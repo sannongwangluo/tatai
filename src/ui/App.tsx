@@ -289,7 +289,7 @@ export default function App() {
           data-brand-footer="tatai"
           title="塔台 Tatai · 杭州三农网络科技有限公司 · GNU AGPL-3.0"
         >
-          Tatai v0.1.0 · 杭州三农网络科技有限公司 · AGPL-3.0
+          Tatai v0.1.1 · 杭州三农网络科技有限公司 · AGPL-3.0
         </div>
       </aside>
 

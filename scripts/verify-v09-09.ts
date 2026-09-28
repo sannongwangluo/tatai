@@ -571,8 +571,8 @@ async function section4(): Promise<void> {
 
 function section5(): void {
   section("⑤ 安装/卸载真机（真机记录在册 + 自洽）");
-  const installer = path.join(REPO, "src-tauri", "target", "release", "bundle", "nsis", "Tatai_0.1.0_x64-setup.exe");
-  const msi = path.join(REPO, "src-tauri", "target", "release", "bundle", "msi", "Tatai_0.1.0_x64_en-US.msi");
+  const installer = path.join(REPO, "src-tauri", "target", "release", "bundle", "nsis", "Tatai_0.1.1_x64-setup.exe");
+  const msi = path.join(REPO, "src-tauri", "target", "release", "bundle", "msi", "Tatai_0.1.1_x64_en-US.msi");
   ok(exists(installer), `⑤-1 新安装包在盘上：${path.relative(REPO, installer)}（${exists(installer) ? fs.statSync(installer).size : "?"} B）`);
   ok(exists(msi), `⑤-2 MSI 同目录在盘上（${exists(msi) ? fs.statSync(msi).size : "?"} B）`);
   const rec = readJson<{

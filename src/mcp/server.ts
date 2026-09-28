@@ -23,7 +23,7 @@ import { WorkServiceClient } from "../server/work/service";
 /** 构造塔台 MCP server：注册工具清单与调用分发。传输层由入口（index.ts）接。 */
 export function createTataiMcpServer(): Server {
   const server = new Server(
-    { name: "tatai", version: "0.1.0" },
+    { name: "tatai", version: "0.1.1" },
     { capabilities: { tools: {} } },
   );
   // Q63：登记失败不再整段静默——每个进程只嚷一次（工具调用本身照旧不受影响）

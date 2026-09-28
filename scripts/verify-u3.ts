@@ -30,8 +30,8 @@ import { sourceFingerprint } from "./lib/sourceFingerprint";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TAURI_DIR = path.join(REPO_ROOT, "src-tauri");
 const RELEASE_DIR = path.join(TAURI_DIR, "target", "release");
-const BUNDLE_NSIS = path.join(RELEASE_DIR, "bundle", "nsis", "Tatai_0.1.0_x64-setup.exe");
-const BUNDLE_MSI = path.join(RELEASE_DIR, "bundle", "msi", "Tatai_0.1.0_x64_en-US.msi");
+const BUNDLE_NSIS = path.join(RELEASE_DIR, "bundle", "nsis", "Tatai_0.1.1_x64-setup.exe");
+const BUNDLE_MSI = path.join(RELEASE_DIR, "bundle", "msi", "Tatai_0.1.1_x64_en-US.msi");
 const RELEASE_EXE = path.join(RELEASE_DIR, "tatai.exe");
 const RES_SERVER = path.join(TAURI_DIR, "resources", "server");
 const RES_LOADER = path.join(TAURI_DIR, "resources", "WebView2Loader.dll");
@@ -157,8 +157,8 @@ const BINDING_FILE = process.env.V0904_BIND_OUT
   : path.join(REPO_ROOT, ".工作台", "evidence", "V09-04", "1", "binding.json");
 const BOUND_ARTIFACTS: [string, string][] = [
   ["壳二进制", "src-tauri/target/release/tatai.exe"],
-  ["NSIS 安装包", "src-tauri/target/release/bundle/nsis/Tatai_0.1.0_x64-setup.exe"],
-  ["MSI 安装包", "src-tauri/target/release/bundle/msi/Tatai_0.1.0_x64_en-US.msi"],
+  ["NSIS 安装包", "src-tauri/target/release/bundle/nsis/Tatai_0.1.1_x64-setup.exe"],
+  ["MSI 安装包", "src-tauri/target/release/bundle/msi/Tatai_0.1.1_x64_en-US.msi"],
 ];
 if (!fs.existsSync(BINDING_FILE)) {
   // 判据不放宽：包存在 + 载荷对得上 ≠ 包是"当前源码"打的——缺绑定记录就是不可判定，如实红。

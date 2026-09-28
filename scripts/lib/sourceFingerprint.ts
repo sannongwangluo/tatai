@@ -72,12 +72,12 @@ export function buildOutputManifest(root: string): { entries: ArtifactEntry[]; m
   pushDir(path.join(root, "src-tauri", "resources", "server"), "src-tauri/resources/server");
   pushFile(path.join(root, "src-tauri", "target", "release", "tatai.exe"), "src-tauri/target/release/tatai.exe");
   pushFile(
-    path.join(root, "src-tauri", "target", "release", "bundle", "nsis", "Tatai_0.1.0_x64-setup.exe"),
-    "src-tauri/target/release/bundle/nsis/Tatai_0.1.0_x64-setup.exe",
+    path.join(root, "src-tauri", "target", "release", "bundle", "nsis", "Tatai_0.1.1_x64-setup.exe"),
+    "src-tauri/target/release/bundle/nsis/Tatai_0.1.1_x64-setup.exe",
   );
   pushFile(
-    path.join(root, "src-tauri", "target", "release", "bundle", "msi", "Tatai_0.1.0_x64_en-US.msi"),
-    "src-tauri/target/release/bundle/msi/Tatai_0.1.0_x64_en-US.msi",
+    path.join(root, "src-tauri", "target", "release", "bundle", "msi", "Tatai_0.1.1_x64_en-US.msi"),
+    "src-tauri/target/release/bundle/msi/Tatai_0.1.1_x64_en-US.msi",
   );
   entries.sort((a, b) => a.path.localeCompare(b.path));
   const h = crypto.createHash("sha256");

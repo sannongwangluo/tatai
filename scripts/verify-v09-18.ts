@@ -123,6 +123,12 @@ const realProjectPath = ((): string | null => {
 const realArchFile = realProjectPath === null ? "" : path.join(realProjectPath, ".工作台", "arch", "blueprint.json");
 const realBefore = realArchFile === "" ? null : sha256File(realArchFile);
 const realBp = readBlueprint(REAL_PROJECT, REAL_DATA_DIR);
+if (realProjectPath === null || realBp === null) {
+  console.log(
+    "[verify] SKIP 未找到真实 tatai 项目注册（TATAI_HOME 数据目录无 registry.json 或未注册 tatai）——本脚本读数依赖作者机器的真实台账，陌生环境无法复现；按 README「验证脚本」节口径退出码 3（没跑全，不算失败）",
+  );
+  process.exit(3);
+}
 ok(realBp !== null, "真实蓝图可读（已发布规划图在场，后续读数都按它现场复算，不用过期固定数）");
 
 const realArchStatus = (() => {
@@ -454,14 +460,21 @@ if (realBp !== null) {
     v0902.includes("时点口径") && v0902.includes("不以任何过期固定数量自证"),
     "verify-v09-02.ts 注释已改时点口径（测试不用过期固定数量自证，裁定 9）",
   );
-  const errataReports = [
-    "D:/tmp/tatai-audit/closure/repo-slimdown-20260926/00-收口与瘦身报告.md",
-    "D:/tmp/tatai-audit/closure/graph-recheck-20260926/00-交付报告.md",
-  ];
-  ok(
-    errataReports.every((f) => fs.existsSync(f) && fs.readFileSync(f, "utf8").includes("勘误")),
-    "作者两份报告（收口与瘦身／graph-recheck 交付）各有勘误页（项目外证据区）",
-  );
+  const errataDir = process.env.TATAI_V0918_EVIDENCE_DIR ?? "";
+  if (errataDir === "") {
+    info(
+      "SKIP ⑦ 作者两份报告的勘误页检查：未设 TATAI_V0918_EVIDENCE_DIR（项目外证据区不在仓库内；作者机器把两份报告所在的证据根目录设给它即可复跑本断言）",
+    );
+  } else {
+    const errataReports = [
+      path.join(errataDir, "repo-slimdown-20260926", "00-收口与瘦身报告.md"),
+      path.join(errataDir, "graph-recheck-20260926", "00-交付报告.md"),
+    ];
+    ok(
+      errataReports.every((f) => fs.existsSync(f) && fs.readFileSync(f, "utf8").includes("勘误")),
+      "作者两份报告（收口与瘦身／graph-recheck 交付）各有勘误页（项目外证据区，目录来自 TATAI_V0918_EVIDENCE_DIR）",
+    );
+  }
 
   const realAfter = sha256File(realArchFile);
   ok(

@@ -29,6 +29,7 @@
 //      本脚本非全 0 一律记 `fail`（唯一能如实表达"未通过"的取值）。
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getProject, resolveDataDir } from "../src/server/registry";
@@ -44,9 +45,9 @@ import { SCHEMA_VERSION, type WorkReceipt } from "../src/server/work/types";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROJECT_ID = "tatai";
 /** 补证清单（输入，任务卡指定） */
-const INVENTORY_PATH = process.env.TATAI_BACKFILL_INVENTORY ?? "D:/tmp/tmp-backfill-inventory.json";
+const INVENTORY_PATH = process.env.TATAI_BACKFILL_INVENTORY ?? path.join(os.tmpdir(), "tatai-backfill-inventory.json");
 /** 汇总结果（输出，任务卡指定） */
-const RESULT_PATH = process.env.TATAI_BACKFILL_TASKS_RESULT ?? "D:/tmp/tmp-backfill-tasks-result.json";
+const RESULT_PATH = process.env.TATAI_BACKFILL_TASKS_RESULT ?? path.join(os.tmpdir(), "tatai-backfill-tasks-result.json");
 /** 幂等键前缀与记录 id 后缀（同批补证统一标记） */
 const BACKFILL_TAG = "backfill-20260927";
 const IDEM_PREFIX = "backfill-20260927:";

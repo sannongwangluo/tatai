@@ -744,7 +744,7 @@ section("⑫ 交付报告按非作者复审 §六 逐项勘误（只追加；原
   //         记录值（三件都查，不只 NSIS）；报告 §八 的 `3,363,927` 作为**历史留痕**仍在册（只追加、不回改）｜
   //   保留意图＝「盘上产物与绑定记录一致（同源）」这条判据一条不减｜
   //   判据不放宽：盘上字节数或 sha256 与绑定记录不符仍判红（旧写法只比字节数，新写法连内容哈希一起比）。
-  const installArtifacts = ["nsis/Tatai_0.1.0_x64-setup.exe", "msi/Tatai_0.1.0_x64_en-US.msi", "tatai.exe"];
+  const installArtifacts = ["nsis/Tatai_0.1.1_x64-setup.exe", "msi/Tatai_0.1.1_x64_en-US.msi", "tatai.exe"];
   const mismatches: string[] = [];
   for (const suffix of installArtifacts) {
     const rec = bind.artifacts.find((a) => a.path.endsWith(suffix));

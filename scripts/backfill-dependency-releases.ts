@@ -23,6 +23,7 @@
 //    但 `SelfCheckInput.conclusion` 只接受 `pass|fail`，且折叠层把非 `fail` 一律折成 `pass`
 //    （`audit.ts:570`）——用 `blocked` 会被静默读成通过。本脚本未释放一律记 `fail`（唯一如实取值）。
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { getProject, resolveDataDir } from "../src/server/registry";
 import { projectWorkDir } from "../src/server/workstation";
@@ -45,8 +46,8 @@ import {
 // ── 常量 ──
 
 const PROJECT_ID = "tatai";
-const INVENTORY_PATH = process.env.TATAI_BACKFILL_INVENTORY ?? "D:/tmp/tmp-backfill-inventory.json";
-const RESULT_PATH = process.env.TATAI_BACKFILL_EDGES_RESULT ?? "D:/tmp/tmp-backfill-edges-result.json";
+const INVENTORY_PATH = process.env.TATAI_BACKFILL_INVENTORY ?? path.join(os.tmpdir(), "tatai-backfill-inventory.json");
+const RESULT_PATH = process.env.TATAI_BACKFILL_EDGES_RESULT ?? path.join(os.tmpdir(), "tatai-backfill-edges-result.json");
 const BACKFILL_TAG = "prereq-backfill-20260927";
 const IDEM_PREFIX = "backfill-20260927:";
 const roundTag = (round: number): string => (round === 1 ? BACKFILL_TAG : `${BACKFILL_TAG}-r${round}`);

@@ -7,9 +7,10 @@
 > 机读的那几栏在 `src/server/work/executionReceipts.ts#BUILTIN_CLIENT_PROFILES`，两边口径必须一致（验证脚本对账）。
 >
 > 实测环境：Windows + Git Bash，`node v24.18.0`、`pnpm 12.4.2`、`git 2.54.0.windows.1`；
-> 两个 CLI 都在 PATH 上：`/c/Users/三农网络/.openagents/nodejs/{kimi,claude}`。实测日期：2026-09-20。
+> 两个 CLI 都在 PATH 上：`<你的可执行目录>/{kimi,claude}`（作者实测机器的具体路径属本机信息，不录入本档案）。实测日期：2026-09-20。
 >
 > **凭据只报"在不在"**：本档案与回执都不记录任何密钥原文，只写键名与配置路径。
+> **本机路径占位**：作者机器的用户名与具体目录不录入（`<你的可执行目录>`、`<KIMI_CODE_HOME>` 等占位符），换机器以实际环境为准。
 
 ---
 
@@ -26,8 +27,8 @@
 ```
 Kimi doctor
 
-OK config.toml  D:/AI工具数据/kimi-code/config.toml
-OK tui.toml     D:\AI工具数据\kimi-code\tui.toml
+OK config.toml  <KIMI_CODE_HOME>/config.toml
+OK tui.toml     <KIMI_CODE_HOME>/tui.toml
 
 All checked config files are valid.
 ```
@@ -101,7 +102,7 @@ stdout 是回答、stderr 带版本与执行的命令回显，退出码 0。完�
 
 ### 2.3 配置标识（哪个文件在生效）
 
-- 生效的配置根由环境变量 `KIMI_CODE_HOME` 决定，本机实测值：`D:\AI工具数据\kimi-code`
+- 生效的配置根由环境变量 `KIMI_CODE_HOME` 决定（作者本机实测值不录入，以你机器的实际值为准）
   （`kimi doctor` 读的就是它下面的 `config.toml`）。
 - 该 `config.toml` 的实测关键项（**只列键名与取值，不含密钥**）：
   - `default_model = "deepseek-v41-flash"`

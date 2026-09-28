@@ -36,8 +36,8 @@ const ok = (cond: boolean, label: string): void => {
 
 const ART = {
   exe: "src-tauri/target/release/tatai.exe",
-  nsis: "src-tauri/target/release/bundle/nsis/Tatai_0.1.0_x64-setup.exe",
-  msi: "src-tauri/target/release/bundle/msi/Tatai_0.1.0_x64_en-US.msi",
+  nsis: "src-tauri/target/release/bundle/nsis/Tatai_0.1.1_x64-setup.exe",
+  msi: "src-tauri/target/release/bundle/msi/Tatai_0.1.1_x64_en-US.msi",
 };
 
 console.log("[verify] ═══ ① 三件产物在场 ═══");
