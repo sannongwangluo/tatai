@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "generated_at": "1970-01-01T00:00:00+08:00",
+  "trigger": "never",
+  "design_exists": false,
+  "code_exists": false,
+  "design_source": null,
+  "design_modules": [],
+  "code_modules": [],
+  "only_in_design": [],
+  "only_in_code": [],
+  "matched": [],
+  "consumed_request": null,
+  "note": "差异是信号，不是错误（DESIGN.md §4.5）：设计书有代码没有=设计书过时或未实现；代码有设计书没有=代码跑偏或漏写设计。"
+}

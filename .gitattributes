@@ -1,0 +1,4 @@
+# 第二轮审计（Q226）：core.autocrlf=true 且无本文件时，新克隆把 Cargo.toml 检出成 CRLF，
+# 而 `tauri dev` 启动约 1 秒就把它改写回 LF——内容逐字节不变也报 `M src-tauri/Cargo.toml`（假脏）。
+# 只钉 toml 一族（cargo 自己写盘恒为 LF）；刻意不写 `* text=auto`，那会触发全仓重归一化。
+*.toml text eol=lf

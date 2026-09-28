@@ -1,0 +1,23 @@
+.工作台/
+node_modules/
+dist/
+# U1（三期）：Rust 构建产物与 Tauri 生成的 schema 不进仓库（生成物，可由 pnpm tauri build 复现）
+src-tauri/target/
+src-tauri/gen/
+# V09-14：壳替身（src-tauri/shell-sim）的构建产物——verify:v09-14 一律用 --target-dir 编到 src-tauri/target/ 下；这行兜住「直接进目录跑 cargo build」的情形
+src-tauri/shell-sim/target/
+# U2（三期）：随包后端产物（pnpm build:server 的产出：打包后的 index.js/mcp.js + 原生依赖副本，
+# 合计 ~7.5MB，含 .node/.dll/.exe 二进制）——构建物，不进 git，可由 pnpm build:server 复现
+src-tauri/resources/
+# L4（发布）：全局数据层落点若被误设进 repo（TATAI_HOME=<repo> 内某目录），这两个文件也绝不进仓库——
+# 口令文件（S1/U2 的 token 存这里）与远程访问审计流水（S3）；默认落点 ~/.tatai/ 本就在 repo 外
+auth.json
+remote-audit.jsonl
+# 第一轮审计（Q13）：audit/ 为审计过程产出，明文含作者本机用户名与真实临时路径，
+# 不能进公开仓库；与 gitignore 内其余条目同理（见 audit/03-问题汇总分级.md Q13）
+audit/
+# 第二轮审计（Q142）：探针夹具临时目录 .audit-tmp/（registry.json 内含本机绝对路径，
+# 另有 remote/auth.json 口令夹具、logs/remote-audit.jsonl 等 34 个文件）——私人数据，
+# 绝不进仓库；与 audit/ 同理（见 audit/R2/03-问题汇总分级.md Q142）
+.audit-tmp/
+scripts/__pycache__/

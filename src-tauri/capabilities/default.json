@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "塔台桌面壳的前端是纯 web 前端（同一份 src/ui），只需要核心权限。不授予 shell/* 等进程调起能力：拉起与回收本地 Node 服务由 Rust 侧 std::process 完成（见 src-tauri/src/backend.rs），前端一行进程代码都没有，也没有自定义命令。Q224（2026-09-19 二轮审计）只放行了 opener 的 open_url 一条，且范围限 http/https：壳内点站外链接不许再把整个窗口导航走，改交系统浏览器打开（前端 src/ui/external-link.ts）。故意的窄：不放行 opener:default（那会连 open-path / reveal-item-in-dir / mailto: / tel: 一起放行），塔台没有这些用法。2026-09-19 试用反馈加放 dialog 的 allow-open 一条（主人报障：添加项目路径只能手敲）：原生目录选择框，只选目录不开文件；同样不放 dialog:default（那会连 save/message/ask/confirm 一起放行），塔台没有这些用法。",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://*" }, { "url": "http://*" }]
+    },
+    "dialog:allow-open"
+  ]
+}

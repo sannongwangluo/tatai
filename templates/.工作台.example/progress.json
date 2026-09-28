@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "gate": {
+    "current_step": "kickoff",
+    "history": [
+      {
+        "step": "kickoff",
+        "result": "pending",
+        "at": null,
+        "note": null
+      },
+      {
+        "step": "requirement",
+        "result": "pending",
+        "at": null,
+        "note": null
+      },
+      {
+        "step": "design",
+        "result": "pending",
+        "at": null,
+        "note": null
+      },
+      {
+        "step": "tasks",
+        "result": "pending",
+        "at": null,
+        "note": null
+      },
+      {
+        "step": "develop",
+        "result": "pending",
+        "at": null,
+        "note": null
+      },
+      {
+        "step": "verify",
+        "result": "pending",
+        "at": null,
+        "note": null
+      },
+      {
+        "step": "deliver",
+        "result": "pending",
+        "at": null,
+        "note": null
+      }
+    ]
+  },
+  "modules": []
+}

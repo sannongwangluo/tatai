@@ -1,0 +1,2 @@
+{"role":"user","content":"（示例占位）user 行只有 role / content / ts 三个字段。","ts":"1970-01-01T00:00:00+08:00"}
+{"role":"assistant","content":"（示例占位）assistant 行多一个 model 字段，回答全文一次写完整行。","ts":"1970-01-01T00:00:01+08:00","model":"<模型 id>"}

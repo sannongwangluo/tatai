@@ -1,0 +1,12 @@
+allowBuilds:
+  esbuild: true
+  node-pty: true
+  # tree-sitter 系走 win32-x64 prebuild（node-gyp-build），无需构建脚本（A1 选型结论，见 PROGRESS.md）
+  tree-sitter: false
+  tree-sitter-javascript: false
+  tree-sitter-python: false
+  tree-sitter-typescript: false
+# 安全：markmap-lib 传递依赖 prismjs 1.29.0 命中 GHSA-x7hr-w5r2-h6wg（DOM Clobbering，moderate），
+# 修在 1.30.0（MIT，满足 markmap-lib 的 ^1.29.0）。锁死下限，防回落到 1.29（审计 Q7）
+overrides:
+  prismjs: ">=1.30.0"

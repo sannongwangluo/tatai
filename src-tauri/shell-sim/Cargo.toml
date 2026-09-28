@@ -1,0 +1,27 @@
+[package]
+name = "tatai-shell-sim"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+
+# `pnpm verify:v09-14` 用的**壳替身**（PLAN V09-14 允许的可测试 launcher）。
+# 它不做 UI、不开窗，只把壳的进程生命周期照原样跑一遍：按 backend.rs 的配方拉起真后端 →
+# 挂 Job Object → 正常退出 / 挂住等强杀。收口原语直接 `#[path]` 编 src 里那份
+# `proc_tree.rs`（与真壳同一份源码），因此这里只依赖 windows crate，**不依赖 tauri**——
+# 验证脚本才能在几十秒内编出可执行文件（真壳那个 debug 构建是十几分钟级）。
+#
+# 为什么单独一个 crate 而不是 tatai 的 bin/example：tatai 包多一个 bin 目标会让
+# `tauri build` 面对"到底打哪个二进制"的问题（U3 的打包链不该为验证脚本冒这个风险），
+# 而 example 目标仍要把 tauri 那一大坨依赖编一遍。单独 crate 只编 windows 这一个小依赖。
+[workspace]
+
+[target.'cfg(windows)'.dependencies]
+# 与 src-tauri/Cargo.toml 同一套 feature（理由逐条见那边注释）；许可 MIT OR Apache-2.0，
+# 原文核对与准入依据见 src-tauri/README.md「进程树收口」与 docs/LICENSE-AUDIT.md §8。
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

@@ -1,0 +1,60 @@
+[package]
+name = "tatai"
+version = "0.1.0"
+description = "塔台（Tatai）：个人级 agent 编程工作台"
+authors = ["sannongwangluo"]
+edition = "2021"
+rust-version = "1.77.2"
+license = "MIT"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+
+# V09-14（2026-09-25）：壳被强杀时靠 Windows Job Object 收口后端子树（`src/proc_tree.rs`）。
+# 这不是新进依赖树的 crate——`windows` 0.61.3 已在 Cargo.lock 里（tauri / tao / wry / webview2-com
+# 的传递依赖），这里只是把它提为**直接依赖**并只开这一段需要的 feature：
+#   - Win32_Foundation：HANDLE / CloseHandle；
+#   - Win32_Security：CreateJobObjectW 的 lpJobAttributes 形参类型（SECURITY_ATTRIBUTES）；
+#   - Win32_System_JobObjects：CreateJobObjectW / AssignProcessToJobObject / SetInformationJobObject /
+#     TerminateJobObject 与 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE；
+#   - Win32_System_Threading：JOBOBJECT_EXTENDED_LIMIT_INFORMATION 里的 IO_COUNTERS（该结构带这个 cfg 门槛）。
+# 走 `[target.'cfg(windows)'.dependencies]`：壳只在 Windows 分发，非 Windows 构建不拉它。
+# 许可：**MIT OR Apache-2.0**（在项目准入白名单内）。§7.4 要求的 LICENSE 原文核对与准入依据
+# 见 `src-tauri/README.md`「进程树收口」一节与 `docs/LICENSE-AUDIT.md` §8；原文关键句由
+# `pnpm verify:v09-14` 回读 crate 内 `license-mit` / `license-apache-2.0` 逐句比对。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+# Q224（2026-09-19 二轮审计）：壳内点站外链接此前把整个 WebView2 窗口导航走（无返回入口，
+# 应用等于被一页网页顶掉）。前端不再让窗口自己导航，改经插件把 url 交给系统浏览器打开。
+# 许可：Apache-2.0 / MIT（`node_modules/@tauri-apps/plugin-opener/LICENSE.spdx` +
+# crates.io `Apache-2.0 OR MIT`），符合 AGENTS.md §6 的开源红线。
+tauri-plugin-opener = "2"
+# 试用反馈（2026-09-19，主人报障）：「+ 添加项目」的路径只能手敲——桌面壳接原生
+# 目录选择框，前端 `src/ui/dir-picker.ts` 调它的 open（directory 模式，只选目录不开文件）。
+# 许可：Apache-2.0 / MIT（`node_modules/@tauri-apps/plugin-dialog/LICENSE.spdx` +
+# crates.io `Apache-2.0 OR MIT`），符合 AGENTS.md §6 的开源红线。
+tauri-plugin-dialog = "2"
+
+[features]
+# 正式/开发构建开关（tauri build 时 CLI 自动传 --features custom-protocol）。tauri 的
+# is_dev() 定义为 `!cfg!(feature = "custom-protocol")`：缺了这个 feature，连 release 产物
+# 也是 dev 模式——窗口去连 devUrl（localhost:5173）而不是嵌入的 dist/（tauri.localhost），
+# 没有 vite 在跑就整页"localhost 拒绝连接"（2026-09-21 实锤定位）。
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+# U3 的体积目标 3–10MB 级（PLAN.md U3 DoD②）：release 一律瘦身，实测值由 U3 出。
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
