@@ -268,7 +268,7 @@ function buildThirdPartyNotices(built: { modules?: Record<string, unknown> }[]):
   L.push("");
   L.push("完整审计在哪：**仓库内 docs/LICENSE-AUDIT.md** —— npm 实际安装面 409 个包 + Rust Cargo.lock");
   L.push("全量 430 个 crate 逐个打开许可原文核对，含原文路径与关键句摘录。");
-  L.push("塔台自身许可：MIT（仓库根 LICENSE）。");
+  L.push("塔台自身许可：GNU AGPL-3.0（仓库根 LICENSE）。");
   L.push("");
   rule();
   L.push(`一、内联进 server/index.js 与 server/mcp.js 的 npm 包（共 ${packages.length} 个）`);

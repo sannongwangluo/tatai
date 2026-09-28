@@ -222,7 +222,7 @@ DoD① 要求"清单里所有勾选项无遗漏"，对未引入项给"为什么�
 | 证据级 | 条数 | 说明 |
 | --- | --- | --- |
 | **crate 原文（解包目录）** | **429** | 255 个来自构建机 `$CARGO_HOME/registry/src/index.crates.io-*/<crate>-<ver>/`（Windows 构建真正用到的那些）；174 个是本机没有的（非 Windows 目标）→ 本轮逐个从 `static.crates.io` 下载 `.crate` 归档并解包，读其中的 `Cargo.toml [package].license` 与 `LICENSE*` 文件 |
-| crates.io API 元数据 | 1 | `tatai@0.1.0`（本仓库自身工作区成员，`src-tauri/Cargo.toml` 声明 `license = "MIT"`） |
+| crates.io API 元数据 | 1 | `tatai@0.1.0`（本仓库自身工作区成员；审计时点声明 `license = "MIT"`，2026-09-28 起已改 `AGPL-3.0-or-later`，见 v0.1.1） |
 | **交叉校验** | — | 每条的「crate 内 `Cargo.toml` 声明」与「crates.io API `version.license`」逐条比对：**0 条不一致** |
 
 ### 4.2 分布
