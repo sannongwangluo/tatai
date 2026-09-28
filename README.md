@@ -4,6 +4,8 @@
 
 塔台面向用 Agent 开发项目的非程序员：保存意图、设计书、施工安排、进度和验收证据，让换模型、换会话后的 Agent 有依据接着做。当前以作者自用为先，作者自行选择工具、模型和档位。
 
+> **English**: Tatai ("control tower") is a local-first desktop workbench for one person running multiple AI coding agents — Claude Code, Codex CLI, Gemini CLI, OpenCode, or any MCP-compatible agent — on the same project. Intent, design docs, build plans, tasks, progress and acceptance evidence live in one auditable event ledger that agents read and write through a single MCP interface. Context survives model and session switches; "done" is only true with verifiable evidence; changing one document re-verifies only what it affects. Multi-agent orchestration, spec-driven development, requirements traceability and codebase architecture visualization — local-first, no cloud required.
+
 ## 它解决什么问题
 
 用 Agent 做项目的人，迟早撞上四件事：
