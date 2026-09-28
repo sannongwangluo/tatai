@@ -1,0 +1,30 @@
+# 基础检查：依赖锁定安装 → typecheck → 前端构建 → 隔离版注册表回归。
+# 刻意保持轻量：不碰任何私有目录、密钥或真实项目数据（verify:registry 自带临时 TATAI_HOME）。
+# 桌面壳（Rust/tauri）与真实安装包的构建不在 CI 里复现——那需要 Windows 本机工具链与打包签名口径，
+# 由维护者在发布流程里跑（README「从源码跑起来」与 src-tauri/README.md）。
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: 安装依赖（锁定）
+        run: pnpm install --frozen-lockfile
+      - name: 类型检查
+        run: pnpm typecheck
+      - name: 前端构建
+        run: pnpm build
+      - name: 注册表回归（隔离夹具，不碰真实数据）
+        run: pnpm verify:registry
