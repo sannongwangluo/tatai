@@ -30,13 +30,13 @@
 安装三步（以 NSIS 包为例）：
 
 1. 下载 `Tatai_<版本>_x64-setup.exe` 并运行（装到当前用户目录，**无需管理员**）；
-2. 确认本机有 **Node.js ≥ 20**（`node -v` 可用即可）——塔台复用系统 Node 跑本地服务，安装包不随包 node；
+2. 运行 `node -v`，确认输出的主版本号 **≥ 20**——塔台复用系统 Node 跑本地服务，安装包不随包 node；
 3. 双击桌面「Tatai」启动。
 
 | 前置条件 | 说明 |
 | --- | --- |
 | 操作系统 | Windows x64 安装包；作者在 Windows 11 x64 实测。其他平台需从源码运行（Rust 工具链等，见「从源码跑起来」） |
-| Node.js ≥ 20 | 必须在 PATH 里；启动时探不到会弹出能照做的报错 |
+| Node.js ≥ 20 | **安装前置要求**：必须在 PATH 里，运行 `node -v` 自行核对主版本号。塔台复用系统 Node 跑本地服务；打包态启动时只探一次 `node --version` **看有没有，不核对版本号**。探不到时窗口照开、**没有专门的弹窗**——具体原因写进 `<全局数据目录>/logs/shell.log`，界面只给一条泛化的「后端未就绪」提示（含该日志路径） |
 | WebView2 运行时 | **不随包**：缺运行时的机器上，安装器会**联网**下载微软官方引导器安装（离线机器请先自行安装 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)） |
 | 卸载 | 程序文件、快捷方式清干净；**用户数据保留**（`%USERPROFILE%\.tatai` 与各项目的 `.工作台/` 不删，需要时手工清理） |
 
@@ -266,9 +266,10 @@ TATAI_REMOTE=1 TATAI_HOST="<局域网 IP>" TATAI_REMOTE_WRITE=1 TATAI_REMOTE_WRI
 
 每张施工卡都留了可复现的验证脚本，`pnpm verify:<卡号>` 即跑。代码验证按改动范围与任务 DoD 执行；下面这份清单是"哪块东西当初是怎么验的"，按需查。
 
-**跑之前先看这三条（涉及真实数据的边界）**：
+**跑之前先看这几条（涉及真实数据的边界）**：
 
-- **多数脚本自带临时 `TATAI_HOME` 与动态端口，不碰真实数据**（表里逐条写明）；但 **读真实注册表/真实项目** 的脚本（`verify:a1/a2/a4/a5`、`b1/b3`、`f2/f3/f4`、`check:graph`、`m4`、`n1/n2/n3`、`v09-08/11/13/17` 等）没设 `TATAI_HOME` 时会读缺省 `~/.tatai`——想隔离就把 `TATAI_HOME` 指到一个临时目录再跑；
+- **只跑表里明确标注自带临时夹具（临时 `TATAI_HOME`）的脚本**，其余一律按"会碰真实数据"对待、先审再跑——例如 `verify:registry` / `verify:onboard` / `verify:r3` / `verify:r4` 那行就标了"自带临时 TATAI_HOME，不碰真实注册表"。**别把"所有脚本都安全"当前提**：未经逐条审计，就不下这个结论。
+- **老脚本不止读、还可能写真实数据**：`scripts/lib/fixtures.ts` 的 `ensureSelfRegistered()` 在缺 `tatai` 记录时会往全局 `registry.json` 写一条（塔台自身＝本仓库）；`verify:intent-path` 就属这一类——它在把自己的临时 `TATAI_HOME` 覆盖上去**之前**，先对脚本继承到的数据目录调用了 `ensureSelfRegistered()`。此外，`verify:a1/a2/a4/a5`、`b1/b3`、`f2/f3/f4`、`check:graph`、`m4`、`n1/n2/n3`、`v09-08/11/13/17`、`verify:intent-path` 等还会读真实注册表、本仓库正文或目标项目的 `.工作台/`。**只设 `TATAI_HOME` 指向临时目录，兜住的是全局数据目录这一侧，兜不住仓库正文与目标项目 `.工作台/`**——要在这些上做真实验证，先读脚本，再用可丢弃的仓库/项目副本加一个独立的临时 `TATAI_HOME` 跑。
 - **会写真实台账/真实配置的命令别在陌生环境顺手跑**：`migrate:real`、`backfill:*`（写真实项目事件账本）、`remote:token` / `remote:write`（改真实远程口令与写开关）；
 - `verify:v09-18` 依赖作者私有证据目录，缺 `TATAI_V0918_EVIDENCE_DIR` 时对应段 SKIP。
 - **环境变量口径**：需要 `TATAI_HOME`／`TATAI_REAL_IDS` 等变量而没设时，依赖它们的段落显式打印 `SKIP` 并让脚本以**退出码 3** 收尾（"没跑全"，不算失败；`0` = 全跑全过，`1` = 有断言 FAIL）。
