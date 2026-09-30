@@ -368,8 +368,9 @@ function scenarioContract(): void {
         "next_action",
         "reasons",
         "required_reads",
+        "sync_summary",
       ]),
-    `① 只读返回恰好是 §6.7 的八个字段：${PROJECT_ENTRY_RESULT_FIELDS.join(" / ")}`,
+    `① 只读返回恰好是 §6.7 八字段 + V09-23 同步摘要 sync_summary（响应层拼；未配置项目为 null）：${PROJECT_ENTRY_RESULT_FIELDS.join(" / ")}`,
   );
 
   // 能力发现：未声明 → 只读（保守）；三档准确区分
@@ -445,7 +446,7 @@ function scenarioMain(): void {
   // 契约形状（真实返回）
   ok(
     JSON.stringify(Object.keys(first)) === JSON.stringify([...PROJECT_ENTRY_RESULT_FIELDS]),
-    `① 真实返回的键顺序与 §6.7 八个字段一致（${Object.keys(first).join(",")}）`,
+    `① 真实返回的键顺序与 §6.7 八字段 + V09-23 sync_summary 一致（${Object.keys(first).join(",")}）`,
     Object.keys(first),
   );
   const packed = packOfEntry(first);

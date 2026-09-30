@@ -42,6 +42,8 @@ import { importTaskDefinitions } from "../src/server/work/plan";
 import { readRequirements } from "../src/server/work/requirements";
 import { projectWorkDir } from "../src/server/workstation";
 import { PROJECT_VIEWS } from "../src/ui/arch/projectGraph";
+// 安装包文件名带产品版本号；唯一来源见 src/shared/version.ts（读仓库根 package.json）
+import { APP_VERSION } from "../src/shared/version";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const EVID = path.join(REPO, ".工作台", "evidence", "V09-09", "1");
@@ -571,8 +573,8 @@ async function section4(): Promise<void> {
 
 function section5(): void {
   section("⑤ 安装/卸载真机（真机记录在册 + 自洽）");
-  const installer = path.join(REPO, "src-tauri", "target", "release", "bundle", "nsis", "Tatai_0.1.1_x64-setup.exe");
-  const msi = path.join(REPO, "src-tauri", "target", "release", "bundle", "msi", "Tatai_0.1.1_x64_en-US.msi");
+  const installer = path.join(REPO, "src-tauri", "target", "release", "bundle", "nsis", `Tatai_${APP_VERSION}_x64-setup.exe`);
+  const msi = path.join(REPO, "src-tauri", "target", "release", "bundle", "msi", `Tatai_${APP_VERSION}_x64_en-US.msi`);
   ok(exists(installer), `⑤-1 新安装包在盘上：${path.relative(REPO, installer)}（${exists(installer) ? fs.statSync(installer).size : "?"} B）`);
   ok(exists(msi), `⑤-2 MSI 同目录在盘上（${exists(msi) ? fs.statSync(msi).size : "?"} B）`);
   const rec = readJson<{

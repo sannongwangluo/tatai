@@ -44,12 +44,16 @@ import { WriteModeController } from "./remote-write";
 import { remotePageHtml } from "./remote-page";
 import { createWorkHost } from "./workHost";
 import { readServiceDescriptor, WORK_TOKEN_HEADER } from "./work/service";
+import { handleSyncStatusRoute } from "./work/syncHttp";
+import { startSyncDiscovery, stopSyncDiscovery } from "./work/syncDiscovery";
 import { onboardProject } from "./onboard";
 import { requestScanCancel, scanProjectAsync } from "./scanner";
 import { sweepAllTmpResidue } from "./tmpSweep";
 import { readModules, startParseProjectRun, requestParseCancel, getParseRunStatus } from "../arch/parse";
 import { nameModules } from "../arch/name";
 import { dataFlowLayerOf, renderGraph } from "../arch/render";
+import { RENDER_FULL_LIMITS } from "../arch/config";
+import { archItemsOf } from "../arch/items";
 import { expandProject } from "../arch/expand";
 import { readLastReconcile, reconcileProject } from "../arch/reconcile";
 import {
@@ -736,6 +740,10 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     return;
   }
 
+  // V09-23（DESIGN §2.10）：同步状态**只读**读口 GET /api/projects/:id/sync-status——不写账、不触发扫描，
+  // 每次重读必要文件与实际目标；与 MCP read_sync_status 同一份判据（sync.readSyncStatus）。
+  if (handleSyncStatusRoute(req, res, reqPath, DATA_DIR)) return;
+
   // ── V06-01 唯一写入服务面（PLAN.md V06-01，DESIGN.md §2.6）──
   // 位置在放行口**之后**：非回环来源照旧先过远程红线（只读模式下写方法 403 REMOTE_READ_ONLY），
   // 回环来源（桌面 UI / stdio MCP）才谈得上描述符令牌那一关。四条路由登记在 remote-routes.ts。
@@ -765,6 +773,20 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     return;
   }
   if (req.method === "GET" && reqPath === "/api/work/snapshot") {
+    replyWorkRoutes();
+    return;
+  }
+  // V09-25 终修：V09-23 新增的两条 work 面路由（显式同步扫描 / 宿主只读同步状态）也必须在桌面宿主转发
+  // ——否则 MCP `scan_sync_evidence` 与跨进程只读宿主健康落进本文件兜底 404。
+  // 判据与上面四条逐字同款：**方法 + 精确路径**（`reqPath` 已在放行口处取好并已去 query）；
+  // 错方法、多段路径、尾斜杠、任意 `/api/work/…` 一律不命中，落到本文件兜底 404——不是整段透传。
+  // 这两条同时登记在 `remote-routes.ts` 的路由-方法清单里（防漂移对账按 `req.method === "…"` 提及数
+  // 逐条对账，新增字面提及必须同步登记，不许绕开扫描器）。
+  if (req.method === "POST" && reqPath === "/api/work/sync/scan") {
+    replyWorkRoutes();
+    return;
+  }
+  if (req.method === "GET" && reqPath === "/api/work/sync/status") {
     replyWorkRoutes();
     return;
   }
@@ -2921,14 +2943,59 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     }
     return;
   }
-  const archRenderMatch = req.url?.match(/^\/api\/projects\/([^/]+)\/arch\/render$/);
+  // V09-22：`?full=1` → 全量上限（RENDER_FULL_LIMITS，同一 builder 的另一组参数）；无 query 逐字不变。
+  // regex 允许 query；从 req.url 手写 split 取 query（不引入 URL/querystring 依赖）。
+  const archRenderMatch = req.url?.match(/^\/api\/projects\/([^/]+)\/arch\/render(?:\?.*)?$/);
   if (req.method === "GET" && archRenderMatch) {
+    const full = (req.url ?? "")
+      .split("?")[1]
+      ?.split("&")
+      .some((kv) => kv === "full=1");
     try {
       res.end(
         JSON.stringify(
-          withoutLocalPaths({ ok: true, render: renderGraph(decodePathSegment(archRenderMatch[1])) }, guard.remote),
+          withoutLocalPaths(
+            {
+              ok: true,
+              render: renderGraph(
+                decodePathSegment(archRenderMatch[1]),
+                full ? { limits: RENDER_FULL_LIMITS } : undefined,
+              ),
+            },
+            guard.remote,
+          ),
         ),
       );
+    } catch (e) {
+      wsFail(e);
+    }
+    return;
+  }
+
+  // ── V09-22 契约 1：未聚合并集逐项取回（上限外对象不再只能看聚合节点）──
+  // GET /api/projects/:id/arch/items?kind=nodes|edges&q=&offset=&limit=
+  //   kind 必填（nodes/edges，否则 400 INVALID_INPUT）；q 大小写不敏感子串（节点 id/name/path、边 from/to）；
+  //   offset 缺省 0、负数/非整数 400；limit 缺省 200、clamp 到 [1,2000]。
+  //   数据源＝与 /arch/render 同一 builder 管线的**未聚合并集**（无上限组），先过滤后开窗、逐页可取完。
+  //   错误口径与相邻路由一致：项目不存在 404 PROJECT_NOT_FOUND，参数校验失败 400 INVALID_INPUT。
+  const archItemsMatch = req.url?.match(/^\/api\/projects\/([^/]+)\/arch\/items(?:\?(.*))?$/);
+  if (req.method === "GET" && archItemsMatch) {
+    try {
+      const params = new URLSearchParams(archItemsMatch[2] ?? "");
+      const kind = params.get("kind");
+      if (kind !== "nodes" && kind !== "edges") {
+        throw new WsError("INVALID_INPUT", `kind 必填且只接受 nodes/edges（收到 ${JSON.stringify(kind)}）`);
+      }
+      const offset = nonNegParam(params, "offset");
+      const limit = nonNegParam(params, "limit");
+      const q = params.get("q");
+      const result = archItemsOf(decodePathSegment(archItemsMatch[1]), {
+        kind,
+        ...(q === null ? {} : { q }),
+        ...(offset === undefined ? {} : { offset }),
+        ...(limit === undefined ? {} : { limit }),
+      });
+      res.end(JSON.stringify(withoutLocalPaths({ ok: true, kind, ...result }, guard.remote)));
     } catch (e) {
       wsFail(e);
     }
@@ -3091,6 +3158,8 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
   //   子目录成子模块节点、文件成文件节点（文件名即名字，纯静态零 LLM，响应带 llm_calls:0）；
   //   tree-sitter 只解析该子树内源码（懒加载：不展开的分支无解析开销，stats.parsed_files 为证）；
   //   子级超硬上限时截断成「还有 N 个」聚合节点（§4.3 第 1 招，见 expand.ts）。
+  //   body 可带 `full:true`（V09-22 全量模式）：单枝子级上限放到 RENDER_FULL_LIMITS.MAX_CHILDREN；
+  //   子树遍历仍走 WALK_LIMITS 预算，budget_exhausted 照实带出（不宣称假全量）。
   // N2 打点：每次展开在服务端留一行（未点开的枝一行都不会有 → 未展开分支零解析；这一行的
   //   parsed 计数全部落在被展开的子树内）。验证脚本抓服务端 stdout 作为 DoD② 的日志证据。
   // GET/PUT /api/projects/:id/arch/layout —— 布局记忆：GET 读 layout.json（缺文件返回空 positions 空态；
@@ -3105,9 +3174,25 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     readJsonBody(req)
       .then((body) => {
         const modulePath = (body as { module_path?: unknown })?.module_path;
-        const result = expandProject(projectId, modulePath as string);
+        // V09-22：body 里 `full:true` → 全量子级上限（RENDER_FULL_LIMITS.MAX_CHILDREN）；缺省逐字不变。
+        const full = (body as { full?: unknown })?.full === true;
+        // V09-22 契约 2：body 里 `childrenOffset`（数字）→ 稳定分页模式（子级窗口，逐页取回上限外子级）；
+        // 不传＝缺省截断口径（逐字节不变）。
+        const rawChildrenOffset = (body as { childrenOffset?: unknown })?.childrenOffset;
+        const childrenOffset =
+          typeof rawChildrenOffset === "number" && Number.isFinite(rawChildrenOffset) ? rawChildrenOffset : undefined;
+        const expandOpts = {
+          ...(full ? { childrenLimit: RENDER_FULL_LIMITS.MAX_CHILDREN } : {}),
+          ...(childrenOffset === undefined ? {} : { childrenOffset }),
+        };
+        const result = expandProject(
+          projectId,
+          modulePath as string,
+          undefined,
+          Object.keys(expandOpts).length > 0 ? expandOpts : undefined,
+        );
         console.log(
-          `[arch/expand] project=${projectId} path=${result.parent.path || "."} ` +
+          `[arch/expand] project=${projectId} path=${result.parent.path || "."}${full ? " full=1" : ""} ` +
             `children=${result.children.length}(截断 ${result.truncated.children} / 上限 ${result.limit.children}) ` +
             `parsed=${result.stats.parsed_files.length}/${result.stats.subtree_files} ` +
             `parse_ms=${result.parse_ms} duration_ms=${result.duration_ms} ` +
@@ -3998,6 +4083,10 @@ void (async () => {
   if (workBound && typeof workBound === "object") {
     workHost.publish(workBound.port, workBound.address);
   }
+  // V09-23（DESIGN §2.10）：**在发布/确认描述符之后**才启动后台同步发现——退位候选不先扫；
+  // 桌面与独立 daemon 共用同一生命周期（daemon.ts 同样在 publish 后启动）。
+  // `startSyncDiscovery` 内部会复核描述符 `pid === process.pid`，不是本进程就不启动（两宿主同一门槛）。
+  startSyncDiscovery({ service: workHost.service, dataDir: DATA_DIR });
   console.log(`[tatai-server] listening on http://${HOST}:${PORT} (${HOST === "127.0.0.1" ? "仅本机" : "⚠ 非回环地址"})`);
   console.log(`[tatai-server] data dir: ${resolveDataDir()}`);
   // Q66（2026-09-18 审计）：原子写会在被 kill 时留下 `<文件>.<pid>.<时间戳>.tmp` 残骸，全仓此前没有
@@ -4115,6 +4204,11 @@ function logShutdown(why: string): void {
 // 现在优雅退出（信号）里真跑一遍：先把各项目已排队的变更刷进 changes.jsonl（不静默丢行），
 // 再杀掉全部终端会话（不留孤儿 shell 进程）。两条都容错——收尾失败只记日志，不拦住退出。
 async function shutdownCleanup(): Promise<void> {
+  try {
+    await stopSyncDiscovery(); // V09-23：先停后台同步发现（关监听/定时器），再收其它 watcher
+  } catch (e) {
+    console.error(`[tatai-server] 退出收尾：停止同步发现失败（已忽略，继续退出）：${(e as Error).message}`);
+  }
   try {
     stopAllGraphRefresh(); // V09-07：先摘发现链（退订 + 清防抖），再收 watcher 本体
     await closeAllWatchers();

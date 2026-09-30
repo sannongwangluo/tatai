@@ -64,6 +64,8 @@ DESIGN §2.6 的事件源、自动投影和版本化写入**已上线并在运�
 
 后续接 Claude Code/Kimi Code 时，先核对已有 worker、审计中心与本机配置，使用已批准的工作链；不在塔台里再造一个独立进程调度器。执行请求、已接收、运行中和结果必须有真实回执。
 
+- 同步证据对账（V09-23，2026-09-30）：执行前由**设计/协调角色**经 `register_sync_contract` 登记「应同步清单」契约（来源哈希实核、同批次改内容拒、`supersedes` 不得减少旧必需项或把 `blocks_entry` 改 false）；完成后把 `<batch_id>.evidence.json` 证据包写进项目 `.工作台/work/sync-inbox/`，由后台发现／`scan_sync_evidence`（唯一写服务宿主，与后台同一逻辑与写口）逐项读**当前实际目标**验收；`read_sync_status`／`GET /api/projects/:id/sync-status` 只读同判据。`blocks_entry` 批次未当前通过时 `project_entry` 给 `sync_summary` 且 `next_action=blocked`，`claim_task` 与直连写口同样拒绝——**补证后自动解阻，不需要人工逐项放行**。同步通过只表示所登记范围在该版本对账通过，**不等于业务实现、独立审计或用户 Gate**；契约细节见 `docs/sync-evidence-contract.md`。
+
 ## 7. 数据、目录与开源约束
 
 - 项目根以当前仓库为准。全局数据以运行服务 health 的 data_dir、TATAI_HOME 和实际配置核实，默认 ~/.tatai；不要沿用旧机器的硬编码目录。stdio MCP 与桌面服务必须同源。
@@ -78,7 +80,7 @@ DESIGN §2.6 的事件源、自动投影和版本化写入**已上线并在运�
 进项目先取接续入口（DESIGN.md §6.2 / §6.7）：
 
 - 先 `select_project` 对准项目，再调 `project_entry`（入参 `project_id` / `role` / `client_capabilities` / `known_revision` / `resume_hint`）拿**只读交接**：有效基线、上下文清单、未结束 run、下一动作（`resume_task`/`claim_task`/`review_result`/`await_role`/`await_decision`/`blocked`/`complete`）、理由与必读原文。它只读，不会替你认领，也不会替你调模型。
-- **六图别靠读代码猜**（2026-09-26 V09-19）：接续入口 `project_entry` 的 `graph_summary` 给六图各一行的计数与状态、同一快照标识、基线/更新时间、更新中或过期状态与原因、异常与下一读取入口；完整状态用 `get_project_graphs` 一次取全（四档：全部六图／`graph=<六图之一>`／`node_id=…`／`relation_id=…`；逐对象带状态键、界面短标与颜色口径、来源、映射、证据状态、有效版本、阻断原因、用户待验；模型待审线索单列，不混进正式节点/关系）。没有图或图更新中/失败/过期时，它如实给状态与原因——**不许**把静态 import 依赖读成业务数据流，也不许把「可请求验收」读成「已交付」。
+- **六图别靠读代码猜**（2026-09-26 V09-19）：接续入口 `project_entry` 的 `graph_summary` 给六图各一行的计数与状态、同一快照标识、基线/更新时间、更新中或过期状态与原因、异常与下一读取入口；完整状态用 `get_project_graphs` 一次取全（四档：全部六图／`graph=<六图之一>`／`node_id=…`／`relation_id=…`；逐对象带状态键、界面短标与颜色口径、来源、映射、证据状态、有效版本、阻断原因、用户待验；模型待审线索单列，不混进正式节点/关系）。没有图或图更新中/失败/过期时，它如实给状态与原因——**不许**把静态 import 依赖读成业务数据流，也不许把「可请求验收」读成「已交付」。**架构判断/影响分析前先 `get_project_graphs mode=full` 按同一快照游标逐图取齐**（`complete:true` 只表示图对象取完，不等于源码全覆盖；采集残缺／忽略目录／旧聚合桶看各图 `notes` 与顶层 `anomalies`）。技术图节点看 `origin_layer`／`counts.by_origin` 区分代码模块与规划层对象，**别把节点总数当代码模块数**（塔台实测 80 节点＝8 代码模块＋72 规划对象＋0 聊天补全）。
 - 照 `next_action` 干活：`claim_task`（带 `expected_revision` 的原子领取，冲突会被拒）→ 按返回的允许范围执行 → 核实 → `submit_task_result`（重新校验任务版本/依赖/认领 token/证据）→ 再调 `project_entry` 取下一项。既有授权内不必等人逐卡说继续。
 - 能力如实声明：`client_capabilities` 不声明就按「仅可读取」处理——只读客户端只拿读取与明确的接续指令，不假装能自动执行。MCP 提供工具不等于客户端必然主动调用（§6.2）。
 - 开工、完工、卡住时调 `report_task_status`（入参 `project_id` / `task_id` / `status`，四值 todo/doing/done/blocked；可带 `title`/`module_id`/`reporter`/`note`）自报任务状态。**任务状态的事实源是 v2 事件账本**：`read_progress` 里的模块四色是 v1 兼容读数，不得当现行状态；模块状态由 v2 证据派生，派生不到就如实「无状态记录」，不要自己给模块涂色。拿不准现状时回 `project_entry` 或 `list_tasks` 查，再报，不瞎报。

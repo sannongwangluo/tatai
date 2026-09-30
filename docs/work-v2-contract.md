@@ -129,6 +129,14 @@ logs/work-service.jsonl      # 服务启停留痕
 | `task.cancelled` | `reason` | → `cancelled`（旁路，单独标记；取消后不能被后续事件悄悄改回非取消） |
 | `task.rebound` | `from_definition_sha256` / `to_definition_sha256` / `to_plan_revision` / `to_definition_revision` / `disposition`（continue/adjust/pause） | 换定义绑定，**留痕不静默换输入** |
 
+**写边界的认领门禁（2026-09-30 有界修正）**：`task.claimed` 不只在 `claims.claimTask` 里过一遍预查——
+唯一写入服务的文件锁（`service.ts#submit` ②′.2）会用**锁内的事件现场**复核这张卡当前是不是 `blocked`，
+是则拒绝（`INVALID_COMMAND` + `detail.reason="blocked_not_claimable"`）、被拒命令零字节；直连
+`POST /api/work/command` 手写 `task.claimed` 因此不能旁路"只从就绪队列领"。合法的**续约**
+（`claim_action:"renew"` 且凭事件现场核实通过）不受此限——续约是持有者对已有认领的延长，不是新领；
+取消 / 已交付（`result_submitted`）的原有规则不变。解阻只能由协调器按**原启动条件**处理
+（先满足前置，再写 `task.status_changed(status="ready")`），一句话的"授权"不构成解阻凭据。
+
 ### 8.2 定义与状态分离
 
 施工定义来自施工图（`.工作台/plan.md` 或塔台根 `PLAN.md`）的第一张「卡号/依赖/完成证据」表 + 对应
@@ -304,6 +312,8 @@ severity 六值按**用户后果**定义：`blocks_core_goal / data_loss / unaut
 - `next_action` **恰好**七个取值：`resume_task` / `claim_task` / `review_result` / `await_role` / `await_decision` / `blocked` / `complete`；判定优先顺序写在 `entry.ts` 文件头与 `decideNextAction` 里（恢复优先于新领；无有效基线不派活）。
 - **只读红线**：入口不提交事件、不写文件、不认领、不调模型。它给的"下一项"是接续指令（任务/交接 ID、依据版本、依赖、允许范围、完成要求、`task_revision`），不是认领动作。
 - 能力发现（§6.2）：`client_capabilities` **未声明按「仅可读取」处理**；只读档位不会被派发 `resume_task`/`claim_task`（返回 `await_role` + 接续指令）。
+- **阻塞卡不许新领（2026-09-30 有界修正）**：任务执行状态是 `blocked` 时，`claim_task` 明确拒绝（`NOT_CLAIMABLE`，引 `blocked_reason` 原文并说明按**原启动条件**经协调器解阻），零认领事件；唯一写入服务的文件锁内复核同一判据（见 §8.1），直连 `POST /api/work/command` 手写 `task.claimed` 不能旁路。解阻只能由协调器写 `task.status_changed(status="ready")`（先满足原启动条件）；续约（`claim_action:"renew"`，核实通过）与释放不受此限。
+- **`required_reads` 的项目级扩展（2026-09-30 有界修正）**：除硬编码的四处（plan/design/baselines/events，按需再加 audit/checkpoint）外，入口另读一个**可选的**项目级运行配置 `<项目根>/.工作台/work/stage-reads.json`（与 `budget.json` 同层同类，**机器派生指针、不是新设计也不是授权源**），把本阶段必读原文（项目总图、AGENTS.md、当前交接等）追加进 `required_reads`（`kind` 复用既有枚举，**不新增必需 enum**；同一 `kind+path` 不重复列）。文件不存在 = 老项目原样兼容（**不**加 missing 理由、不阻断）；文件存在但不合法（坏 JSON / 未知字段 / 重复字段 / `schema_version` 不是 `1` / 体积超 256 KiB / 条目 `kind` 不在枚举内 / `path` 绝对路径、`..` 穿越、越出项目根或经软链逃逸 / `generated_from` 或 `entries` 点名的文件不存在 / 生成时 `sha256` 与当前内容不一致）→ 入口 `next_action="blocked"` + `reasons[].code="stage_reads_invalid"`，**不派活**（来源缺失或改过就拒发）。**重复字段按 JSON 字符串语义解码后判定**：`"schema_version"` 与 `"\u0073chema_version"` 是同一个键，转义写法不能绕过该检查（2026-09-30 按对端探针 `root-stage-review-o7ur1t/` 收口）。`preferred_task_id`（可选）只是排序意见：只在**真实就绪候选集合**内生效（依赖已释放、角色相符、范围无冲突），指不动就如实给 `stage_preferred_unusable` 并回落默认排序；调用方显式 `resume_hint` **优先于**它，两者都不越权绕过任何校验。指针格式与判据的唯一实现在 `src/server/work/stageReads.ts`。
 
 ### 12.2 认领与回报 `claim_task` / `submit_task_result`（MCP 写口；实现 `claims.ts`）
 

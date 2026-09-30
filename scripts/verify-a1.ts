@@ -1,23 +1,27 @@
 // A1 验证脚本（用 tsx 跑）：tree-sitter 静态解析顶层模块骨架（纯静态，零 LLM）。
 // 用法：pnpm verify:a1
 // 覆盖点（对应 A1 卡 DoD 逐条）：
-//   ① 对两个真实项目（一个 Python 后端 + 塔台自身 JS/TS，具体是哪个由 TATAI_REAL_IDS 给）真跑 parseProject：
-//      产出 .工作台/arch/modules.json，贴真实片段（模块清单 + 聚合边权重）；
+//   ① 对两个真实项目（一个 Python 后端 + 塔台自身 JS/TS，具体是哪个由 TATAI_REAL_IDS 给）在**隔离副本**上真跑
+//      parseProject：源码树复制到 tmp、注册进隔离 home，产出 .工作台/arch/modules.json 并贴片段（模块清单 + 聚合边权重）；
 //   ② 两项目顶层模块数都落在 5–15（§3.3 规则 1，贴数量）；
 //   ③ 贴耗时：parse_ms（tree-sitter 解析阶段本身，不含遍历/IO）与单文件均值（毫秒级口径）；
 //   ④ 绑定选型结论见 PROGRESS.md 流水（node binding，未决项 #2）；
-//   ⑤ 合并兜底：造 30 个顶层目录的临时项目 → 断言 ≤15（14 + 其他聚合桶）；
+//   ⑤ 采集层无损化：造 30 个顶层目录的临时项目 → 断言 modules.json 30 个模块全保留、无「其他」桶、
+//      每个 id＝slugify(路径)；概览投影 buildSharedGraphFrom 仍 15 节点（14＋__more__、隐藏 16）。勘误见 ⑤ 段；
 //   ⑥ import 解析正确性抽查：临时项目手写 py/ts 互相 import → 断言边与权重精确；
 //   ⑦ 少于 5 时按二级目录细分补；
 //   ⑧ HTTP 全链路：POST arch/parse 落盘 + GET arch/modules 读回 + 未解析空态 exists:false。
-// 备注：① 对两个真实项目是真实落盘（各自 .工作台/arch/modules.json，塔台纳管口径内）。
+// 备注（2026-09-29 返工）：① 对真实项目在**隔离副本**上真跑（源码树复制到 tmp、注册进隔离 home），
+// 真实项目 .工作台 零写入（2026-09-29 返工：此前真跑会重写真实 modules.json，Codex 审验要求改为隔离副本）。
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseDirectory, parseProject, readModules, type ArchModulesFile } from "../src/arch/parse";
+import { parseDirectory, parseProject, readModules, slugify, type ArchModulesFile } from "../src/arch/parse";
+import { ARCH_LIMITS, isJunkDir, MORE_NODE_ID } from "../src/arch/config";
+import { buildSharedGraphFrom } from "../src/arch/shared-graph";
 import { addProject, getProject } from "../src/server/registry";
 import { ensureSelfRegistered, finish, realHome, realProjectIds, skip } from "./lib/fixtures";
 
@@ -28,6 +32,10 @@ const BASE = `http://localhost:${PORT}`;
 // 真实项目清单 = 塔台自身（本仓库，幂等登记）+ TATAI_REAL_IDS 列出的注册表项目 id
 const REAL_DATA_DIR = realHome();
 ensureSelfRegistered(REAL_DATA_DIR);
+
+// ①②③ 隔离副本用的临时目录（隔离 home ＋ 隔离源码副本），main 收尾统一删除；
+// 真实项目与真实 home 一律不碰（2026-09-29 返工：改隔离副本，不再对真实项目真跑落盘）。
+const ISO_TMP: string[] = [];
 
 const ok = (cond: boolean, label: string) => {
   console.log(`[verify] ${cond ? "PASS" : "FAIL"} ${label}`);
@@ -101,57 +109,107 @@ function printFragment(tag: string, arch: ArchModulesFile, parseMs: number, dura
   console.log(`[verify]   聚合边总数=${edgeCount}`);
 }
 
-async function main(): Promise<void> {
-  // ── ①②③ 真实项目：塔台自身 + TATAI_REAL_IDS 给的项目（各自 .工作台 真实落盘）───
-  console.log("[verify] ── ①②③ 真实项目解析（真实落盘各自 .工作台/arch/modules.json）");
-  for (const [id, expectMin, expectMax] of realProjectIds().map((id) => [id, 5, 15] as const)) {
-    if (!getProject(id, REAL_DATA_DIR)) {
-      skip(
-        `① 真实项目 ${id} 解析`,
-        `注册表里没有 ${id}：设 TATAI_REAL_IDS=<已登记的项目 id,…> 与 TATAI_HOME=<数据目录> 后可跑`,
-      );
-      continue;
+/** 隔离副本用：递归复制源码树 srcRoot → dstRoot，**跳过**垃圾目录段（isJunkDir）与临时交换文件（*.tmp）。
+ *  .工作台/node_modules/dist/target 等都在 JUNK_DIR_SEGMENTS 里，天然被跳过——与解析扫描的忽略口径一致，
+ *  副本上解析出的模块集合因此与真实树等价；真实项目目录只读源、不写不改。 */
+function copySourceTree(srcRoot: string, dstRoot: string): void {
+  fs.mkdirSync(dstRoot, { recursive: true });
+  for (const entry of fs.readdirSync(srcRoot, { withFileTypes: true })) {
+    const src = path.join(srcRoot, entry.name);
+    const dst = path.join(dstRoot, entry.name);
+    if (entry.isDirectory()) {
+      if (isJunkDir(entry.name)) continue;
+      copySourceTree(src, dst);
+    } else if (entry.isFile()) {
+      if (entry.name.endsWith(".tmp")) continue;
+      fs.copyFileSync(src, dst);
     }
-    const r = parseProject(id, REAL_DATA_DIR);
-    ok(fs.existsSync(r.source), `① ${id} modules.json 真实落盘（${r.source}）`);
-    const back = readModules(id, REAL_DATA_DIR);
-    ok(back.exists === true && back.arch !== undefined, `① ${id} modules.json 可读回`);
-    if (!back.arch) continue;
-    ok(back.arch.version === 1 && typeof back.arch.generated_at === "string", `① ${id} 结构 version/generated_at 正确`);
-    ok(back.arch.modules.every((m) => m.name === ""), `① ${id} name 字段留空（A2 Flash 起名填）`);
-    ok(back.arch.modules.every((m) => typeof m.id === "string" && m.id !== "" && typeof m.file_count === "number"), `① ${id} id 稳定非空（路径 slug）`);
-    ok(
-      back.arch.modules.length >= expectMin && back.arch.modules.length <= expectMax,
-      `② ${id} 顶层模块数 ${back.arch.modules.length} ∈ [${expectMin}, ${expectMax}]（§3.3 规则 1）`,
-    );
-    const weightSum = back.arch.modules.flatMap((m) => m.deps).reduce((n, d) => n + d.weight, 0);
-    console.log(`[verify]   ${id} import 提取 ${r.stats.imports} 条 → 聚合边权重总和 ${weightSum}（源码 ${r.stats.source_files} 文件，跳过大文件 ${r.stats.skipped_large}）`);
-    ok(weightSum <= r.stats.imports, `① ${id} 边权重 ≤ import 条数（模块内边不画，只少不多）`);
-    printFragment(id, back.arch, r.parse_ms, r.duration_ms, r.stats.source_files);
+    // 其余类型（符号链接等）跳过：解析扫描也不跟进，避免环
+  }
+}
+
+async function main(): Promise<void> {
+  // ── ①②③ 真实项目：塔台自身 + TATAI_REAL_IDS 给的项目（隔离副本上真跑，真实项目零写入）───
+  console.log("[verify] ── ①②③ 真实项目解析（源码复制到隔离副本、注册进隔离 home；真实项目 .工作台 零写入）");
+  // 2026-09-29（六图完整读取轮）：期望上界从 15 放开——采集层不再有损合并（DESIGN §4.3 修订），
+  // 真实项目顶层候选 >15 是合法落盘结果；15 上限只约束概览投影层（⑤ 段已按新口径断言）。
+  // 2026-09-29 返工（Codex 审验）：此前直接 parseProject(id, REAL_DATA_DIR) 会重写真实项目
+  // .工作台/arch/modules.json；现改为复制源码树到隔离 tmp、注册进隔离 home，真实项目与真实 home 一律不写不删。
+  try {
+    for (const [id, expectMin] of realProjectIds().map((id) => [id, 5] as const)) {
+      const real = getProject(id, REAL_DATA_DIR);
+      if (!real) {
+        skip(
+          `① 真实项目 ${id} 解析`,
+          `注册表里没有 ${id}：设 TATAI_REAL_IDS=<已登记的项目 id,…> 与 TATAI_HOME=<数据目录> 后可跑`,
+        );
+        continue;
+      }
+      // 隔离 home ＋ 隔离源码副本：真实项目目录只作只读源，不落盘、不注册进真实注册表
+      const isoHome = fs.mkdtempSync(path.join(os.tmpdir(), "tatai-a1-iso-home-"));
+      ISO_TMP.push(isoHome);
+      const srcTmp = fs.mkdtempSync(path.join(os.tmpdir(), "tatai-a1-iso-src-"));
+      ISO_TMP.push(srcTmp);
+      const isoPath = path.join(srcTmp, "proj");
+      copySourceTree(real.path, isoPath);
+      const isoId = "a1-iso-" + id;
+      addProject({ id: isoId, name: "A1 隔离副本", path: isoPath, kind: real.kind }, isoHome);
+      const r = parseProject(isoId, isoHome);
+      ok(fs.existsSync(r.source), `① ${id} modules.json 隔离副本落盘（${r.source}）`);
+      ok(!r.source.startsWith(real.path), `① ${id} 落盘路径不在真实项目目录下（真实项目目录零写入）`);
+      const back = readModules(isoId, isoHome);
+      ok(back.exists === true && back.arch !== undefined, `① ${id} modules.json 可读回`);
+      if (!back.arch) continue;
+      ok(back.arch.version === 1 && typeof back.arch.generated_at === "string", `① ${id} 结构 version/generated_at 正确`);
+      ok(back.arch.modules.every((m) => m.name === ""), `① ${id} name 字段留空（A2 Flash 起名填）`);
+      ok(back.arch.modules.every((m) => typeof m.id === "string" && m.id !== "" && typeof m.file_count === "number"), `① ${id} id 稳定非空（路径 slug）`);
+      ok(
+        back.arch.modules.length >= expectMin,
+        `② ${id} 顶层模块数 ${back.arch.modules.length} ≥ ${expectMin}（下限照旧；上界 2026-09-29 起放开——采集层 >15 合法落盘，15 上限在概览投影层）`,
+      );
+      const weightSum = back.arch.modules.flatMap((m) => m.deps).reduce((n, d) => n + d.weight, 0);
+      console.log(`[verify]   ${id} import 提取 ${r.stats.imports} 条 → 聚合边权重总和 ${weightSum}（源码 ${r.stats.source_files} 文件，跳过大文件 ${r.stats.skipped_large}）`);
+      ok(weightSum <= r.stats.imports, `① ${id} 边权重 ≤ import 条数（模块内边不画，只少不多）`);
+      // tag 用原 id（输出可读性），内部数据来自隔离副本
+      printFragment(id, back.arch, r.parse_ms, r.duration_ms, r.stats.source_files);
+    }
+  } finally {
+    for (const dir of ISO_TMP) fs.rmSync(dir, { recursive: true, force: true });
   }
 
-  // ── ⑤ 合并兜底：30 个顶层目录 → ≤15 ──────────────────────────────
-  console.log("\n[verify] ── ⑤ 合并兜底（30 顶层目录临时项目）");
+  // ── ⑤ 采集层无损化：30 个顶层目录 → modules.json 全保留 + 概览投影仍 15 ─────
+  // 2026-09-29 勘误（六图完整读取轮，DESIGN §4.3 已修订）：旧期望「落盘层合并后 ≤15＝14＋
+  // id=other「其他」聚合桶」。依据变更：采集落盘层（parse.ts 删 mergeOverflow）不再有损合并，
+  // >15 的候选原样落盘 modules.json；15 上限只在概览投影层（shared-graph.ts buildSharedGraphFrom
+  // 的 ARCH_LIMITS.MAX_NODES）施加，保留 14 个真实节点＋1 个 __more__ 聚合节点。
+  // 断言随之定向更新（不降强度：由「合并到 ≤15」改成「全保留、身份稳定」）。
+  console.log("\n[verify] ── ⑤ 采集层无损化（30 顶层目录临时项目）");
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "tatai-a1-verify-"));
   try {
     const big = path.join(tmpBase, "proj-30dirs");
     for (let i = 1; i <= 30; i++) {
       const d = path.join(big, `mod${String(i).padStart(2, "0")}`);
       fs.mkdirSync(d, { recursive: true });
-      // 文件数递减：mod01 最大，便于断言保留大头
+      // 文件数递减：mod01 最大，便于断言概览保留大头
       for (let j = 0; j <= 30 - i; j++) fs.writeFileSync(path.join(d, `f${j}.py`), `x${i}_${j} = 1\n`, "utf8");
     }
     const rBig = parseDirectory(big);
-    ok(rBig.file.modules.length <= 15, `⑤ 30 顶层目录 → 合并后 ${rBig.file.modules.length} ≤ 15`);
-    const other = rBig.file.modules.find((m) => m.id === "other");
-    ok(other !== undefined, "⑤ 存在「其他」聚合桶（id=other）");
-    if (other) {
-      console.log(`[verify]   聚合桶 path=${JSON.stringify(other.path)} files=${other.file_count}`);
-      ok(other.path.includes(","), "⑤ 聚合桶 path 记录被合并的路径清单");
-    }
+    const TOPS = 30;
+    ok(rBig.file.modules.length === TOPS, `⑤ ${TOPS} 顶层目录 → modules.json ${rBig.file.modules.length} 个模块全保留（旧期望：合并后 ≤15＝14＋「其他」桶；新期望：全保留 ${TOPS}）`);
+    ok(!rBig.file.modules.some((m) => m.id === "other" || m.path.startsWith("其他:")), "⑤ 无「其他」聚合桶（id=other / path 以「其他:」开头）（旧期望：存在该桶；新期望：采集层不合并）");
+    ok(rBig.file.modules.every((m) => m.id === slugify(m.path)), "⑤ 每个模块 id＝slugify(路径)（稳定身份，原始候选逐个在场）");
+    // 概览投影层上限仍在：buildSharedGraphFrom(模块数组) → 15 节点（14 真实＋__more__），隐藏 30−14
+    const gOverview = buildSharedGraphFrom(rBig.file.modules, {});
+    ok(
+      gOverview.nodes.length === ARCH_LIMITS.MAX_NODES &&
+        gOverview.nodes.filter((n) => n.aggregate !== true).length === ARCH_LIMITS.MAX_NODES - 1 &&
+        gOverview.nodes.some((n) => n.id === MORE_NODE_ID) &&
+        gOverview.truncated.nodes === TOPS - (ARCH_LIMITS.MAX_NODES - 1),
+      `⑤ 概览投影：${gOverview.nodes.length} 节点（${ARCH_LIMITS.MAX_NODES - 1}＋__more__）、隐藏 ${gOverview.truncated.nodes}（上限移到概览层，不消失）`,
+    );
     ok(rBig.file.modules.some((m) => m.id === "mod01"), "⑤ 文件数最大的目录保留为独立模块");
     const totalFiles = rBig.file.modules.reduce((n, m) => n + m.file_count, 0);
-    ok(totalFiles === 465, `⑤ 合并不丢文件（${totalFiles} = 30+29+…+1）`);
+    ok(totalFiles === 465, `⑤ 落盘不丢文件（${totalFiles} = 30+29+…+1）`);
 
     // ── ⑥ import 解析正确性抽查（py 与 ts 各一组，权重精确）──────────
     console.log("\n[verify] ── ⑥ import 正确性（权重精确断言）");
@@ -195,6 +253,7 @@ async function main(): Promise<void> {
     ok(rFew.file.modules.some((m) => m.id === "src-alpha"), "⑦ 细分模块 id 为二级路径 slug（src-alpha）");
 
     // ── ⑧ HTTP 全链路 ───────────────────────────────────────────
+    // ⑧ 用临时夹具（tmpBase/home ＋ 临时项目 imp），不碰真实项目与真实 home——无需隔离副本（2026-09-29 核查确认）
     console.log("\n[verify] ── ⑧ HTTP 全链路（临时数据目录 + 临时项目）");
     const dataDir = path.join(tmpBase, "home");
     fs.mkdirSync(dataDir, { recursive: true });

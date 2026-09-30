@@ -20,6 +20,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { evaluateBuildStamps, STAMP_REL, stampsEqual, type BuildStamp } from "./lib/buildStamp";
 import { buildOutputManifest, sourceFingerprint } from "./lib/sourceFingerprint";
+// 安装包文件名带产品版本号；唯一来源见 src/shared/version.ts（读仓库根 package.json）
+import { APP_VERSION } from "../src/shared/version";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const BIND = process.env.V0904_BIND_OUT
@@ -36,8 +38,8 @@ const ok = (cond: boolean, label: string): void => {
 
 const ART = {
   exe: "src-tauri/target/release/tatai.exe",
-  nsis: "src-tauri/target/release/bundle/nsis/Tatai_0.1.1_x64-setup.exe",
-  msi: "src-tauri/target/release/bundle/msi/Tatai_0.1.1_x64_en-US.msi",
+  nsis: `src-tauri/target/release/bundle/nsis/Tatai_${APP_VERSION}_x64-setup.exe`,
+  msi: `src-tauri/target/release/bundle/msi/Tatai_${APP_VERSION}_x64_en-US.msi`,
 };
 
 console.log("[verify] ═══ ① 三件产物在场 ═══");

@@ -19,6 +19,7 @@ import { readProgressTool } from "./readProgress";
 import { reportTaskStatusTool } from "./reportTaskStatus";
 import { selectProjectTool } from "./selectProject";
 import { updateProgressTool } from "./updateProgress";
+import { SYNC_EVIDENCE_TOOLS } from "./syncEvidence";
 import { registerToolNameSource } from "../../server/work/eventSurface";
 import type { McpTool } from "./types";
 
@@ -54,6 +55,9 @@ export const TOOLS: readonly McpTool[] = [
   // V07-04（DESIGN 附录 C.5-4）：接续入口体检——一次调用报写服务/描述符/基线/迁移/事件面五项；
   // 只读探活，heal=true 才走自愈。它只报事实，不做任何写入（不是 gate 写入类工具）。
   doctorTool,
+  // V09-23（DESIGN §2.10 / docs/sync-evidence-contract.md）：同步域三个规范接口——
+  // register_sync_contract（写）/ scan_sync_evidence（写，经宿主）/ read_sync_status（只读）。
+  ...SYNC_EVIDENCE_TOOLS,
 ];
 
 export function findTool(name: string): McpTool | undefined {

@@ -19,6 +19,7 @@
 // `src/ui/arch/provenance.ts`，派生见 `src/arch/blueprint.ts#archProvenanceModelOf`——读口不另算一套。
 // 只读；未解析过项目返回空态说明（200 空态口径，不是错误）。
 import { archProvenanceModelOf } from "../../arch/blueprint";
+import { RENDER_FULL_LIMITS } from "../../arch/config";
 import { DISPLAY_STATUS_PALETTE, NO_STATUS_RECORD_KEY } from "../../ui/arch/statusColor";
 import { MODULE_VERIFIED_SHORT } from "../../ui/arch/projectGraph";
 import { dataFlowLayerOf, renderGraph, techModuleStatusOf } from "../../arch/render";
@@ -54,11 +55,21 @@ export const getArchTool: McpTool = {
     "（`delivery`：存在未映射/未验证/缺证/证据失效时给「不可判定项目可交付」并逐条点名；" +
     "全部满足才给「可请求验收」——**仍不等于用户接受**，人工待验由用户本人记录）。" +
     "规划层（能力/声明模块/任务）与逐对象状态见 `project_entry` 或状态投影。" +
+    "`full`（V09-22）＝全量上限：缺省 false 是概览（15 节点/40 边硬上限，兼容不变）；true 换全量上限" +
+    "（2000 节点/4000 边、扇出过滤关闭，同一份 builder/同一节点身份，超限仍聚合计数）。" +
+    "注意全量模式**只解除渲染上限聚合**：采集侧 `budget_exhausted`（到点收工的残缺）与规则忽略目录" +
+    "（node_modules/.git/dist/build/target/缓存等）仍如实存在，不是完整采集；数千节点级的完整遍历用 " +
+    "`get_project_graphs` 的 `mode=full`（同快照分页）。" +
     "还没静态解析过时返回空态说明。",
   inputSchema: {
     type: "object",
     properties: {
       project_id: { type: "string", description: "注册表里的项目 id" },
+      full: {
+        type: "boolean",
+        description:
+          "缺省 false＝概览（15 节点/40 边上限，兼容不变）；true＝全量上限（2000 节点/4000 边、扇出关闭，同一 builder/同一节点身份，超限仍聚合计数）。数千节点级的完整遍历用 get_project_graphs mode=full（同快照分页）。",
+      },
     },
     required: ["project_id"],
     additionalProperties: false,
@@ -68,7 +79,8 @@ export const getArchTool: McpTool = {
     if (projectId === "") {
       return errorResult("get_arch 缺入参 project_id");
     }
-    const r = renderGraph(projectId);
+    // V09-22：full=true 走全量上限（RENDER_FULL_LIMITS）；缺省走原调用，行为逐字不变。
+    const r = renderGraph(projectId, args.full === true ? { limits: RENDER_FULL_LIMITS } : undefined);
     if (!r.exists || !r.graph) {
       return textResult(
         "项目还没静态解析过（可在「架构图」页签点解析生成；聊天补全层可先写、解析后一并显示）",

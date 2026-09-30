@@ -3,6 +3,9 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    // src/shared/version.ts 直接 import 仓库根 package.json 的 version 字段（构建期内联，
+    // 见该文件注释；随包产物运行时不读文件）
+    "resolveJsonModule": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
     "strict": true,

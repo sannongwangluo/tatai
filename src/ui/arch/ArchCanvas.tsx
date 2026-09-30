@@ -64,6 +64,7 @@ import {
 import type { ProjectItem } from "../api";
 import {
   deleteArchParseRun,
+  getArchItems,
   getArchLayout,
   getArchParseRun,
   getArchReconcile,
@@ -76,6 +77,8 @@ import {
   putArchLayout,
   type ArchParseAck,
 } from "../api";
+// V09-22：未聚合并集对象（隐藏对象抽屉的行与详情读它；type-only 复用，服务端实现不进前端包）
+import type { SharedGraphEdge, SharedModuleNode } from "../../arch/items";
 // T19：run 现场类型 type-only 复用（编译期擦除，服务端实现不进前端包——同 ArchParseStats 的 Q133 口径）
 import type { ParseRun } from "../../arch/parse";
 import { FILE_NODE_HEIGHT, FILE_NODE_WIDTH, NODE_HEIGHT, NODE_WIDTH, gridLayout, layoutSubtree, layoutWithDagre } from "./layout";
@@ -553,6 +556,49 @@ const REVEAL_HARD_MIN_ZOOM = 0.1;
  *  不反向缩小用户视角。只作用于 override（主视图）路径；技术详情三图（78+ 节点）维持 0.05 下限。 */
 const OVERRIDE_FIT_MIN_ZOOM = 0.26;
 
+/** V09-22（契约 2）：子级稳定分页续取的**安全上限**——到顶仍未取完就如实停止并 `console.warn` 留痕
+ *  （不静默丢页、不冒充全量）。50 页 × 默认页 200 = 1 万级，足够覆盖真实巨枝，异常时不至于挂住请求线程。 */
+const MAX_EXPAND_PAGES = 50;
+
+/**
+ * V09-22（契约 2）：全量模式下把一条枝的子级**按稳定分页取全**（上限外的子级逐项可取回）。
+ *
+ * 首拉带 `childrenOffset: 0` → 服务端进分页模式（不再为「还有 N 个」聚合节点保留名额，返回体带
+ * `children_total/offset/returned/has_more`）；`children_has_more` 为真就按 `offset + returned` 续取，
+ * 直到取完。合并后：`children` 为全量真实子级；`truncated.children` 取**末页**值（取完即 0，
+ * 到安全上限未取完则如实保留余量，画布上照旧显示聚合口径）。
+ * 不带分页字段的旧返回体不会进这里（调用方只在全量模式调本函数）。
+ */
+async function postArchExpandAll(projectId: string, modulePath: string): Promise<ExpandResult> {
+  let last = await postArchExpand(projectId, modulePath, { full: true, childrenOffset: 0 });
+  let merged = [...last.children];
+  let pages = 1;
+  while (last.children_has_more === true) {
+    if (pages >= MAX_EXPAND_PAGES) {
+      console.warn(
+        `[arch/expand] 子级分页达到安全上限 ${MAX_EXPAND_PAGES} 页仍未取完（path=${modulePath}，` +
+          `已取 ${merged.length}/${last.children_total ?? "?"}）——如实停止，不冒充全量`,
+      );
+      break;
+    }
+    const returned = last.children_returned ?? last.children.length;
+    if (returned <= 0) break; // 空页：offset 不前进，避免死循环（页数由安全上限兜底）
+    last = await postArchExpand(projectId, modulePath, {
+      full: true,
+      childrenOffset: (last.children_offset ?? 0) + returned,
+    });
+    merged = merged.concat(last.children);
+    pages++;
+  }
+  return { ...last, children: merged };
+}
+
+/** V09-22：隐藏对象抽屉的两个 kind tab（值即 `/arch/items` 的 kind 参数，命名随本页既有页签风格） */
+const HIDDEN_KINDS: { value: "nodes" | "edges"; label: string }[] = [
+  { value: "nodes", label: "节点" },
+  { value: "edges", label: "边" },
+];
+
 export function ArchCanvas({
   project,
   mode,
@@ -592,6 +638,45 @@ export function ArchCanvas({
   const [exists, setExists] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // ── V09-22：全量模式（「显示全部」）与画布内搜索 ──────────────────────────────
+  /** 「显示全部」= 同一 builder 换全量上限拉 arch/render（概览默认一个字节不动）；仅 !usingOverride 可用 */
+  const [showAll, setShowAll] = useState(false);
+  /** showAll 的 ref 镜像：load 只依赖 [project.id]，靠它读到当前模式，不把 load 重建 */
+  const showAllRef = useRef(false);
+  showAllRef.current = showAll;
+  /** 画布内搜索词（大小写不敏感子串，匹配 label/id/path；范围为当前图 + 已缓存子级） */
+  const [search, setSearch] = useState("");
+  /** 当前命中序号（Enter=下一个、Shift+Enter=上一个；换词归零） */
+  const [hitIdx, setHitIdx] = useState(0);
+  // ── V09-22：隐藏对象抽屉（全量模式下把「被聚合/扇出过滤丢弃」的对象逐项取回）──────────────
+  // 未聚合并集读口（`/arch/items`）在客户端的分页消费：可搜索（防抖 300ms）、可翻页、可点开详情。
+  /** 抽屉开合（入口按钮切换；换项目/切模式由重置 effect 关闭并清空） */
+  const [hiddenOpen, setHiddenOpen] = useState(false);
+  /** 抽屉当前 kind（节点/边两个 tab） */
+  const [hiddenKind, setHiddenKind] = useState<"nodes" | "edges">("nodes");
+  /** 搜索框里的实时输入（防抖 300ms 后才作为查询词拉取；空串＝清过滤、回第一页全集） */
+  const [hiddenQueryInput, setHiddenQueryInput] = useState("");
+  /** 生效的查询词（防抖产物） */
+  const [hiddenQuery, setHiddenQuery] = useState("");
+  /** 当前已取回的行（节点与边同槽位，按 hiddenKind 解释） */
+  const [hiddenRows, setHiddenRows] = useState<(SharedModuleNode | SharedGraphEdge)[]>([]);
+  /** 分页读数（total=过滤后总数；has_more=false 后「加载更多」隐藏） */
+  const [hiddenPage, setHiddenPage] = useState<{ total: number; offset: number; returned: number; has_more: boolean }>({
+    total: 0,
+    offset: 0,
+    returned: 0,
+    has_more: false,
+  });
+  const [hiddenBusy, setHiddenBusy] = useState(false);
+  const [hiddenError, setHiddenError] = useState<string | null>(null);
+  /** 抽屉取数代际：换项目/换 kind/换查询词/翻页交织时，在途旧应答凭它作废（同 loadGenRef 的思路） */
+  const hiddenGenRef = useRef(0);
+  /** 搜索防抖定时器 */
+  const hiddenDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** 抽屉行点击打开的对象详情（对象与 render 节点/边同构；面板根挂 `data-arch-detail`） */
+  const [detailObject, setDetailObject] = useState<
+    { kind: "node"; node: SharedModuleNode } | { kind: "edge"; edge: SharedGraphEdge } | null
+  >(null);
   // §3.3 可折叠树状态：初次进入默认全部折叠；展开位按节点 id 存
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   // A4 懒加载缓存：已展开的父节点 id → 子级数据；折叠不丢，再展开零请求
@@ -633,6 +718,9 @@ export function ArchCanvas({
    *  （不停新项目的轮询、不往新画布写旧项目的图） */
   const projectIdRef = useRef(project.id);
   projectIdRef.current = project.id;
+  /** V09-22：`load` 的代际——换项目重置 effect 与「显示全部」切换都会调它，两次请求可能交织；
+   *  在途应答凭调用时自增的代际识别自己是否已作废（同 ArchCanvas 里 parsePollGenRef 的思路）。 */
+  const loadGenRef = useRef(0);
   const unmountedRef = useRef(false);
   useEffect(() => {
     unmountedRef.current = false;
@@ -671,6 +759,7 @@ export function ArchCanvas({
   locateNodeRef.current = (id, label, path) => onLocate?.({ id, label, path });
 
   const load = useCallback(() => {
+    const gen = ++loadGenRef.current; // V09-22：本次调用的代际（换项目/切模式交织时凭它丢弃旧应答）
     setError(null);
     setDataLoads((n) => n + 1); // F4 DoD③：数据层拉取次数（切视图不得增长）
     const override = overrideRef.current;
@@ -681,22 +770,28 @@ export function ArchCanvas({
       setGraph(override);
       setReconcile(null);
       getArchLayout(project.id)
-        .then((layout) => setLayoutByMode(layout.positions))
+        .then((layout) => {
+          if (loadGenRef.current === gen) setLayoutByMode(layout.positions);
+        })
         .catch(() => undefined);
       return;
     }
     Promise.all([
-      getArchRender(project.id),
+      // V09-22：按当前模式拉取（显示全部时走 ?full=1，同一 builder 换上限；概览默认逐字不变）
+      getArchRender(project.id, { full: showAllRef.current }),
       getArchLayout(project.id).catch(() => ({ version: 2 as const, positions: {} })),
       getArchReconcile(project.id).catch(() => ({ exists: false as const })),
     ])
       .then(([r, layout, rec]) => {
+        if (loadGenRef.current !== gen) return; // 换项目/切模式后的旧应答不写新画布
         setExists(r.exists);
         setGraph(r.graph ?? null);
         setLayoutByMode(layout.positions);
         setReconcile(rec.exists ? (rec.result ?? null) : null);
       })
-      .catch((e: Error) => setError(e.message));
+      .catch((e: Error) => {
+        if (loadGenRef.current === gen) setError(e.message);
+      });
   }, [project.id]);
 
   // V06-06：外部数据换了（筛选/概览截断/源更新）就地换图——**不清折叠、不清子级缓存、不清布局**：
@@ -704,6 +799,108 @@ export function ArchCanvas({
   useEffect(() => {
     if (graphOverride !== null && graphOverride !== undefined) setGraph(graphOverride);
   }, [graphOverride]);
+
+  // V09-22：切换「显示全部 / 返回概览」就地重拉数据层（同一 builder 换上限参数，不另造图事实源）——
+  // 折叠 / 子级缓存 / 布局不清（新节点由 dagre 兜底落位，现有机制）；挂载首轮不重拉（项目 effect 已拉过）。
+  const showAllMountedRef = useRef(false);
+  useEffect(() => {
+    if (!showAllMountedRef.current) {
+      showAllMountedRef.current = true; // 挂载首轮：load 已由项目重置 effect 触发
+      return;
+    }
+    if (usingOverride) return; // 主视图（override）没有「显示全部」入口
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showAll]);
+
+  // ── V09-22：隐藏对象抽屉的生命周期 ──────────────────────────────────────────────
+  // 换项目/切「显示全部」= 关闭抽屉、清空列表与详情，并作废在途应答（并入既有重置口径）。
+  useEffect(() => {
+    hiddenGenRef.current += 1;
+    setHiddenOpen(false);
+    setHiddenKind("nodes");
+    setHiddenQueryInput("");
+    setHiddenQuery("");
+    setHiddenRows([]);
+    setHiddenPage({ total: 0, offset: 0, returned: 0, has_more: false });
+    setHiddenError(null);
+    setDetailObject(null);
+    if (hiddenDebounceRef.current) {
+      clearTimeout(hiddenDebounceRef.current);
+      hiddenDebounceRef.current = null;
+    }
+  }, [project.id, showAll]);
+
+  /** V09-22：抽屉搜索防抖 300ms——输入停下才把词交给取数 effect（空串＝清过滤、回第一页全集） */
+  useEffect(() => {
+    if (hiddenDebounceRef.current) clearTimeout(hiddenDebounceRef.current);
+    hiddenDebounceRef.current = setTimeout(() => {
+      setHiddenQuery(hiddenQueryInput.trim());
+    }, 300);
+    return () => {
+      if (hiddenDebounceRef.current) clearTimeout(hiddenDebounceRef.current);
+    };
+  }, [hiddenQueryInput]);
+
+  /** V09-22：抽屉第一页取数（打开 / 换 kind / 换查询词时重置回第一页，带 q 拉取） */
+  useEffect(() => {
+    if (!hiddenOpen) return;
+    const gen = ++hiddenGenRef.current;
+    setHiddenBusy(true);
+    setHiddenError(null);
+    getArchItems(project.id, {
+      kind: hiddenKind,
+      ...(hiddenQuery !== "" ? { q: hiddenQuery } : {}),
+      offset: 0,
+    })
+      .then((page) => {
+        if (hiddenGenRef.current !== gen || projectIdRef.current !== project.id) return;
+        setHiddenRows(page.nodes ?? page.edges ?? []);
+        setHiddenPage({ total: page.total, offset: page.offset, returned: page.returned, has_more: page.has_more });
+      })
+      .catch((e: Error) => {
+        if (hiddenGenRef.current === gen) setHiddenError(e.message);
+      })
+      .finally(() => {
+        if (hiddenGenRef.current === gen) setHiddenBusy(false);
+      });
+  }, [hiddenOpen, hiddenKind, hiddenQuery, project.id]);
+
+  /** V09-22：抽屉「加载更多」——按 offset + returned 取下一页并追加（has_more=false 后按钮隐藏） */
+  const loadMoreHidden = useCallback(() => {
+    const gen = ++hiddenGenRef.current;
+    setHiddenBusy(true);
+    setHiddenError(null);
+    getArchItems(project.id, {
+      kind: hiddenKind,
+      ...(hiddenQuery !== "" ? { q: hiddenQuery } : {}),
+      offset: hiddenPage.offset + hiddenPage.returned,
+    })
+      .then((page) => {
+        if (hiddenGenRef.current !== gen || projectIdRef.current !== project.id) return;
+        setHiddenRows((prev) => [...prev, ...(page.nodes ?? page.edges ?? [])]);
+        setHiddenPage({ total: page.total, offset: page.offset, returned: page.returned, has_more: page.has_more });
+      })
+      .catch((e: Error) => {
+        if (hiddenGenRef.current === gen) setHiddenError(e.message);
+      })
+      .finally(() => {
+        if (hiddenGenRef.current === gen) setHiddenBusy(false);
+      });
+  }, [hiddenKind, hiddenQuery, hiddenPage.offset, hiddenPage.returned, project.id]);
+
+  /** V09-22：抽屉行点击 → 打开对象详情（对象与 render 节点同构）。复用画布节点详情的打开路径：
+   *  外部给了 `onNodeClick`（主视图）时也一并交给它；技术详情两图不传该回调，只开本画布自己的详情面板。
+   *  点击后**抽屉保持打开**（面板浮在画布上，两者可并存）。 */
+  const openHiddenDetail = useCallback(
+    (item: { kind: "node"; node: SharedModuleNode } | { kind: "edge"; edge: SharedGraphEdge }) => {
+      setDetailObject(item);
+      if (item.kind === "node") {
+        onNodeClickRef.current?.({ id: item.node.id, label: item.node.name, path: item.node.path });
+      }
+    },
+    [],
+  );
 
   // ── V09-07（附录 E.8-1）：图页自动失效重取——工作事件账本 `task_last_seq` 前进就自动 `load()`，
   //    无需手动刷新（手动「重新解析/刷新」等既有入口不动）。4s 轮询 `GET live`；只在页面可见时跑
@@ -743,8 +940,12 @@ export function ArchCanvas({
   const runReconcile = useCallback(() => {
     setReconcileBusy(true);
     postArchReconcile(project.id)
-      .then((result) => setReconcile(result))
-      .catch((e: Error) => setError(e.message))
+      .then((result) => {
+        if (projectIdRef.current === project.id) setReconcile(result); // 应答跨 await：项目已换则丢弃
+      })
+      .catch((e: Error) => {
+        if (projectIdRef.current === project.id) setError(e.message);
+      })
       .finally(() => setReconcileBusy(false));
   }, [project.id]);
 
@@ -763,6 +964,9 @@ export function ArchCanvas({
    *  拉回落盘真实现状（旧结果可能仍在）；failed 报错并拉回真实现状。每个 run 只应用一次。 */
   const applyParseTerminal = useCallback(
     async (run: ParseRun) => {
+      // V09-22：应答跨 await 回来时项目可能已换/组件已卸——与 handleParse 同一份 stale 口径
+      // （就地一行，不引新抽象层）；本函数入口只保证 run 终态去重，不保证项目仍是同一个。
+      const stale = (): boolean => unmountedRef.current || projectIdRef.current !== project.id;
       const key = `${run.id}:${run.status}`;
       if (parseTermRef.current === key) return;
       parseTermRef.current = key;
@@ -781,7 +985,9 @@ export function ArchCanvas({
         }
         setBusy("正在读取渲染数据…");
         try {
-          let r = await getArchRender(project.id);
+          // V09-22：解析完成后的重取按当前模式拉（全量态不被静默退回概览——load 同一镜像口径）
+          let r = await getArchRender(project.id, { full: showAllRef.current });
+          if (stale()) return;
           // 引导态同口径（§3.3）：无 names 缓存时起名兜底——但只有本页面发起的 run 才接这步；
           // 起名失败不报废画布：按模块 id 兜底显示，原因进横幅（旧口径是整卡错误页，图都出不来）
           if (
@@ -794,7 +1000,9 @@ export function ArchCanvas({
             setParseCalls((n) => n + 1); // F4 DoD③ 打点：起名入口（同为"解析侧"一次性开销）
             try {
               await postArchName(project.id);
-              r = await getArchRender(project.id);
+              if (stale()) return;
+              r = await getArchRender(project.id, { full: showAllRef.current });
+              if (stale()) return;
             } catch (e) {
               setError(`模块起名失败（结构图不受影响，按模块 id 显示）：${(e as Error).message}`);
             }
@@ -804,6 +1012,7 @@ export function ArchCanvas({
             version: 2,
             positions: {},
           }));
+          if (stale()) return;
           setExists(r.exists);
           setGraph(r.graph ?? null);
           setLayoutByMode(layout.positions);
@@ -925,6 +1134,10 @@ export function ArchCanvas({
   useEffect(() => {
     setExists(null);
     setGraph(null);
+    // V09-22：换项目 = 回到概览默认口径（显示全部 / 搜索都不跨项目沿用）
+    setShowAll(false);
+    setSearch("");
+    setHitIdx(0);
     setExpanded({}); // 换项目 = 初次进入，回到默认全折叠（§3.3 规则 5）
     setChildrenMap({});
     setParentOf({});
@@ -942,6 +1155,12 @@ export function ArchCanvas({
     parseTermRef.current = "";
     parseInitiatedRef.current = null;
     dirtyRef.current = {};
+    // V09-22：换项目把待写回的 debounce 定时器也清掉——否则它 600ms 后带着旧项目的坐标
+    // 去 PUT 新项目的 layout.json
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
     // N3：定位状态跟着项目走——node id 是项目内 slug，换个项目可能同名，
     // 留着旧目标会在新项目上画一圈没有来由的高亮
     setFocusedId(null);
@@ -960,7 +1179,9 @@ export function ArchCanvas({
         for (const [dirtyMode, positions] of Object.entries(payload)) {
           if (Object.keys(positions).length === 0) continue;
           putArchLayout(project.id, dirtyMode as GraphMode | typeof PROJECT_ARCH_LAYOUT_KEY, positions)
-            .then((file) => setLayoutByMode(file.positions))
+            .then((file) => {
+              if (projectIdRef.current === project.id) setLayoutByMode(file.positions); // 回包跨 await：项目已换则丢弃
+            })
             .catch(() => {
               // 写回失败不打断交互（下次拖动会再带上）；布局记忆以 layout.json 为准
             });
@@ -1006,7 +1227,13 @@ export function ArchCanvas({
         try {
           setExpandBusy(id);
           setParseCalls((n) => n + 1); // F4 DoD③ 打点：展开 = 走一次解析入口
-          result = await postArchExpand(project.id, nodePath);
+          // V09-22（契约 2）：全量模式按稳定分页把子级取全（上限外的子级逐项可取回，不再只给「还有 N 个」）；
+          // 概览模式维持缺省调用——旧行为逐字节不变（仍走截断＋「还有 N 个」聚合口径，概览契约不动）。
+          result = showAllRef.current
+            ? await postArchExpandAll(project.id, nodePath)
+            : await postArchExpand(project.id, nodePath);
+          // V09-22：应答跨 await 回来时项目可能已换——旧子级不往新画布写（busy 由 finally 收尾）
+          if (projectIdRef.current !== project.id) return;
         } catch (e) {
           setError((e as Error).message);
           return;
@@ -1380,6 +1607,63 @@ export function ArchCanvas({
   ]);
   flowRef.current = flow;
 
+  // ── V09-22：画布内搜索（概览与全量通用）──────────────────────────────────────
+  /** 命中项：当前图的节点 + 已缓存子级（childrenMap 展平），大小写不敏感子串匹配 label/id/path。
+   *  概览态下被聚合的节点不在本图（`graph.truncated.nodes`），故计数行旁另有提示（见渲染处）。
+   *  搜索**不代替「显示全部」**：要搜到被聚合节点需先点「显示全部」换成全量口径。 */
+  const searchHits = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (q === "" || graph === null) return [] as { id: string; label: string; path: string }[];
+    const seenIds = new Set<string>();
+    const out: { id: string; label: string; path: string }[] = [];
+    const hit = (id: string, label: string, path: string): boolean =>
+      label.toLowerCase().includes(q) || id.toLowerCase().includes(q) || path.toLowerCase().includes(q);
+    for (const n of graph.nodes) {
+      if (!hit(n.id, n.name, n.path ?? "") || seenIds.has(n.id)) continue;
+      seenIds.add(n.id);
+      out.push({ id: n.id, label: n.name, path: n.path ?? "" });
+    }
+    for (const r of Object.values(childrenMap)) {
+      for (const c of r.children) {
+        if (!hit(c.id, c.name, c.path ?? "") || seenIds.has(c.id)) continue;
+        seenIds.add(c.id);
+        out.push({ id: c.id, label: c.name, path: c.path ?? "" });
+      }
+    }
+    return out;
+  }, [search, graph, childrenMap]);
+  const activeIdx = searchHits.length > 0 ? ((hitIdx % searchHits.length) + searchHits.length) % searchHits.length : 0;
+  const activeHitId = searchHits.length > 0 ? searchHits[activeIdx].id : null;
+  /** 命中即复用 N3 定位机制：命中子级且祖先折叠时就地展开祖先链（零新请求，子级数据已在内存里），
+   *  再 `setFocusedId`——既有的「目标节点出现即居中」effect 负责 setCenter 与高亮。 */
+  useEffect(() => {
+    if (usingOverride || activeHitId === null) return;
+    const chain: string[] = [];
+    for (let cur = parentOf[activeHitId]; cur; cur = parentOf[cur]) chain.unshift(cur);
+    if (chain.length > 0) {
+      setExpanded((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const p of chain) {
+          if (next[p] !== true) {
+            next[p] = true;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }
+    setFocusedId(activeHitId);
+  }, [activeHitId, parentOf, usingOverride]);
+  /** 下一个 / 上一个命中（Enter / Shift+Enter 与按钮共用） */
+  const stepHit = useCallback(
+    (delta: number) => {
+      if (searchHits.length === 0) return;
+      setHitIdx((i) => ((((i % searchHits.length) + delta) % searchHits.length) + searchHits.length) % searchHits.length);
+    },
+    [searchHits.length],
+  );
+
   const onNodeDragStop = useCallback(
     (_: unknown, node: Node) => {
       const p = { x: node.position.x, y: node.position.y };
@@ -1398,7 +1682,8 @@ export function ArchCanvas({
   //     只把**祖先链就地展开**（§3.3 规则 2 的原地展开，子级数据本来就在内存里），不发新解析请求。
   //  未命中（该 module_id 不在共用层、也没在方框图里展开过）→ 明确提示，不静默失败（DoD④）。
   const locateNonce = locate?.nonce ?? 0;
-  const fitKey = graph ? `${mode}:${graph.generated_at}` : "";
+  // V09-22：fitKey 加 full 维度——全量模式首次拉取后补一次 fitView，全量图不沿用概览视口
+  const fitKey = graph ? `${mode}:${graph.generated_at}${showAll ? ":full" : ""}` : "";
   locateDataRef.current = {
     sharedIds: new Set((graph?.nodes ?? []).map((n) => n.id)),
     loadedChildIds: new Set(Object.values(childrenMap).flatMap((r) => r.children.map((c) => c.id))),
@@ -1695,6 +1980,13 @@ export function ArchCanvas({
   }
   if (!graph || !flow) return null;
 
+  // V09-22：概览态扇出过滤丢弃数（第 4 招只服务概览防爆炸；全量模式 MAX_FANOUT 放开、该数为 0）
+  const fanoutDropped =
+    (graph.truncated.layers?.parse.fanout ?? 0) + (graph.truncated.layers?.merged.fanout ?? 0);
+  // V09-22：本页仍被聚合/扇出过滤丢弃的对象数（隐藏对象抽屉的入口文案与可见判据）。
+  // 入口只在**全量模式**且本数 >0 时出现（概览沿用既有「显示全部」入口，不新增抽屉入口）。
+  const hiddenCount = graph.truncated.nodes + graph.truncated.edges + fanoutDropped;
+
   // Q133：模块集完整性三态——解析应答（本会话刚跑的那次）优先，其次落盘件标记；
   // null = 旧落盘件没标记（完整性未知），不许当成"扫完了"
   const budgetExhausted: boolean | null =
@@ -1702,8 +1994,10 @@ export function ArchCanvas({
 
   return (
     <div
-      className="flex min-h-0 flex-1 flex-col"
+      className="relative flex min-h-0 flex-1 flex-col"
       data-arch-mode={mode}
+      // V09-22：概览/全量（显示全部）模式状态常驻可读
+      data-arch-mode-state={showAll ? "full" : "overview"}
       data-arch-parse-calls={parseCalls}
       data-arch-data-loads={dataLoads}
       data-arch-expanded={Object.values(expanded).filter((v) => v === true).length}
@@ -1790,12 +2084,106 @@ export function ArchCanvas({
           </button>
         </div>
       )}
-      {(graph.truncated.nodes > 0 || graph.truncated.edges > 0) && (
-        <p className="shrink-0 border-b border-neutral-800 px-3 py-1 text-[11px] text-neutral-500">
-          已达渲染上限（{graph.limits.MAX_NODES} 节点 / {graph.limits.MAX_EDGES} 边）：聚合{" "}
-          {graph.truncated.nodes} 节点、截断 {graph.truncated.edges} 边
-        </p>
+      {/* V09-22：画布内搜索（仅技术详情两图；概览与全量通用）——搜索**不代替「显示全部」**：
+          概览态下被聚合的节点不在本图，计数行旁如实提示（`data-arch-search-note`）。
+          Enter=下一个 / Shift+Enter=上一个（原生 input 键盘）；命中即复用 N3 定位机制（展开祖先链 + setFocusedId）。 */}
+      {!usingOverride && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-800 px-3 py-1 text-[11px]">
+          <input
+            data-arch-search
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setHitIdx(0);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                stepHit(e.shiftKey ? -1 : 1);
+              }
+            }}
+            placeholder="搜索节点名 / id / 路径（含全量模式节点）…"
+            className="w-64 rounded border border-neutral-700 bg-neutral-950 px-2 py-0.5 text-[11px] text-neutral-200"
+          />
+          <span
+            data-arch-search-count={searchHits.length > 0 ? `${activeIdx + 1}/${searchHits.length}` : "0"}
+            className="text-neutral-400"
+          >
+            {search.trim() === "" ? "" : searchHits.length === 0 ? "无匹配" : `${activeIdx + 1}/${searchHits.length}`}
+          </span>
+          <button
+            data-arch-search-prev
+            onClick={() => stepHit(-1)}
+            disabled={searchHits.length === 0}
+            className="rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:bg-neutral-800 disabled:opacity-40"
+          >
+            上一个
+          </button>
+          <button
+            data-arch-search-next
+            onClick={() => stepHit(1)}
+            disabled={searchHits.length === 0}
+            className="rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:bg-neutral-800 disabled:opacity-40"
+          >
+            下一个
+          </button>
+          {!showAll && graph.truncated.nodes > 0 && (
+            <span data-arch-search-note className="text-neutral-500">
+              （被聚合节点不在本图，点「显示全部」后可搜）
+            </span>
+          )}
+        </div>
       )}
+      {/* V09-22：渲染上限行——概览态原文案 + 扇出丢弃数 + 「显示全部」；全量态一行说明 + 「返回概览」。
+          仅 !usingOverride（技术详情两图）可用这些入口；主视图（override）没有此模式。 */}
+      {!usingOverride &&
+        (showAll ? (
+          <p
+            className="shrink-0 border-b border-neutral-800 px-3 py-1 text-[11px] text-neutral-500"
+            data-arch-full-note
+          >
+            全量模式：{graph.nodes.length} 节点 / {graph.edges.length} 边（上限 {graph.limits.MAX_NODES}/
+            {graph.limits.MAX_EDGES}，扇出过滤已关闭
+            {graph.truncated.nodes > 0 || graph.truncated.edges > 0
+              ? `，仍聚合 ${graph.truncated.nodes} 节点/${graph.truncated.edges} 边`
+              : ""}
+            ）
+            <button
+              data-arch-show-overview
+              onClick={() => setShowAll(false)}
+              className="ml-2 rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:bg-neutral-800"
+            >
+              返回概览
+            </button>
+            {/* V09-22：本页仍有被聚合/扇出过滤丢弃的对象时，给一个逐项取回的入口（原生 button，Tab/Enter 可用）。
+                只在全量模式出现——未聚合并集读口（/arch/items）不依赖渲染上限，概览态沿用「显示全部」即可。 */}
+            {hiddenCount > 0 && (
+              <button
+                data-arch-hidden-items
+                onClick={() => setHiddenOpen((v) => !v)}
+                title="逐项查看本页仍被聚合/扇出过滤丢弃的对象（未聚合并集：可搜索、可翻页、可点开详情）"
+                className="ml-2 rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:bg-neutral-800"
+              >
+                查看被聚合对象（{hiddenCount}）
+              </button>
+            )}
+          </p>
+        ) : graph.truncated.nodes > 0 || graph.truncated.edges > 0 || fanoutDropped > 0 ? (
+          <p className="shrink-0 border-b border-neutral-800 px-3 py-1 text-[11px] text-neutral-500">
+            已达渲染上限/扇出阈值（{graph.limits.MAX_NODES} 节点 / {graph.limits.MAX_EDGES} 边 / 扇出入边上限{" "}
+            {graph.limits.MAX_FANOUT}）：聚合{" "}
+            {graph.truncated.nodes} 节点、截断 {graph.truncated.edges} 边
+            {fanoutDropped > 0 ? `、扇出过滤丢弃 ${fanoutDropped} 条` : ""}
+            <button
+              data-arch-show-all
+              title="放开渲染上限：列出全部节点与边（大图布局会变慢）；采集侧 budget_exhausted 时仍如实标注"
+              onClick={() => setShowAll(true)}
+              className="ml-2 rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:bg-neutral-800"
+            >
+              显示全部
+            </button>
+          </p>
+        ) : null)}
       {/* Q133：采集侧的完整性——与上面那条渲染上限**不是一回事**（那条是节点被聚合，这条是节点本来就少）。
           到点收工的残缺集刷新/重启后照样在这里说，不靠"用户还记得解析慢"。
           V06-06：喂了外部数据层（三个主视图的系统架构）时不显示——那两份说明讲的是**静态解析层**，
@@ -1951,7 +2339,24 @@ export function ArchCanvas({
           {locateNote.text}
         </p>
       )}
-      <div className="min-h-0 flex-1" data-arch-view ref={viewHostRef}>
+      <div
+        className="min-h-0 flex-1"
+        data-arch-view
+        ref={viewHostRef}
+        onKeyDown={(e) => {
+          // V09-22：键盘也能打开节点详情——Enter 且焦点在 `.react-flow__node` 内元素时，触发与
+          // `onNodeClick` 相同的回调（按钮/输入框是原生元素，Tab/Enter/Space 天然可用）。
+          if (e.key !== "Enter") return;
+          const active = document.activeElement;
+          if (!(active instanceof Element)) return;
+          const id = active.closest(".react-flow__node")?.getAttribute("data-id");
+          if (id === null || id === undefined) return;
+          const d = flowRef.current?.nodes.find((n) => n.id === id)?.data as ArchNodeData | undefined;
+          if (d === undefined) return;
+          e.preventDefault();
+          onNodeClickRef.current?.({ id, label: d.label, path: d.path });
+        }}
+      >
         <ReactFlow
           nodes={flow.nodes}
           edges={flow.edges}
@@ -1977,6 +2382,225 @@ export function ArchCanvas({
           <Controls showInteractive={false} />
         </ReactFlow>
       </div>
+      {/* V09-22（契约 1）：隐藏对象抽屉——全量模式下把被聚合/扇出过滤丢弃的对象逐项取回（未聚合并集读口，
+          可搜索、可翻页、可点开详情）。根节点常驻 DOM（关闭时 display:none），入口只在全量模式且本页
+          仍有隐藏对象时出现；换项目/切模式由上面的重置 effect 关闭并清空列表与详情。 */}
+      {!usingOverride && showAll && hiddenCount > 0 && (
+        <div
+          data-arch-hidden-drawer
+          className={
+            hiddenOpen
+              ? "absolute right-2 top-10 z-10 flex max-h-[70%] w-[440px] flex-col overflow-hidden rounded-lg border border-neutral-700 bg-neutral-900/95 text-[11px] shadow-xl"
+              : "hidden"
+          }
+        >
+          <div className="flex shrink-0 items-center gap-2 border-b border-neutral-800 px-3 py-1.5">
+            <span className="font-semibold text-neutral-200" data-arch-hidden-count={`共 ${hiddenPage.total} 个对象`}>
+              共 {hiddenPage.total} 个对象
+            </span>
+            <nav className="flex gap-1" data-arch-hidden-kinds>
+              {HIDDEN_KINDS.map((k) => (
+                <button
+                  key={k.value}
+                  data-arch-hidden-kind-tab={k.value}
+                  onClick={() => setHiddenKind(k.value)}
+                  className={`rounded px-2 py-0.5 ${
+                    hiddenKind === k.value
+                      ? "border border-neutral-700 bg-neutral-800 text-neutral-100"
+                      : "text-neutral-500 hover:text-neutral-300"
+                  }`}
+                >
+                  {k.label}
+                </button>
+              ))}
+            </nav>
+            <button
+              data-arch-hidden-close
+              onClick={() => setHiddenOpen(false)}
+              className="ml-auto rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:bg-neutral-800"
+            >
+              关闭
+            </button>
+          </div>
+          <div className="shrink-0 border-b border-neutral-800 px-3 py-1.5">
+            <input
+              data-arch-hidden-search
+              value={hiddenQueryInput}
+              onChange={(e) => setHiddenQueryInput(e.target.value)}
+              placeholder="搜索 id / 名字 / 路径（大小写不敏感子串）…"
+              className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-0.5 text-[11px] text-neutral-200"
+            />
+          </div>
+          {hiddenError && (
+            <p
+              data-arch-hidden-error
+              className="shrink-0 border-b border-red-500/40 bg-red-500/10 px-3 py-1 text-red-300"
+            >
+              读取被聚合对象失败：{hiddenError}
+            </p>
+          )}
+          <ul data-arch-hidden-list className="min-h-0 flex-1 overflow-y-auto px-2 py-1">
+            {hiddenRows.map((row, i) =>
+              hiddenKind === "nodes" ? (
+                <li key={`n:${(row as SharedModuleNode).id}:${i}`}>
+                  <button
+                    type="button"
+                    data-arch-hidden-item={(row as SharedModuleNode).id}
+                    onClick={() => openHiddenDetail({ kind: "node", node: row as SharedModuleNode })}
+                    className="flex w-full flex-col rounded px-1.5 py-1 text-left hover:bg-neutral-800"
+                  >
+                    <span className="truncate text-neutral-200">{(row as SharedModuleNode).name}</span>
+                    <span className="truncate text-[10px] text-neutral-500">
+                      {(row as SharedModuleNode).id}
+                      {(row as SharedModuleNode).path ? ` · ${(row as SharedModuleNode).path}` : ""}
+                      {(row as SharedModuleNode).aggregate === true ? " · 聚合" : ""}
+                    </span>
+                  </button>
+                </li>
+              ) : (
+                <li key={`e:${(row as SharedGraphEdge).from}>${(row as SharedGraphEdge).to}:${i}`}>
+                  <button
+                    type="button"
+                    data-arch-hidden-item={`${(row as SharedGraphEdge).from}>${(row as SharedGraphEdge).to}`}
+                    onClick={() => openHiddenDetail({ kind: "edge", edge: row as SharedGraphEdge })}
+                    className="flex w-full flex-col rounded px-1.5 py-1 text-left hover:bg-neutral-800"
+                  >
+                    <span className="truncate text-neutral-200">
+                      {(row as SharedGraphEdge).from} → {(row as SharedGraphEdge).to}
+                    </span>
+                    <span className="truncate text-[10px] text-neutral-500">
+                      权重 {(row as SharedGraphEdge).weight}
+                      {(row as SharedGraphEdge).origin === "plan" ? " · 规划层" : ""}
+                    </span>
+                  </button>
+                </li>
+              ),
+            )}
+          </ul>
+          <div className="flex shrink-0 items-center gap-2 border-t border-neutral-800 px-3 py-1.5 text-neutral-500">
+            <span data-arch-hidden-shown>
+              {hiddenBusy ? "加载中…" : `已显示 ${hiddenRows.length} / ${hiddenPage.total}`}
+            </span>
+            {hiddenPage.has_more && (
+              <button
+                data-arch-hidden-more
+                onClick={loadMoreHidden}
+                disabled={hiddenBusy}
+                className="ml-auto rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:bg-neutral-800 disabled:opacity-40"
+              >
+                加载更多
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      {/* V09-22：抽屉行点开的对象详情（对象与 render 节点/边同构：来源/证据等既有字段照常）。
+          抽屉保持打开；面板是浮层、限高可滚，不遮死画布。 */}
+      {detailObject !== null && (
+        <div
+          data-arch-detail
+          className="absolute left-2 top-10 z-10 flex max-h-[60%] w-[360px] flex-col overflow-y-auto rounded-lg border border-neutral-700 bg-neutral-900/95 p-3 text-[11px] shadow-xl"
+        >
+          <div className="flex items-center gap-2">
+            <span className="min-w-0 flex-1 truncate font-semibold text-neutral-200">
+              {detailObject.kind === "node"
+                ? detailObject.node.name
+                : `${detailObject.edge.from} → ${detailObject.edge.to}`}
+            </span>
+            <button
+              data-arch-detail-close
+              onClick={() => setDetailObject(null)}
+              className="shrink-0 rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:bg-neutral-800"
+            >
+              关闭
+            </button>
+          </div>
+          {detailObject.kind === "node" ? (
+            <dl className="mt-2 space-y-1 text-neutral-400">
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-neutral-500">id</dt>
+                <dd className="min-w-0 break-all text-neutral-200">{detailObject.node.id}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-neutral-500">名字</dt>
+                <dd className="min-w-0 break-all text-neutral-200">{detailObject.node.name}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-neutral-500">路径</dt>
+                <dd className="min-w-0 break-all text-neutral-200">{detailObject.node.path || "（无）"}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-neutral-500">类型</dt>
+                <dd className="min-w-0 text-neutral-200">{detailObject.node.kind}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-neutral-500">文件数</dt>
+                <dd className="min-w-0 text-neutral-200">{detailObject.node.file_count}</dd>
+              </div>
+              {detailObject.node.status && (
+                <div className="flex gap-2">
+                  <dt className="shrink-0 text-neutral-500">状态</dt>
+                  <dd className="min-w-0 text-neutral-200">{detailObject.node.status}</dd>
+                </div>
+              )}
+              {detailObject.node.aggregate === true && (
+                <p className="text-neutral-500">聚合节点：不是可对账对象、不进来源/证据标注（§3.3）</p>
+              )}
+              {(() => {
+                // V09-13：来源与证据标注（与画布节点、三个主视图、MCP 读口同一份判据/模型）
+                const model = provenanceRef.current;
+                const a =
+                  model === null
+                    ? null
+                    : (model.by_object[planCodeNodeIdOf(detailObject.node.id)] ??
+                      model.by_object[detailObject.node.id] ??
+                      null);
+                return a === null ? (
+                  <p className="text-neutral-500">来源/证据：未映射（该对象没有来源与证据标注）</p>
+                ) : (
+                  <>
+                    <div className="flex gap-2">
+                      <dt className="shrink-0 text-neutral-500">来源</dt>
+                      <dd className="min-w-0 text-neutral-200">{sourceKindLabelOf(a.source_kinds)}</dd>
+                    </div>
+                    <div className="flex gap-2">
+                      <dt className="shrink-0 text-neutral-500">证据</dt>
+                      <dd
+                        data-arch-detail-evidence={a.evidence_state}
+                        className="min-w-0 text-neutral-200"
+                      >
+                        {evidenceShortOf(a.evidence_state)}
+                        {a.user_pending ? " · 用户待验" : ""}
+                      </dd>
+                    </div>
+                  </>
+                );
+              })()}
+            </dl>
+          ) : (
+            <dl className="mt-2 space-y-1 text-neutral-400">
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-neutral-500">from</dt>
+                <dd className="min-w-0 break-all text-neutral-200">{detailObject.edge.from}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-neutral-500">to</dt>
+                <dd className="min-w-0 break-all text-neutral-200">{detailObject.edge.to}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-neutral-500">权重</dt>
+                <dd className="min-w-0 text-neutral-200">{detailObject.edge.weight}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-neutral-500">来源</dt>
+                <dd className="min-w-0 text-neutral-200">
+                  {detailObject.edge.origin === "plan" ? "规划层（审定图纸派生）" : "静态 import 聚合边"}
+                </dd>
+              </div>
+            </dl>
+          )}
+        </div>
+      )}
     </div>
   );
 }

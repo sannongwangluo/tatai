@@ -9,7 +9,8 @@
 //      与磁盘上的源文件一一对账；**含"exe 静态导入的 DLL 必须随包"这条回归护栏**（U3 实测踩过的坑）
 //   ④ WebView2 运行时处置（DoD②）：随不随包、没运行时的机器会怎样、引导器行为——全部落在生成态脚本证据上
 //   ⑤ 权限口径（DoD④）：谁需要管理员、谁不需要，逐个包给源码级证据
-//   ⑥ 路径与残留口径（DoD①④）：README 里的安装路径 vs 安装器实际口径；卸载会不会碰用户数据目录
+//   ⑥ 路径与残留口径（DoD①④）：根 README 链到 docs/getting-started.md、getting-started 里的安装态
+//      MCP 入口 vs 安装器实际口径；卸载会不会碰用户数据目录
 //   ⑦ 真装记录复述（若有）：`.工作台/verify/u3-install-record.txt` 里的冷启动数值与残留结论
 //
 // 分工（与 verify:u1 / verify:u2 同口径）：
@@ -26,12 +27,14 @@ import { fileURLToPath } from "node:url";
 // V09-04：产物-源码绑定判据只此一处（`scripts/lib/sourceFingerprint.ts`）——此处只消费，
 // 不另写一套（`package-bind.ts` 与 `verify-v09-04.ts` 用的是同一份）。
 import { sourceFingerprint } from "./lib/sourceFingerprint";
+// 安装包文件名带产品版本号；唯一来源见 src/shared/version.ts（读仓库根 package.json）
+import { APP_VERSION } from "../src/shared/version";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TAURI_DIR = path.join(REPO_ROOT, "src-tauri");
 const RELEASE_DIR = path.join(TAURI_DIR, "target", "release");
-const BUNDLE_NSIS = path.join(RELEASE_DIR, "bundle", "nsis", "Tatai_0.1.1_x64-setup.exe");
-const BUNDLE_MSI = path.join(RELEASE_DIR, "bundle", "msi", "Tatai_0.1.1_x64_en-US.msi");
+const BUNDLE_NSIS = path.join(RELEASE_DIR, "bundle", "nsis", `Tatai_${APP_VERSION}_x64-setup.exe`);
+const BUNDLE_MSI = path.join(RELEASE_DIR, "bundle", "msi", `Tatai_${APP_VERSION}_x64_en-US.msi`);
 const RELEASE_EXE = path.join(RELEASE_DIR, "tatai.exe");
 const RES_SERVER = path.join(TAURI_DIR, "resources", "server");
 const RES_LOADER = path.join(TAURI_DIR, "resources", "WebView2Loader.dll");
@@ -157,8 +160,8 @@ const BINDING_FILE = process.env.V0904_BIND_OUT
   : path.join(REPO_ROOT, ".工作台", "evidence", "V09-04", "1", "binding.json");
 const BOUND_ARTIFACTS: [string, string][] = [
   ["壳二进制", "src-tauri/target/release/tatai.exe"],
-  ["NSIS 安装包", "src-tauri/target/release/bundle/nsis/Tatai_0.1.1_x64-setup.exe"],
-  ["MSI 安装包", "src-tauri/target/release/bundle/msi/Tatai_0.1.1_x64_en-US.msi"],
+  ["NSIS 安装包", `src-tauri/target/release/bundle/nsis/Tatai_${APP_VERSION}_x64-setup.exe`],
+  ["MSI 安装包", `src-tauri/target/release/bundle/msi/Tatai_${APP_VERSION}_x64_en-US.msi`],
 ];
 if (!fs.existsSync(BINDING_FILE)) {
   // 判据不放宽：包存在 + 载荷对得上 ≠ 包是"当前源码"打的——缺绑定记录就是不可判定，如实红。
@@ -364,11 +367,30 @@ const readmeTauri = read(path.join(TAURI_DIR, "README.md"));
 const mcpPathClaim = "%LOCALAPPDATA%\\Tatai\\server\\mcp.js";
 // README 里的 JSON 片段是转义写法（`\\Tatai`），比对前先把双反斜杠压成单反斜杠
 const hasClaim = (text: string) => text.replace(/\\\\/g, "\\").includes(mcpPathClaim);
-ok(hasClaim(readmeRoot), `⑥ 根 README 写的 MCP 入口路径 == ${mcpPathClaim}`);
+// 安装/MCP 入口路径的**文档入口本轮有意迁移**：根 README 只保留"链到 docs/getting-started.md"，
+// 具体入口路径由 getting-started 承载（README 里改成展开后的绝对示例）。因此这里判两件事：
+//   ① 根 README 确实 link 到 docs/getting-started.md（入口没丢，只是换了落点）；
+//   ② getting-started 写的安装态 MCP 入口与**真实安装器口径**（%LOCALAPPDATA%\Tatai\server\mcp.js）一致。
+const gsRel = "docs/getting-started.md";
+const gsAbs = path.join(REPO_ROOT, gsRel);
+const readmeGs = fs.existsSync(gsAbs) ? read(gsAbs) : "";
+// getting-started 允许两种等价写法：真实安装器口径原样（%LOCALAPPDATA%\Tatai\server\mcp.js），
+// 或展开后的绝对示例（C:/Users/<用户名>/AppData/Local/Tatai/server/mcp.js，正/反斜杠均可）。
+const gsInstallerPathClaim = /[Cc]:[\\/]Users[\\/]<用户名>[\\/]AppData[\\/]Local[\\/]Tatai[\\/]server[\\/]mcp\.js/.test(
+  readmeGs.replace(/\\\\/g, "\\"),
+);
+ok(
+  /\]\(docs\/getting-started\.md\)/.test(readmeRoot),
+  `⑥ 根 README 确实链接到 ${gsRel}（安装/MCP 入口的文档落点已迁移到这里）`,
+);
+ok(
+  hasClaim(readmeGs) || gsInstallerPathClaim,
+  `⑥ ${gsRel} 写的安装态 MCP 入口 == 真实安装器口径 ${mcpPathClaim}`,
+);
 ok(hasClaim(readmeTauri), `⑥ src-tauri/README.md 写的 MCP 入口路径 == ${mcpPathClaim}`);
 ok(
   /StrCpy \$INSTDIR "\$LOCALAPPDATA\\\$\{PRODUCTNAME\}"/.test(nsi) && /!define PRODUCTNAME "Tatai"/.test(nsi),
-  "⑥ 安装器实际口径 %LOCALAPPDATA%\\Tatai == README 里那句（真装记录见 .工作台/verify/u3-install-record.txt）",
+  "⑥ 安装器实际口径 %LOCALAPPDATA%\\Tatai == 文档里那句（真装记录见 .工作台/verify/u3-install-record.txt）",
 );
 const uninstallSection = nsi.slice(nsi.indexOf("Section Uninstall"));
 ok(

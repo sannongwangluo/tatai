@@ -75,7 +75,7 @@ windows-gnu 下 `tauri-build` 专门把这个 DLL 复制到 `target/<profile>/`�
 | 入口 | 谁拉起 | 用途 |
 | --- | --- | --- |
 | `index.js` | **壳自己**（`backend.rs`，release 分支） | 本地 HTTP 服务（8787）：注册表 / 门禁 / 终端 / 架构图 / 变更流 |
-| `mcp.js` | **外部 agent 的 MCP 客户端**（stdio，DESIGN.md §6.1「agent → 工作台」） | MCP 工具集（8 个），与 `index.js` 读写同一份注册表与 `.工作台/` |
+| `mcp.js` | **外部 agent 的 MCP 客户端**（stdio，DESIGN.md §6.1「agent → 工作台」） | MCP 工具集（U2 时为 8 个；**当前 22 个**，计数以 `src/mcp/tools/index.ts` 注册表为唯一来源），与 `index.js` 读写同一份注册表与 `.工作台/` |
 
 ### node 运行时口径（U2 明确选择，不是静默假设）
 
@@ -96,13 +96,12 @@ CreateProcessW 认前缀、顺带还能吃超 260 字符的长路径）。
 
 | 层 | 位置 | 打包态行为 |
 | --- | --- | --- |
-| 工作台全局 | `TATAI_HOME` > 缺省 `~/.tatai/`（作者本机 `D:\.tatai\`，`DESIGN.md` §8.1） | 注册表 `registry.json`、`agents.json`、全局配置、`logs/backend.log` **全部落这里**；首次运行**自动建目录与 `registry.json`**，不报错 |
+| 工作台全局 | `TATAI_HOME` > 缺省 `~/.tatai/`（`DESIGN.md` §8.1） | 注册表 `registry.json`、`agents.json`、全局配置、`logs/backend.log` **全部落这里**；首次运行**自动建目录与 `registry.json`**，不报错 |
 | 项目私有 | `<项目根>/.工作台/`（注册表里的绝对路径） | 设计书 / 进度 / Gate / 聊天 / 变更流水 / 终端历史，照常落各项目 |
 | 应用安装目录 | 安装目录（exe 同目录） | **只读**：运行期一个字节都不写（`pnpm verify:u2` 对安装目录逐文件哈希前后比对；打包壳另有一层顶层条目快照比对） |
 
-作者本机口径是 `TATAI_HOME=D:\.tatai`：本机**未**把它写进系统/用户环境变量（`pnpm verify:u2` 与打包壳实测都由启动环境显式传入），
-未配时按开源缺省走 `~/.tatai`。想让双击图标启动也用 `D:\.tatai`，把 `TATAI_HOME` 加成用户环境变量即可——
-这是本机配置，不属代码改动范围，未擅自改（改系统设置需人确认）。
+不设 `TATAI_HOME` 时按缺省走 `~/.tatai`。想让双击图标启动也固定用某个目录，把 `TATAI_HOME` 加成用户环境变量即可——
+这是本机配置，不属代码改动范围（改系统设置需人确认）。`pnpm verify:u2` 与打包壳的实测都由启动环境显式传入该变量。
 
 ### 打包态日志（U2）
 
@@ -128,7 +127,7 @@ MCP 是 stdio server，**agent 主动拉起**（壳不管它）。装好之后�
     "tatai": {
       "command": "node",
       "args": ["C:\\Users\\<你的用户名>\\AppData\\Local\\Tatai\\server\\mcp.js"],
-      "env": { "TATAI_HOME": "D:\\.tatai" }
+      "env": { "TATAI_HOME": "<你的全局数据目录；两边都不设时都取缺省 ~/.tatai，可省略>" }
     }
   }
 }
@@ -141,7 +140,7 @@ MCP 是 stdio server，**agent 主动拉起**（壳不管它）。装好之后�
   U2 那句"MSI 也按用户装"是错的，U3 实测生成态 `main.wxs` 后改正）。要用户级 MSI 得改 wix 模板，属计划外。
   **没安装、只是直接跑 `target/release/tatai.exe` 时**，入口在 `src-tauri/target/release/server/mcp.js`。
 - `env.TATAI_HOME` 要与壳启动时的一致（否则 MCP 侧读的是另一份注册表——同一份数据是"单一事实源"的前提）；
-  作者本机即 `D:\.tatai`，开源缺省可省略（两边都取 `~/.tatai`）。
+  两边都不设时都取缺省 `~/.tatai`，这时可省略。
 - `command` 是 `node`（口径同上，需要 PATH 里有 node >= 20）。
 - 开发态等价物：`pnpm mcp`（= `tsx src/mcp/index.ts`），两条入口共用同一份数据层与工具实现。
 
@@ -164,7 +163,7 @@ MCP 是 stdio server，**agent 主动拉起**（壳不管它）。装好之后�
      "结束进程"，都不带 `/T`）时 `Drop` 与这条回收点都不跑（release 是 `panic = "abort"`，恐慌不展开）——
      这时由**内核**在壳的 Job 句柄关闭时按 `KILL_ON_JOB_CLOSE` 终止 Job 内全部进程：原来登记的
      "强杀留孤儿占住 8787"（`DESIGN.md` 附录 B「M-1」）在 V09-14 由此收口，真机两轮见
-     `pnpm verify:v09-14` 与 `.工作台/evidence/V09-14/1/`。
+     `pnpm verify:v09-14` 与作者私有台账 `.工作台/evidence/V09-14/1/`（**不随本开源仓分发**）。
      **边界如实**：Job 只终止**本 Job 成员**（按句柄，不按进程名），所以别的 agent 客户端 / 无关 node
      进程不会被误杀；`assign` 之前子进程抢先 fork 出的后代不在 Job 里，由 `taskkill /T` 兜底；
      Job 建不出来（`CreateJobObjectW`/`SetInformationJobObject` 失败）时不静默——壳打告警并退回
@@ -210,7 +209,7 @@ node 进程不受影响。独立 MCP 的写需求仍按 v0.7 自愈机制按需�
 - **端口占用检查一条不动**（V09-14 禁止越界明写"不得为通过验收关闭端口占用检查"）：预检、
   `shell_fatal` 弹窗、不自动杀占用者的口径全部保持原样（见上一节）。
 - **真机两轮**：`pnpm verify:v09-14`（壳替身 + 真壳 `src-tauri/target/debug/tatai.exe` 在场时）＋
-  `.工作台/evidence/V09-14/1/` 的日志（正常退出 / 强杀、端口前后读数、PID 对照、数据重读与 MCP 接续）。
+  作者私有台账 `.工作台/evidence/V09-14/1/` 的日志（正常退出 / 强杀、端口前后读数、PID 对照、数据重读与 MCP 接续；**不随本开源仓分发**）。
 
 ### 壳替身（验证用 launcher，`src-tauri/shell-sim/`）
 
@@ -259,33 +258,33 @@ document 捕获段拦下站外 http(s) 点击（`preventDefault` + `openUrl`）�
 `icons/` 是 U1 的**占位图标**（蓝环雷达图，`pnpm tauri icon <1024png>` 生成），正式视觉待设计；
 `tauri.conf.json` 的 `bundle.icon` 与目录内容一一对应。
 
-## 本机工具链（作者机器，进 PROGRESS 不进仓库）
+## 桌面壳工具链（Windows：Rust + mingw）
 
-Rust 与 mingw 都装在项目外、按用户安装、不改系统 PATH：
+Rust 与 mingw 建议装在**项目外**、按用户安装、不改系统 PATH。下表是**通用要求**，路径请换成你自己的（作者本机的真实路径按仓库规则不写进本文件）：
 
-| 组件 | 路径 | 装法 |
+| 组件 | 路径（占位符，换成你的） | 装法 |
 | --- | --- | --- |
-| rustup / cargo | `D:\tools\rmw\cargo`（`CARGO_HOME`） | `rustup-init.exe -y --no-modify-path --profile minimal --default-host x86_64-pc-windows-gnu` |
-| 工具链本体 | `D:\tools\rmw\rustup`（`RUSTUP_HOME`） | 同上，`stable-x86_64-pc-windows-gnu`（1.98.1） |
-| mingw-w64 | `D:\tools\rmw\mingw64`（winlibs 16.2.0 免安装解压） | 解压，无安装器 |
-| 构建临时目录 | `D:\tools\rmw\tmp`（`TMP`/`TEMP`） | 见下 |
+| rustup / cargo | `<ASCII 工具链目录>\cargo`（`CARGO_HOME`） | `rustup-init.exe -y --no-modify-path --profile minimal --default-host x86_64-pc-windows-gnu` |
+| 工具链本体 | `<ASCII 工具链目录>\rustup`（`RUSTUP_HOME`） | 同上，`stable-x86_64-pc-windows-gnu` |
+| mingw-w64 | `<ASCII 工具链目录>\mingw64`（如 winlibs 免安装解压包） | 解压，无安装器 |
+| 构建临时目录 | `<ASCII 工具链目录>\tmp`（`TMP`/`TEMP`） | 见下 |
 
-**必须全 ASCII 路径**（本机踩坑，2026-09-18 实证）：winlibs 的 `ld`/`dlltool` **读不了非 ASCII 路径**——
+**必须全 ASCII 路径**（2026-09-18 实证的踩坑）：winlibs 的 `ld`/`dlltool` **读不了非 ASCII 路径**——
 
 - `ld.exe: cannot find C:/Users/<中文用户名>/.rustup/.../libcore-*.rlib: No such file or directory`（文件明明存在）；
 - `dlltool: Cannot create temporary file in C:\Users\<中文用户名>\AppData\Local\Temp\: Unknown error`；
 - 对照实验：同一份 `libcore-*.rlib`，从 ASCII 路径链接成功（产出 44788 字节 dll），从中文路径链接失败。
 
-所以 `CARGO_HOME`/`RUSTUP_HOME`/`TMP`/`TEMP` 一律指到 ASCII 目录（本机即 `D:\tools\rmw\*`），
-项目自身路径 `D:\tatai` 也是 ASCII（安装到 `C:\Users\<中文名>\...` 下的 IDE/编辑器若报同样错，同因此）。
+所以 `CARGO_HOME`/`RUSTUP_HOME`/`TMP`/`TEMP` 一律指到 ASCII 目录（如 `<ASCII 工具链目录>\*`），
+**项目自身的路径也要是 ASCII**（安装到 `C:\Users\<中文名>\...` 下的 IDE/编辑器若报同样错，同因此）。
 
-构建命令（三个变量缺一不可）：
+构建命令（三个变量缺一不可，路径换成你自己的 ASCII 目录）：
 
 ```bash
-export PATH="/d/tools/rmw/cargo/bin:/d/tools/rmw/mingw64/bin:$PATH"
+export PATH="/<ASCII 工具链目录>/cargo/bin:/<ASCII 工具链目录>/mingw64/bin:$PATH"
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=gcc
-export TMP='D:\tools\rmw\tmp' TEMP='D:\tools\rmw\tmp'
-cd D:/tatai/src-tauri && cargo build      # 或回到仓库根跑 pnpm tauri:dev / pnpm tauri:build
+export TMP='<ASCII 工具链目录>\tmp' TEMP='<ASCII 工具链目录>\tmp'
+cd <你的仓库目录>/src-tauri && cargo build   # 或回到仓库根跑 pnpm tauri:dev / pnpm tauri:build
 ```
 
 > **出正式 exe 只能走 `pnpm tauri:build`（tauri CLI 会自动带上 `--features custom-protocol`）**。
@@ -294,40 +293,33 @@ cd D:/tatai/src-tauri && cargo build      # 或回到仓库根跑 pnpm tauri:dev
 > devUrl（localhost:5173）而不是嵌入的 dist/，没跑 vite 就整页"localhost 拒绝连接"
 > （2026-09-21 实锤排障：后端打包分支正常拉起、窗口却是 devUrl 的混合态）。
 
-> `pnpm tauri:dev` / `pnpm tauri:build` 需先有上面三个环境变量（本机未写进系统 PATH——按用户安装、不改系统配置）。
+> `pnpm tauri:dev` / `pnpm tauri:build` 需先有上面三个环境变量（按用户安装、不改系统配置，所以每开一个新终端都要先设一次）。
 
-## 安装包（U3）：装哪种、装到哪、多大
+## 安装包（U3）：装哪种、装到哪
 
-| | NSIS（`Tatai_0.1.0_x64-setup.exe`） | MSI（`Tatai_0.1.0_x64_en-US.msi`） |
+**逐版本的体积与 sha256 一律看对应 [Release 页](https://github.com/sannongwangluo/tatai/releases)**——仓库不另存发布说明副本，避免"仓 ↔ 包"两处漂移（本文件曾按 0.1.0 的读数记过一张固定表，已删除）。这里只保留**不随版本变化**的口径：
+
+| | NSIS `Tatai_<版本>_x64-setup.exe`（推荐） | MSI `Tatai_<版本>_x64_en-US.msi` |
 | --- | --- | --- |
-| 实测大小（**终审收口批重打，2026-09-25**） | **3,333,050 B（3.179 MB）**，sha256 `84b41f65…` | **4,939,776 B（4.711 MB）**，sha256 `849e5edb…` |
-| 壳二进制 `tatai.exe`（同一批） | 4,011,008 B（3.826 MB），sha256 `8fc3330d…` | 同左（两个包装的是同一个 exe） |
 | 安装作用域 | `currentUser`（`$LOCALAPPDATA\Tatai`） | `perMachine`（`Program Files\Tatai`） |
 | 要管理员吗 | **不要**（`RequestExecutionLevel user`，实测非提权会话静默装成功、不弹 UAC） | **要**（per-machine，Tauri wix 模板缺省） |
-| 装完占盘（程序文件） | 55 个文件 / 13,265,363 B（12.65 MB）＝exe 4,008,960 + `WebView2Loader.dll` 160,320 + `server/` 53 文件 9,096,083；**另有安装器在装机时生成的 `uninstall.exe`，不在载荷里、未计入** | 55 个文件 / 13,265,363 B（12.65 MB），同上三件、无 `uninstall.exe`（MSI 载荷 7z 解包实测逐项相等，卸载走 `msiexec`） |
 | 卸载 | `uninstall.exe /S`，程序文件与快捷方式清干净；HKCU 卸载项删除 | `msiexec /x` |
+| 装完占盘（程序文件） | 约 13 MB＝`tatai.exe` + `WebView2Loader.dll` + `server/`（约 53 个文件）；NSIS 另有安装器在装机时生成的 `uninstall.exe`（不在载荷里） | 同上三件、无 `uninstall.exe`（MSI 载荷解包实测逐项相等，卸载走 `msiexec`） |
 
-> 上表是**终审收口批实测**（2026-09-25 15:38 终包；逐条 sha256/体积原文见 `.工作台/evidence/V09-04/1/binding.json`）。
-> 与 2026-09-19 首次打包相比：NSIS 2,961,489→3,333,050 B、MSI 4,440,064→4,939,776 B、exe 3,994,624→4,011,008 B。
-> 变化来源如实登记：① V09-14 给壳加了 `windows` 直接依赖 + `Job Object` 收口代码（exe +14 KB）；
-> ② `pnpm build:server` 重出的 `server/` 比首次打包那份大（53 文件 / 9.1 MB）——两个包都随之变大。
-> 另：同一棵树**连打两次哈希不同**（体积逐项相同），唯一变的是 `resources/server/THIRD-PARTY-NOTICES.txt`
-> ——它由 `build-server.ts` 生成、带一行「生成时间」，内嵌进 exe 与两个包，所以哈希会变；
-> 这是构建物自身的非确定性，不是源码漂移（对照记录见 `.工作台/evidence/V09-04/1/artifacts.txt`）。
-> 「装完占盘」改为**载荷口径**：本轮没做真装（桌面已有用户自己的 `塔台.lnk`，装/卸会动它——
-> 真装记录属 U3 ⑦ 的人工那一半，`verify:u3` 如实报 SKIP，未假装跑过）。
+**体积目标 3–10MB 对着安装包本体看**（历史两版都在区间内）；组成拆分的实测值见 `PROGRESS.md` 的 U3 与 V09-04 流水。
 
-**体积目标 3–10MB 对着安装包本体看**：两个包都在区间内（NSIS 3.179MB 已过 3MB 下沿、MSI 4.711MB，都在上限以内）。
-组成拆分的实测值见 `PROGRESS.md` 的 U3 与 V09-04 流水。
-**WebView2 运行时两个包都不随包**（安装包内没有运行时/引导器文件，实测）：安装时先查注册表，缺了才联网拉微软官方引导器
-（`downloadBootstrapper`，短链 `https://go.microsoft.com/fwlink/p/?LinkId=2124703`，NSIS 与 MSI 同口径）——
-所以**目标机需要联网一次**才能在没有运行时的机器上装；没有网会停在安装阶段并提示下载失败（NSIS `Abort "$(webview2AbortError)"`）。
+**构建物的两条已知性质**（省得你以为下错了包）：
+
+- **同一棵树连打两次哈希不同**，体积逐项相同——唯一变的是 `resources/server/THIRD-PARTY-NOTICES.txt`，它由 `build-server.ts` 生成、带一行「生成时间」，内嵌进 exe 与两个包。这是**构建物自身的非确定性，不是源码漂移**。
+- 「装完占盘」按**载荷口径**核对（不真装也能核）；真装 / 冷启动 / 卸载记录属 U3 ⑦ 的人工那一半，`verify:u3` 在这类机器上如实报 SKIP，不假装跑过。
+
+**WebView2 运行时两个包都不随包**（安装包内没有运行时/引导器文件）：安装时先查注册表，缺了才联网拉微软官方引导器（`downloadBootstrapper`，短链 `https://go.microsoft.com/fwlink/p/?LinkId=2124703`，NSIS 与 MSI 同口径）——所以**目标机需要联网一次**才能在没有运行时的机器上装；没有网会停在安装阶段并提示下载失败（NSIS `Abort "$(webview2AbortError)"`）。
+
 **壳需要的 node 也一样**：不在包里，要目标机 PATH 里有 node >= 20（口径见上文）。
 
 **装 / 卸会留什么**（U3 实测）：程序文件、快捷方式、HKCU 卸载项都清干净；留下的三样**都不是我们的程序文件**——
 ① `HKCU\Software\sannongwangluo\Tatai`（Tauri 记"上次装哪了"的键，重装时沿用；勾"删除应用数据"或手动删才清）；
-② `%LOCALAPPDATA%\com.sannongwangluo.tatai`（WebView2 自己的缓存目录，本机实测卸载后 342 文件 / 65 MB——
-嫌大就勾"删除应用数据"，或在 WebView2 设置里清）；
+② `%LOCALAPPDATA%\com.sannongwangluo.tatai`（WebView2 自己的缓存目录，可达数百 MB——嫌大就勾"删除应用数据"，或在 WebView2 设置里清）；
 ③ **全局数据目录（`TATAI_HOME` 或 `~/.tatai`）必须保留**——那是用户数据，卸载删了才是 bug。
 
 ## 本卡（U2 / U3）验证怎么复现
@@ -341,10 +333,10 @@ pnpm build:server && pnpm tauri:build && pnpm package:bind && pnpm verify:u3 && 
 # ② 真桌面壳那半边（GUI 截图 / 真装真卸的一次性脚本，2026-09-19 证据归档进 PROGRESS 后已清理，不再随目录分发；
 #    当时怎么跑的逐条见 PROGRESS.md 的 U2 流水：CDP 接打包壳 WebView2 真敲终端、release exe + 真 MCP 客户端）
 #    V09-04 的打包态冒烟（进程存活 ≥15s + /health 200 + 主界面关键 DOM）用同一套 CDP 接法，
-#    驱动脚本与日志见 .工作台/evidence/V09-04/1/smoke-packaged.py 与 smoke-*.log
+#    驱动脚本与日志属作者私有台账（见下方说明），不随本开源仓分发
 # ③ 真装 / 冷启动 / 真卸同理，记录见 U3 流水（install-record 证据摘录也在流水里）
 #   ⚠️ 若重做真装验证：Git Bash 里跑 NSIS 安装器时 `/S` 会被当路径转换（MSYS 老毛病）——
 #      用 `MSYS_NO_PATHCONV=1` 或 cmd.exe；脚本内部用 spawn 传参不受影响。
 ```
 
-证据与逐条对照写在 `PROGRESS.md` 的 U2 流水里（截图 / 壳日志 / MCP 工具列表当时落 gitignore 的 `.工作台/verify/`，一次性材料已清理）。
+**私有证据不是随仓复现材料**：本文件与 `PROGRESS.md` 里出现的 `.工作台/evidence/…`、`.工作台/verify/…`、`smoke-*.py/log`、`binding.json` 等路径，都指**作者本机的私有台账目录**（`.工作台/` 默认 gitignore，**不随本开源仓分发**）；它们是历史核对记录，**不是**你 clone 之后能直接打开或复跑的文件。想自己复现，按上面 ① 的命令在你自己的环境产出、对照你自己的 `.工作台/evidence/`。逐条证据与对照写在 `PROGRESS.md` 的 U2 流水里。

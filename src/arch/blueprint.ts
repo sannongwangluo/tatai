@@ -44,6 +44,7 @@ import {
   type PlanLayerInput,
   type PlanLayerNode,
   type SharedGraph,
+  type SharedLimits,
 } from "./shared-graph";
 import {
   codeLinkageOf,
@@ -2607,10 +2608,10 @@ export function planningLayerInput(bp: Blueprint): PlanLayerInput {
  */
 export function viewGraphWithPlan(
   projectId: string,
-  opts: { dataDir?: string } = {},
+  opts: { dataDir?: string; limits?: SharedLimits } = {},
 ): { graph: SharedGraph; blueprint: Blueprint | null; baseline_id: string | null } {
   const bp = readBlueprint(projectId, opts.dataDir);
-  const base = buildSharedGraph(projectId, { dataDir: opts.dataDir });
+  const base = buildSharedGraph(projectId, { dataDir: opts.dataDir, limits: opts.limits });
   // 未跑过静态解析（空仓）时上游给 {exists:false}：这里用共用层自己做一份**空图**顶住——
   // 上限/口径仍从共用层取（不另写一套数值），节点边为空而已，不影响规划层并入。
   const graph = base.exists && base.graph !== undefined ? base.graph : buildSharedGraphFrom([], {}, new Map(), {}, null);

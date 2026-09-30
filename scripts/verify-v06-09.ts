@@ -90,6 +90,7 @@ import { EXECUTION_EVENT_TYPES } from "../src/server/work/executionReceipts";
 import { REQUIREMENT_EVENT_TYPES } from "../src/server/work/requirements";
 import { CHANGE_EVENT_TYPES } from "../src/server/work/changes";
 import { BUDGET_EVENT_TYPES } from "../src/server/work/budget";
+import { SYNC_EVENT_TYPES } from "../src/server/work/sync";
 import {
   REGISTERED_EVENT_TYPES,
   registeredEventTypes,
@@ -1850,10 +1851,11 @@ async function main(): Promise<void> {
     ...REQUIREMENT_EVENT_TYPES,
     ...CHANGE_EVENT_TYPES,
     ...BUDGET_EVENT_TYPES,
+    ...SYNC_EVENT_TYPES,
   ].sort();
   ok(
     registered.length === moduleTypes.length && registered.join(",") === moduleTypes.join(","),
-    `④-2 登记面 = 七个模块词表的并集（${registered.length} 条：task ${TASK_EVENT_TYPES.length} / finding ${FINDING_EVENT_TYPES.length} / audit ${AUDIT_EVENT_TYPES.length} / execution ${EXECUTION_EVENT_TYPES.length} / requirement ${REQUIREMENT_EVENT_TYPES.length} / change ${CHANGE_EVENT_TYPES.length} / budget ${BUDGET_EVENT_TYPES.length}；2026-09-20 V06-11 并入执行、T21 并入需求与变更批次、T23 并入项目预算约束）`,
+    `④-2 登记面 = 八个模块词表的并集（${registered.length} 条：task ${TASK_EVENT_TYPES.length} / finding ${FINDING_EVENT_TYPES.length} / audit ${AUDIT_EVENT_TYPES.length} / execution ${EXECUTION_EVENT_TYPES.length} / requirement ${REQUIREMENT_EVENT_TYPES.length} / change ${CHANGE_EVENT_TYPES.length} / budget ${BUDGET_EVENT_TYPES.length} / sync ${SYNC_EVENT_TYPES.length}；2026-09-20 V06-11 并入执行、T21 并入需求与变更批次、T23 并入项目预算约束、2026-09-30 V09-23 并入同步证据域）`,
   );
   ok(
     EXECUTION_EVENT_TYPES.every((t) => registeredEventTypes().includes(t)) &&
@@ -1870,6 +1872,7 @@ async function main(): Promise<void> {
         (r.type.startsWith("requirement.") && r.entity_prefix === "requirement:") ||
         (r.type.startsWith("change.") && r.entity_prefix === "change:") ||
         (r.type.startsWith("budget.") && r.entity_prefix === "budget:") ||
+        (r.type.startsWith("sync.") && r.entity_prefix === "sync:") ||
         (Object.values(AUDIT_ENTITY_PREFIXES) as string[]).includes(r.entity_prefix),
     ),
     "④-2 每条登记都带实体前缀，且与各模块的实体约定一致",

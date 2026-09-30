@@ -307,6 +307,9 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
   /** 本次读取时间（详情「来源时间」里的"本机读取时间"，如实标注来源） */
   const [receivedAt, setReceivedAt] = useState<string>("");
   const [filter, setFilter] = useState<ViewFilter>(EMPTY_FILTER);
+  /** V09-22「显示全部」：概览 5–15 聚合口径放开——全部分组与成员一个不漏、无聚合节点；
+   *  换项目在下面的 reset effect 里重置回概览（construction 视图无 aggregate_node，按钮自然不出现）。 */
+  const [showAll, setShowAll] = useState(false);
   const [selected, setSelected] = useState<Record<string, string | null>>({});
   const [focused, setFocused] = useState<string | null>(null);
   const [locateNote, setLocateNote] = useState<{ state: "matched" | "unmatched"; text: string } | null>(null);
@@ -323,8 +326,11 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
   const fitPendingRef = useRef<Record<string, boolean>>({ functional: true, architecture: true, construction: true });
   const locateHandledRef = useRef(0);
   const draftRef = useRef(0);
+  /** V09-22：`load` 的代际——换项目与「显示全部」都会重取，在途应答凭它识别自己是否已作废 */
+  const loadGenRef = useRef(0);
 
   const load = useCallback(() => {
+    const gen = ++loadGenRef.current; // V09-22：本次调用的代际（换项目/切模式的旧应答凭它丢弃）
     setLoading(true);
     setError(null);
     setBackendVersions((n) => n + 1);
@@ -336,6 +342,7 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
       getArchReconcile(project.id).catch(() => ({ exists: false as const })),
     ])
       .then(([bp, proj, rec]) => {
+        if (loadGenRef.current !== gen) return; // 换项目/切模式后的旧应答不写新视图
         setExists(bp.blueprint.exists);
         // §3.2：没有已发布的有效图时用**草稿**顶上（草稿恒为未审定、不可施工，界面另挂草稿横幅明示）；
         // 有有效图就只画有效图，不把草稿混进正在施工的图（服务端在那种情况下压根不给草稿）。
@@ -363,6 +370,7 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
         setLoading(false);
       })
       .catch((e: Error) => {
+        if (loadGenRef.current !== gen) return;
         setError(e.message);
         setLoading(false);
       });
@@ -383,11 +391,15 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
     setOpenRelation(null);
     setReceivedAt("");
     setFilter(EMPTY_FILTER);
+    setShowAll(false);
     setSelected({});
     setFocused(null);
     setLocateNote(null);
     setBookmarks([]);
     setPosByView({});
+    // V09-22：换项目 = 新图，三个主视图的"首次进入归位"重新置位——否则换项目后首个视图
+    // 不再自动 fitView（fitPendingRef 在旧项目里已被消费掉），用户看到画布停在视口外。
+    fitPendingRef.current = { functional: true, architecture: true, construction: true };
     load();
   }, [load]);
 
@@ -454,8 +466,10 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
       projection,
       mergedNodes: (merged?.nodes ?? []).map((n) => ({ id: n.id, plan_refs: n.plan_refs })),
       module_status: moduleDerived.status,
+      // V09-22：显示全部 = 概览上限换 full 口径（同一份蓝图与投影，不另造图事实源）
+      overview_full: showAll,
     });
-  }, [blueprint, projection, merged, view, moduleDerived]);
+  }, [blueprint, projection, merged, view, moduleDerived, showAll]);
 
   const filtered = useMemo(
     () => (model === null ? null : applyViewFilter(model.nodes, filter, model.edges)),
@@ -831,6 +845,8 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
       className="flex min-h-0 flex-1 flex-col"
       data-project-view={view}
       data-project-view-kind={PROJECT_VIEWS[view].projection_kind}
+      // V09-22：概览/全量（显示全部）模式状态常驻可读
+      data-project-mode-state={showAll ? "full" : "overview"}
       data-project-reads={backendVersions}
       // V09-12：图更新状态常驻可读（ready 时不显示横幅，但状态与"本次变更指纹"仍可被读到）
       data-project-update={update?.state ?? "none"}
@@ -944,6 +960,27 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
           <span data-project-scope={scope.note} className="text-[11px] text-neutral-400">
             {scope.note}
           </span>
+        )}
+        {/* V09-22：显示全部分组 / 返回概览——只有概览超量（有聚合节点）时才给入口；
+            construction 视图无 aggregate_node，按钮自然不出现（同一份真实模型判据，不做项目特例）。 */}
+        {model?.aggregate_node != null && !showAll && (
+          <button
+            data-project-show-all
+            title="概览只显示 5–15 个主要分组；点开列出全部分组与成员（隐藏≠已完成）"
+            onClick={() => setShowAll(true)}
+            className="rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-300 hover:bg-neutral-800"
+          >
+            显示全部分组
+          </button>
+        )}
+        {showAll && (
+          <button
+            data-project-show-overview
+            onClick={() => setShowAll(false)}
+            className="rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-300 hover:bg-neutral-800"
+          >
+            返回概览
+          </button>
         )}
       </div>
 

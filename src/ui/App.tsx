@@ -38,10 +38,13 @@ import { PlanView } from "./components/PlanView";
 import { ProjectList } from "./components/ProjectList";
 import { ProjectOverview } from "./components/ProjectOverview";
 import { RemoveProjectDialog } from "./components/RemoveProjectDialog";
+import { SyncEvidenceStatus } from "./components/SyncEvidenceStatus";
 import { TerminalView } from "./components/TerminalView";
 import { VersionReminder } from "./components/VersionReminder";
 import { CrossProjectView } from "./projects/CrossProjectView";
 import { useProjectScope, type ViewKey } from "./projectScope";
+// 版本号与 package.json 同源（src/shared/version.ts，构建期内联）——页脚别再写死字面量
+import { APP_VERSION } from "../shared/version";
 
 /** 选中态存 URL hash：#p/<id>；空 hash = 未选中。
  *  Q65（2026-09-18 审计）：手改/外链 hash 成畸形编码（`#p/%`）时 decodeURIComponent 抛 URIError，
@@ -289,7 +292,7 @@ export default function App() {
           data-brand-footer="tatai"
           title="塔台 Tatai · 杭州三农网络科技有限公司 · GNU AGPL-3.0"
         >
-          Tatai v0.1.1 · 杭州三农网络科技有限公司 · AGPL-3.0
+          Tatai v{APP_VERSION} · 杭州三农网络科技有限公司 · AGPL-3.0
         </div>
       </aside>
 
@@ -365,6 +368,10 @@ export default function App() {
             </div>
 
             <ProjectStatusBar project={selected} />
+
+            {/* V09-24（§2.10）：同步证据状态**小摘要入口**——只占状态条下面一行，详情是浮层；
+                不加大页签、不遮图、不挤画布。点开逐项看期望/实际/原因/证据路径。 */}
+            <SyncEvidenceStatus project={selected} />
 
             <div
               ref={viewHostRef}

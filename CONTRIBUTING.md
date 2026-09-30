@@ -5,7 +5,7 @@
 ## 反馈问题
 
 1. 先看 [Issues](https://github.com/sannongwangluo/tatai/issues) 里有没有人报过；
-2. 新建 Issue，请带上：
+2. 新建 Issue 时选对应模板（[`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/)：Bug 报告 / 功能建议），模板会提示要带的信息：
    - 你在做什么（步骤）、期望什么、实际发生什么；
    - 环境：Windows 版本、Node 版本（`node -v`）、塔台版本（界面左下角页脚或 Release 页）；
    - 相关日志（如有）：`~/.tatai/logs/backend.log`、`~/.tatai/logs/shell.log`——**贴之前先脱敏**（见下文"绝不能提交的数据"）。
@@ -14,11 +14,12 @@
 
 ## 从源码复现
 
+前置：**Node.js `^20.19.0 || >=22.12.0`**（这是构建链 Vite 7 自己的 `engines` 要求；**推荐直接用现有 LTS 22.12+**，不用改环境）与 **pnpm 12**（用 `npm i -g pnpm@12` 装——**别依赖"Node 自带 corepack"**：新版 Node 已弃用、后续发行版不再随带，换机器就不一定有了）。
+
 ```bash
-corepack enable pnpm
 git clone https://github.com/sannongwangluo/tatai.git
 cd tatai
-pnpm install --frozen-lockfile
+pnpm install --frozen-lockfile   # 首次上手可用 pnpm install；要复现环境请保留 --frozen-lockfile
 pnpm typecheck     # tsc --noEmit
 pnpm build         # 前端产物 dist/
 pnpm verify:registry   # 注册表读写层回归（自带临时 TATAI_HOME，不碰你的真实数据）
@@ -31,7 +32,7 @@ pnpm dev:server    # 后端 http://localhost:8787
 pnpm dev           # 前端 http://localhost:5173
 ```
 
-桌面壳需要 Rust 工具链，见 `README.md`「从源码跑起来」与 `src-tauri/README.md`。
+桌面壳需要 Rust 工具链，见 `README.md` 与 [`docs/development.md`](docs/development.md) 第 3 节、[`src-tauri/README.md`](src-tauri/README.md)。完整开发与验证口径（版本要求、验证脚本清单、数据边界）见 [`docs/development.md`](docs/development.md)。
 
 ## 提交改动
 

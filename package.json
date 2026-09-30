@@ -1,7 +1,7 @@
 {
   "name": "tatai",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "description": "塔台（Tatai）：个人级 agent 编程工作台",
   "scripts": {
@@ -75,6 +75,12 @@
     "verify:v09-20": "tsx scripts/verify-v09-20.ts",
     "verify:v09-20-ui": "python scripts/verify-v09-20-ui.py",
     "verify:v09-20-info-bar": "tsx scripts/verify-v09-20-info-bar.ts",
+    "verify:v09-22": "tsx scripts/verify-v09-22.ts",
+    "verify:v09-22-ui": "python scripts/verify-v09-22-ui.py",
+    "verify:v09-22-mcp": "tsx scripts/verify-v09-22-mcp.ts",
+    "verify:stage-entry": "tsx scripts/verify-stage-entry.ts",
+    "verify:sync-evidence": "tsx scripts/verify-sync-evidence.ts",
+    "verify:v09-22-ui-installed": "python scripts/verify-v09-22-ui-installed.py",
     "verify:v09-09": "tsx scripts/verify-v09-09.ts",
     "verify:v09-09-ui": "python scripts/verify-v09-09-ui.py",
     "verify:review-arch-badges-ui": "python scripts/verify-review-fix-20260925-arch-badges-ui.py",

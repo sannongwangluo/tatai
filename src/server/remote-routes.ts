@@ -125,6 +125,32 @@ export const REMOTE_ROUTES: readonly RemoteRoute[] = [
     anchors: ['if (req.method === "POST" && reqPath === "/api/work/repair") {'],
     body: { project_id: "tatai" },
   },
+  // ── V09-25 终修：V09-23 新增的两条 work 面路由必须在桌面宿主（index.ts）转发，同样登记在本清单 ──
+  // 登记理由（不是可选的美化）：verify-s2 段②的防漂移对账按 `req.method === "…"` 的提及数与本清单
+  // 逐条对账——桌面宿主补路由必然新增字面提及，漏登记就会红。此前用「方法 + 精确路径」常量绕开扫描器
+  // 的做法已被判为不可接受的捷径：新路由必须出现在维护中的路由面清单里。
+  {
+    id: "work-sync-scan",
+    method: "POST",
+    path: "/api/work/sync/scan",
+    kind: "write",
+    note:
+      "显式同步扫描（MCP scan_sync_evidence 的唯一落点；与后台自动发现共用同一逻辑与单飞队列，" +
+      "真正唯一写口仍是本服务的 submit；只读模式下由红线先拒）",
+    anchors: ['if (req.method === "POST" && reqPath === "/api/work/sync/scan") {'],
+    body: { project_id: "tatai", role: "coordinator" },
+  },
+  {
+    id: "work-sync-status",
+    method: "GET",
+    path: "/api/work/sync/status",
+    kind: "read",
+    note:
+      "宿主跨进程**只读**同步状态读口（同一份 report + 后台发现健康；不触发扫描、不写账；" +
+      "仍要描述符令牌：无/错令牌 401 SERVICE_UNAVAILABLE）",
+    anchors: ['if (req.method === "GET" && reqPath === "/api/work/sync/status") {'],
+    query: "?project_id=:id",
+  },
 
   // ── 补修 A（V06-14）：注册表恢复入口（显式触发；只读模式下必须被拒）──
   {
@@ -456,6 +482,20 @@ export const REMOTE_ROUTES: readonly RemoteRoute[] = [
     kind: "read",
     note: "架构图数据（S2 四样之一：render/graph 合成）",
     anchors: ['if (req.method === "GET" && archRenderMatch) {'],
+  },
+  // ── V09-22 契约 1：未聚合并集逐项取回（HEAD 即有，此前漏登记；V09-25 终修补登记，不改功能/接口）──
+  // 补登记理由：verify-s2 段②按 `req.method === "…"` 提及数逐条对账，这条既有只读路由的提及此前
+  // 没有被清单认领（源码 47 vs 清单 46），属**清单与源码不一致**；补最少的清单登记即对平，不新增接口。
+  {
+    id: "arch-items-read",
+    method: "GET",
+    path: "/api/projects/:id/arch/items",
+    kind: "read",
+    note:
+      "未聚合并集逐项取回（`kind=nodes|edges` 必填；`q` 子串过滤；`offset` 缺省 0、`limit` 缺省 200 " +
+      "并 clamp 到 [1,2000]；数据源＝与 /arch/render 同一 builder 管线的未聚合并集，先过滤后开窗、逐页可取完）",
+    anchors: ['if (req.method === "GET" && archItemsMatch) {'],
+    query: "?kind=nodes",
   },
   {
     id: "arch-reconcile-read",

@@ -26,6 +26,43 @@ export const ARCH_LIMITS = {
   FANOUT_KEEP: 5,
 } as const;
 
+/** V09-22 全量模式（「显示全部」）的上限组：概览默认（ARCH_LIMITS）不动，full 只是同一套
+ *  builder 的另一组参数（SharedLimits），不是第二套图事实源；超限仍聚合+计数，不静默截断。
+ *  RENDER_FULL 给 UI/HTTP（React Flow + dagre 在 2000 节点量级仍可交互；性能实测随 V09-22 夹具记录）。
+ *  MCP 读口的全量自 V09-22 返工起不用「安全上限内的全量」，改走 ARCH_UNLIMITED_LIMITS（未聚合并集）
+ *  ＋ sixGraphs 4000 对象/页的同快照分页续取（见下）；MCP_FULL_LIMITS 仅存于验证夹具。
+ *  **形状即 `shared-graph.ts` 的 `SharedLimits` 子集**——故意不 import 那个类型：shared-graph
+ *  import config，config 再 import 它会成环；故按 as const 字面量给出，由使用侧按结构收窄。 */
+export const RENDER_FULL_LIMITS = {
+  MAX_NODES: 2000,
+  MAX_CHILDREN: 2000,
+  MAX_EDGES: 4000,
+  MAX_FANOUT: 1_000_000_000, // 禁用扇出过滤：第 4 招只服务概览防爆炸，全量模式如实给全部入边
+} as const;
+export const MCP_FULL_LIMITS = {
+  MAX_NODES: 20000,
+  MAX_CHILDREN: 20000,
+  MAX_EDGES: 40000,
+  MAX_FANOUT: 1_000_000_000,
+} as const;
+// 2026-09-29 口径澄清（六图完整读取轮）：MCP_FULL_LIMITS **不再是生产读口的全量上限**——
+// `get_project_graphs(mode=full)` 自 V09-22 返工起走 ARCH_UNLIMITED_LIMITS（未聚合并集＋4000 对象/页
+// 同快照分页）。本组只保留给验证夹具（verify-v09-22 G 段钉「20000 档超限仍聚合＋计数」的行为），
+// 文档/文案不得再以「MCP 20000 节点」描述现行全量能力。
+
+/** V09-22 返工：**未聚合并集**的上限组（契约 3／`sixGraphsOf(mode=full)` 的底层候选真值）。
+ *  与 RENDER_FULL/MCP_FULL 的区别：那两个仍是"安全上限内的全量"（2000/20000 节点），超限依旧聚合；
+ *  这一组把五个维度都抬到 1e9 —— builder 不再聚合、不再截断、不再扇出过滤，
+ *  `graph.nodes` 就是**逐项可取**的底层候选并集（`archItemsOf`／full 分页遍历据此返回真实对象）。
+ *  形状即 `shared-graph.ts` 的 `SharedLimits` 子集（同 RENDER_FULL/MCP_FULL 的写法，故意不 import 那个类型防成环）。 */
+export const ARCH_UNLIMITED_LIMITS = {
+  MAX_NODES: 1_000_000_000,
+  MAX_CHILDREN: 1_000_000_000,
+  MAX_EDGES: 1_000_000_000,
+  MAX_FANOUT: 1_000_000_000,
+  FANOUT_KEEP: 1_000_000_000,
+} as const;
+
 /** 聚合节点固定 id（A3 渲染层据 aggregate:true 识别） */
 export const MORE_NODE_ID = "__more__";
 

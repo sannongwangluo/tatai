@@ -13,6 +13,7 @@ import { evaluateProjectEntry } from "../../server/work/entry";
 import { graphSummaryOf } from "../../arch/sixGraphs";
 import { claimTask, releaseClaim, renewClaim, reopenTask, submitTaskResult, DEFAULT_LEASE_MS, LEASE_NOTE } from "../../server/work/claims";
 import { resolveDataDir } from "../../server/registry";
+import { hostSyncView } from "./syncHost";
 import { errorResult, textResult, type McpContext, type McpTool, type ToolResult } from "./types";
 
 /** 结构化拒绝：内容照原样给（含 code/failures/revision/read_again），isError 让客户端按失败处理 */
@@ -67,7 +68,9 @@ export const projectEntryTool: McpTool = {
     "项目接续入口（只读）：入参 project_id/role/client_capabilities/known_revision/resume_hint；返回 project/baseline/" +
     "context_manifest/current_change/current_runs/next_action/reasons/required_reads，另带 **graph_summary**（六图摘要：" +
     "六图各一行＋同一快照标识＋基线/更新时间＋更新中或过期状态与原因＋异常＋下一读取入口）。只读、不认领、不调模型（DESIGN.md §6.7）。" +
-    "六图**完整**状态走 `get_project_graphs`（摘要只给指针与状态，不内联整图；两者同一份事实与判据）。",
+    "六图**完整**状态走 `get_project_graphs`（摘要只给指针与状态，不内联整图；两者同一份事实与判据）；" +
+    "**架构判断/影响分析前先取 mode=full 并按同快照游标取齐**（next_read_entry 已指向 full；complete:true 只表示图对象取完，" +
+    "不等于源码全覆盖——采集残缺/忽略目录/旧聚合桶见 notes 与 anomalies），再读设计书、施工图与相关源码。",
   inputSchema: {
     type: "object",
     properties: {
@@ -87,29 +90,40 @@ export const projectEntryTool: McpTool = {
     required: ["project_id", "role"],
     additionalProperties: false,
   },
-  handler: (args) => {
+  handler: async (args, ctx) => {
     const projectId = str(args, "project_id");
     const role = str(args, "role");
     if (projectId === "" || role === "") return errorResult("project_entry 缺入参 project_id/role（两者都必填）");
     try {
-      const entry = evaluateProjectEntry({
-        project_id: projectId,
-        role,
-        client_capabilities: args.client_capabilities,
-        known_revision: strOrNull(args, "known_revision"),
-        resume_hint: strOrNull(args, "resume_hint"),
-      });
+      const dataDir = resolveDataDir();
+      // V09-23 返工C（Codex 反例12）：entry 的 sync_summary 必须在**响应层**用唯一宿主的**同一份**后台发现错误重算
+      // （MCP 另一进程自己汇为空，不能冒充"后台无故障"）；宿主不可达且已配置时 fail-closed。
+      const view = await hostSyncView(projectId, dataDir, ctx?.work);
+      const entry = evaluateProjectEntry(
+        {
+          project_id: projectId,
+          role,
+          client_capabilities: args.client_capabilities,
+          known_revision: strOrNull(args, "known_revision"),
+          resume_hint: strOrNull(args, "resume_hint"),
+        },
+        { dataDir, syncDiscoveryIssues: view.discovery_issues },
+      );
       // V09-19（§6.7）：入口另带**六图摘要**——六图各一行＋同一快照标识＋基线/更新时间＋更新中或过期状态与原因＋
       // 异常＋下一读取入口。摘要**不内联整图**（完整状态走 get_project_graphs），但必须与整图**同一份事实与判据**
       // （同一个 `sixGraphsOf` 摘要模式）。摘要算不出来**不阻断入口**：如实带一条原因，其余字段照给。
       let graphSummary: unknown = null;
       try {
-        graphSummary = graphSummaryOf(projectId, { dataDir: resolveDataDir() });
+        graphSummary = graphSummaryOf(projectId, { dataDir });
       } catch (e) {
         graphSummary = {
           available: false,
           reason: `六图摘要算不出来：${e instanceof Error ? e.message : String(e)}（按「读不到」如实表达，不假装有图）`,
-          next_read_entry: { tool: "get_project_graphs", args: { project_id: projectId, graph: "all" } },
+          next_read_entry: {
+            tool: "get_project_graphs",
+            args: { project_id: projectId, graph: "all", mode: "full" },
+            note: "六图完整状态在本工具（架构判断/影响分析用 mode=full 并按同快照游标逐图取齐；complete:true 只表示图对象取完，不等于源码全覆盖）",
+          },
         };
       }
       return jsonOk({ ...entry, graph_summary: graphSummary });

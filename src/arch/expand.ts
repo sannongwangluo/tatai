@@ -25,7 +25,7 @@ import {
   slugify,
 } from "./parse";
 import { capChildren } from "./shared-graph";
-import { CHANGE_DOT_WINDOW_HOURS } from "./config";
+import { ARCH_LIMITS, CHANGE_DOT_WINDOW_HOURS } from "./config";
 
 /** 子级节点（子模块=目录 / 文件节点 / 聚合节点） */
 export interface ExpandChild {
@@ -69,6 +69,13 @@ export interface ExpandResult {
   /** 本次生效的子级硬上限与截断量（§4.3 第 1 招；truncated.children = 0 表示没触发上限） */
   limit: { children: number };
   truncated: { children: number };
+  /** V09-22 契约 2：传了 `childrenOffset` 时（含 0）给出的**稳定分页**四字段——
+   *  子级列表＝排序后全量直接子级的 `[childrenOffset, childrenOffset+childrenLimit)` 窗口，
+   *  全是真实子级、**不**为聚合节点保留名额、不带 `__more__`。缺省调用不带这四字段（逐字节不变）。 */
+  children_total?: number;
+  children_offset?: number;
+  children_returned?: number;
+  children_has_more?: boolean;
   stats: {
     /** 子树内文件总数（截断时只算保留的那部分：被截断的枝不遍历，§4.3 第 2 招） */
     subtree_files: number;
@@ -142,8 +149,20 @@ function recentChangedPaths(root: string): Set<string> {
  * 扫目录子树本体（核心，与项目 id 解耦，便于对任意目录验证）。全程只读，不落盘。
  * @param root 项目根（绝对或相对）
  * @param modulePath 相对项目根的模块路径（posix；"." = 根散文件模块，只展开根直属文件）
+ * @param opts.childrenLimit 本次生效的单枝子级硬上限（V09-22 全量模式传 RENDER_FULL_LIMITS.MAX_CHILDREN；
+ *   缺省走 config.ts 的 ARCH_LIMITS.MAX_CHILDREN，行为与概览默认逐字节相同）。截断仍在遍历子树**之前**
+ *   落地；full 时 readdir 本来就全读了，直接子级全量列出，子树遍历仍走 WALK_LIMITS 预算、
+ *   budget_exhausted 照实带出。
+ * @param opts.childrenOffset V09-22 契约 2：传了它（含 0）即切到**稳定分页**模式——不再截断成「还有 N 个」
+ *   聚合节点，而是把排序后全量直接子级按 `[childrenOffset, childrenOffset+childrenLimit)` 开窗，
+ *   全是真实子级；返回体额外带 children_total/offset/returned/has_more 四字段。不传（undefined）＝
+ *   缺省调用，行为与概览默认逐字节相同（不含这四字段）。
  */
-export function expandDirectory(root: string, modulePath: string): ExpandResult {
+export function expandDirectory(
+  root: string,
+  modulePath: string,
+  opts: { childrenLimit?: number; childrenOffset?: number } = {},
+): ExpandResult {
   const t0 = Date.now();
   const deadline = t0 + WALK_LIMITS.maxMs;
   const abs = path.resolve(root);
@@ -184,10 +203,24 @@ export function expandDirectory(root: string, modulePath: string): ExpandResult 
   // 超上限的子级不遍历、不解析、不渲染（§4.3 第 2 招），改成一个聚合节点。巨枝（归档日志/临时
   // 产物目录，实测 12 286 个文件）的耗时因此从"整枝"降到"保留的前 39 个子级"——这是本卡
   // 极端巨枝的降级表现；截断量与上限随响应带回（limit / truncated，调用方显示"还有 N 个"）。
+  // V09-22 契约 2：传了 childrenOffset（含 0）即切**稳定分页**——不再截成「还有 N 个」聚合节点，
+  // 而是把排序后全量直接子级按 [offset, offset+limit) 开窗（全是真实子级，逐页可取回上限外的对象）。
   const parentId = slugify(norm);
-  const capped = capChildren<fs.Dirent>([...directDirs, ...directFiles], parentId);
-  const keptDirs = capped.kept.filter((e) => e.isDirectory());
-  const keptFiles = capped.kept.filter((e) => !e.isDirectory());
+  const allChildren: fs.Dirent[] = [...directDirs, ...directFiles];
+  const childrenLimit = opts.childrenLimit ?? ARCH_LIMITS.MAX_CHILDREN;
+  const offsetMode = opts.childrenOffset !== undefined;
+  const pageOffset = offsetMode ? Math.max(0, Math.floor(opts.childrenOffset as number)) : 0;
+  const capped = offsetMode ? null : capChildren<fs.Dirent>(allChildren, parentId, childrenLimit);
+  const windowStart = Math.min(pageOffset, allChildren.length);
+  const keptEntries: fs.Dirent[] = offsetMode
+    ? allChildren.slice(windowStart, windowStart + childrenLimit)
+    : capped!.kept;
+  const limitChildren = offsetMode ? childrenLimit : capped!.limit;
+  const truncatedChildren = offsetMode
+    ? Math.max(0, allChildren.length - (windowStart + keptEntries.length))
+    : capped!.dropped;
+  const keptDirs = keptEntries.filter((e) => e.isDirectory());
+  const keptFiles = keptEntries.filter((e) => !e.isDirectory());
 
   // ── 子树文件清单（递归，只走文件名）：**直属文件 + 保留的子目录各自的整棵子树** ──
   // 直属文件必须算进来（旧口径 walkFiles(子树根) 本来就把它们算在里头）：漏了它们，展开 src/ui
@@ -290,7 +323,7 @@ export function expandDirectory(root: string, modulePath: string): ExpandResult 
       deps: [],
     });
   }
-  if (capped.aggregate) {
+  if (capped?.aggregate) {
     // 「还有 N 个」聚合节点（§4.3 第 1 招）：不可下钻、无文件数（被截断的枝不遍历）
     children.push({
       id: capped.aggregate.id,
@@ -348,8 +381,17 @@ export function expandDirectory(root: string, modulePath: string): ExpandResult 
     duration_ms: Date.now() - t0,
     parse_ms: Math.round(parseMs * 100) / 100,
     llm_calls: 0,
-    limit: { children: capped.limit },
-    truncated: { children: capped.dropped },
+    limit: { children: limitChildren },
+    truncated: { children: truncatedChildren },
+    // V09-22 契约 2：稳定分页模式额外带四字段（缺省调用一个都不带，逐字节不变）
+    ...(offsetMode
+      ? {
+          children_total: allChildren.length,
+          children_offset: pageOffset,
+          children_returned: keptEntries.length,
+          children_has_more: windowStart + keptEntries.length < allChildren.length,
+        }
+      : {}),
     stats: {
       subtree_files: norm === "." ? directFiles.length : subtreeFiles.length,
       parsed_files: parsedFiles,
@@ -364,7 +406,12 @@ export function expandDirectory(root: string, modulePath: string): ExpandResult 
 }
 
 /** 按注册表项目 id 就地展开（HTTP 路由入口；路径只走注册表，不落盘） */
-export function expandProject(projectId: string, modulePath: string, dataDir?: string): ExpandResult {
+export function expandProject(
+  projectId: string,
+  modulePath: string,
+  dataDir?: string,
+  opts?: { childrenLimit?: number; childrenOffset?: number },
+): ExpandResult {
   const project = getProject(projectId, dataDir);
   if (!project) {
     throw new WsError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`);
@@ -372,5 +419,5 @@ export function expandProject(projectId: string, modulePath: string, dataDir?: s
   if (typeof modulePath !== "string" || modulePath === "") {
     throw new WsError("INVALID_INPUT", "module_path 必填（相对项目根的 posix 路径）");
   }
-  return expandDirectory(project.path, modulePath);
+  return expandDirectory(project.path, modulePath, opts);
 }

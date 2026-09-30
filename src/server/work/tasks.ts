@@ -412,6 +412,72 @@ export function readTaskStates(workDir: string): TaskProjection {
   return foldTaskStates(events);
 }
 
+/** 写侧门禁拒因（`service.submit` 的 detail.reason；与 `claims.claimTask` 同一判据） */
+export const BLOCKED_NOT_CLAIMABLE_DETAIL_REASON = "blocked_not_claimable";
+
+/** 单张卡在事件流里的当前执行状态快照（只读、纯函数） */
+export interface TaskStatusSnapshot {
+  status: TaskExecutionStatus;
+  /** 取消是旁路：一旦被取消就保持取消（与 `foldTaskStates` 的"不许被改回非取消"同口径） */
+  cancelled: boolean;
+  /** 阻塞理由（`task.blocked` 的 payload.reason；没有就 null，不编造） */
+  blocked_reason: string | null;
+}
+
+/**
+ * 单张卡在**已提交事件流**里的当前执行状态（与 `foldTaskStates` 同一口径；实体不是任务实体、
+ * 或该实体一条事件都没有 → null）。抽出来是给**写侧门禁**用：`service.submit` 必须在文件锁里判
+ * "这张卡是不是阻塞态"——直连通用写口手写 `task.claimed` 不能绕过 `claims.claimTask` 的阻塞门禁。
+ */
+export function taskStatusOfEvents(
+  events: readonly WorkEvent[],
+  entityId: string,
+): TaskStatusSnapshot | null {
+  let status: TaskExecutionStatus | null = null;
+  let cancelled = false;
+  let blockedReason: string | null = null;
+  for (const e of events) {
+    if (e.entity_id !== entityId) continue;
+    const p = e.payload ?? {};
+    switch (e.type as TaskEventType) {
+      case "task.definition_imported":
+      case "task.rebound":
+        status ??= "preparing";
+        break;
+      case "task.reopened":
+        status = "ready";
+        blockedReason = null;
+        break;
+      case "task.status_changed": {
+        const next = strOrNull(p.status);
+        if (next !== null && (TASK_EXECUTION_STATUSES as readonly string[]).includes(next)) {
+          status = next as TaskExecutionStatus;
+        }
+        if (next === "cancelled") cancelled = true;
+        break;
+      }
+      case "task.claimed":
+        status = "claimed";
+        break;
+      case "task.result_submitted":
+        status = "result_submitted";
+        break;
+      case "task.blocked":
+        status = "blocked";
+        blockedReason = strOrNull(p.reason) ?? blockedReason;
+        break;
+      case "task.cancelled":
+        status = "cancelled";
+        cancelled = true;
+        break;
+      default:
+        break;
+    }
+  }
+  if (status === null) return null;
+  return { status: cancelled ? "cancelled" : status, cancelled, blocked_reason: blockedReason };
+}
+
 // ── 定义 ↔ 状态对齐（"PLAN 与运行任务同源"） ──
 
 export interface TaskRebindNeeded {

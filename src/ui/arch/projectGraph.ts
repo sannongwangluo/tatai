@@ -207,13 +207,26 @@ export interface OverviewCap<T> {
  * 概览数量口径（§3.3）：`> max` → 只显示前 max 个 + 一个「还有 N 个」聚合节点（显示数量）；
  * `< min` → 有几个显示几个，**不补假节点**；区间内 → 原样。
  * 顺序由调用方给（本函数只截断，不重排、不挑选语义）。
+ *
+ * V09-22：`opts.full === true`（「显示全部」）时**不截断**——概览的 5–15 聚合口径放开，一个不漏、
+ * 无聚合节点；同一份数据源只换上限口径（§0 红线），采集侧完整性另见 budget 标注。
+ * 默认路径（不带 full）逐字不变。
  */
 export function capOverview<T>(
   items: readonly T[],
-  opts: { unit: string; min?: number; max?: number; aggregateLabel?: (n: number) => string },
+  opts: { unit: string; min?: number; max?: number; aggregateLabel?: (n: number) => string; full?: boolean },
 ): OverviewCap<T> {
   const min = opts.min ?? OVERVIEW_MIN;
   const max = opts.max ?? OVERVIEW_MAX;
+  if (opts.full === true) {
+    return {
+      shown: [...items],
+      hidden_count: 0,
+      aggregate: null,
+      note: `全量展示：共 ${items.length} 个${opts.unit}（概览 5–15 聚合口径已按「显示全部」放开，一个不漏；采集侧完整性另见 budget 标注）`,
+      padded: false,
+    };
+  }
   if (items.length > max) {
     const hidden = items.length - max;
     return {
@@ -787,6 +800,9 @@ export function buildViewModel(input: {
   mergedNodes?: readonly { id: string; plan_refs?: string[] }[];
   /** V08-03（附录 D）：模块层派生结果（`taskDerivedModuleStatus`）。不给 = 模块节点按投影直取（旧行为） */
   module_status?: Readonly<Record<string, NodeStatus>>;
+  /** V09-22「显示全部」：概览上限放开——分组/任务节点一个不漏、无聚合节点（aggregate_node 恒 null）。
+   *  缺省 false = 概览默认口径逐字不变。 */
+  overview_full?: boolean;
 }): ProjectViewModel {
   const spec = PROJECT_VIEWS[input.view];
   const bp = input.blueprint;
@@ -933,7 +949,10 @@ export function buildViewModel(input: {
         label: `${base.label}（集成端点·不表示进度）`,
       });
     }
-    overview = capOverview(nodes.filter((n) => n.endpoint !== true), { unit: "任务节点" });
+    overview = capOverview(nodes.filter((n) => n.endpoint !== true), {
+      unit: "任务节点",
+      full: input.overview_full === true,
+    });
   } else {
     const memberKindSet = new Set(spec.member_kinds);
     const members = bp.nodes.filter((n) => memberKindSet.has(n.kind) && n.kind !== "capability");
@@ -971,7 +990,7 @@ export function buildViewModel(input: {
       for (const m of g.members) memberGroups[m] = [...ownersOf(m)].sort();
       allGroupNodes.push({ ...node, id: g.key, label: g.label, group_key: g.key, members: g.members, member_groups: memberGroups });
     }
-    overview = capOverview(allGroupNodes, { unit: "分组" });
+    overview = capOverview(allGroupNodes, { unit: "分组", full: input.overview_full === true });
     nodes.push(...overview.shown);
     for (const g of overview.shown) {
       memberGroupNodeId.set(g.id, g.id);

@@ -10,7 +10,8 @@
 //      note 留痕（2026-09-19 主人拍板）：首报带 note 落盘、再报不传 note 保留旧值、再报传新 note 覆盖
 //   ⑤ update_progress 改模块四色状态，progress.json 里 gate.current_step 未被动
 //   ⑥ select_project 的 project_id / path 两种入参各调一次
-//   ⑦ listTools 恰好 18 个（一期 8 + §6.4 两件 + V06-10 三件套 + C-015 三件套 + V07-02 出口件逐个点名）；V06-10
+//   ⑦ listTools 恰好 22 个（一期 8 + §6.4 两件 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 +
+//      V07-04 doctor + V09-19 六图读口 + V09-23 同步域三接口逐个点名）；V06-10
 //      三件套的入参 schema 点到点 + 各真调一次（没有 v2 事实的窗口期：入口给只读结论，两个写口明确拒绝）；
 //      C-015 三件套（manage_requirement/manage_change/import_plan_definitions）的 schema 点到点与
 //      负例真链路在 verify-requirements.ts ⑧-5（96 条守着）、写口服务侧校验在 verify-c015-service.ts，
@@ -112,6 +113,11 @@ async function main(): Promise<void> {
   // 其四档读取/同源/完整性口径由 verify:v09-19 用真实项目与夹具（大图分页、缺图、表损坏）守；
   // 本脚本只做身份/集合断言，不验语义。
   const V0919_TOOLS = ["get_project_graphs"];
+  // 2026-09-30（V09-23，DESIGN §2.10 / docs/sync-evidence-contract.md）：同步证据域三接口，
+  // 注册表 19 → 22。同一个口径（V06-10/V07-02/V07-04/V09-19 先例）：**逐个点名登记**、
+  // 数量判据仍是"恰好"（**不**改成从注册表动态生成期望集合）。其契约/反例语义由
+  // verify:sync-evidence 等各自守；本脚本只做身份/集合断言，不验语义。
+  const V0923_TOOLS = ["register_sync_contract", "scan_sync_evidence", "read_sync_status"];
   ok(
     EXPECTED.every((n) => names.includes(n)) &&
       M5_TOOLS.every((n) => names.includes(n)) &&
@@ -120,6 +126,7 @@ async function main(): Promise<void> {
       V0702_TOOLS.every((n) => names.includes(n)) &&
       V0704_TOOLS.every((n) => names.includes(n)) &&
       V0919_TOOLS.every((n) => names.includes(n)) &&
+      V0923_TOOLS.every((n) => names.includes(n)) &&
       names.length ===
         EXPECTED.length +
           M5_TOOLS.length +
@@ -127,8 +134,9 @@ async function main(): Promise<void> {
           C015_TOOLS.length +
           V0702_TOOLS.length +
           V0704_TOOLS.length +
-          V0919_TOOLS.length,
-    `listTools 恰含一期 8 个 + 扩充 2 个 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 + V07-04 doctor + V09-19 六图读口（实际 ${names.length} 个）`,
+          V0919_TOOLS.length +
+          V0923_TOOLS.length,
+    `listTools 恰含一期 8 个 + 扩充 2 个 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 + V07-04 doctor + V09-19 六图读口 + V09-23 同步域三接口（实际 ${names.length} 个）`,
   );
   ok(!names.includes("write_design"), "权限证伪②：listTools 不存在 write_design");
   ok(

@@ -207,6 +207,44 @@ function nearestExisting(p: string): string {
   return cur;
 }
 
+/** 项目根内相对路径被判不合法的原因（措辞表见 `badSource`） */
+export type ProjectRelativeReason =
+  | "empty"
+  | "absolute_path"
+  | "parent_traversal"
+  | "outside_project_root"
+  | "symlink_escape";
+
+export type ProjectRelativeResolution =
+  | { ok: true; abs: string; rel_path: string }
+  | { ok: false; reason: ProjectRelativeReason };
+
+/**
+ * 项目根内相对路径的安全解析（DESIGN.md §2.9 口径的**唯一实现**）：
+ * 拒绝空串、绝对路径、`..` 段、解析后越出项目根、经软链/联接点逃逸。
+ * 不抛错——由调用方按自己的口径报（图纸源抛 `badSource`，项目级运行配置如实记一条拒绝理由）；
+ * 同一份判据只此一处实现，调用方各自再写一遍必然漂移。
+ */
+export function resolveProjectRelative(root: string, raw: string): ProjectRelativeResolution {
+  const value = raw.trim();
+  if (value === "") return { ok: false, reason: "empty" };
+  if (POSIX_REL_RE.test(value) || path.isAbsolute(value)) return { ok: false, reason: "absolute_path" };
+  const unix = value.replace(/\\/g, "/");
+  if (unix.split("/").some((seg) => seg === "..")) return { ok: false, reason: "parent_traversal" };
+  const abs = path.resolve(root, unix);
+  const back = path.relative(root, abs);
+  if (back === "" || back.startsWith("..") || path.isAbsolute(back)) {
+    return { ok: false, reason: "outside_project_root" };
+  }
+  // 软链/联接点逃逸：解析"最深的已存在祖先"的真实路径，必须仍在项目根真实路径内
+  const realRoot = realpathOrNull(root) ?? root;
+  const realAncestor = realpathOrNull(nearestExisting(abs));
+  if (realAncestor !== null && relBackOutside(path.relative(realRoot, realAncestor))) {
+    return { ok: false, reason: "symlink_escape" };
+  }
+  return { ok: true, abs, rel_path: back.split(path.sep).join("/") };
+}
+
 /**
  * 登记的相对路径校验（拒绝 `../`、绝对路径、越出项目根、软链/联接点逃逸）。
  * 校验通过返回解析后的绝对路径。
@@ -217,26 +255,9 @@ function resolveRegisteredPath(
   raw: string,
   extra: Record<string, unknown> = {},
 ): string {
-  const value = raw.trim();
-  if (value === "") badSource(kind, raw, "empty", extra);
-  if (POSIX_REL_RE.test(value) || path.isAbsolute(value)) {
-    badSource(kind, raw, "absolute_path", extra);
-  }
-  const unix = value.replace(/\\/g, "/");
-  if (unix.split("/").some((seg) => seg === "..")) badSource(kind, raw, "parent_traversal", extra);
-  const abs = path.resolve(root, unix);
-  const back = path.relative(root, abs);
-  if (back === "" || back.startsWith("..") || path.isAbsolute(back)) {
-    badSource(kind, raw, "outside_project_root", extra);
-  }
-  // 软链/联接点逃逸：解析"最深的已存在祖先"的真实路径，必须仍在项目根真实路径内
-  const realRoot = realpathOrNull(root) ?? root;
-  const realAncestor = realpathOrNull(nearestExisting(abs));
-  if (realAncestor !== null) {
-    const relReal = path.relative(realRoot, realAncestor);
-    if (relBackOutside(relReal)) badSource(kind, raw, "symlink_escape", extra);
-  }
-  return abs;
+  const resolution = resolveProjectRelative(root, raw);
+  if (!resolution.ok) badSource(kind, raw, resolution.reason, extra);
+  return resolution.abs;
 }
 
 function relBackOutside(rel: string): boolean {

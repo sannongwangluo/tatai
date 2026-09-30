@@ -37,6 +37,12 @@ export const getProjectGraphsTool: McpTool = {
     "映射（需求 id/设计章节/代码模块）、证据状态（verified/unverified/missing/invalidated/user_pending）、有效版本、阻断原因与用户待验标记。" +
     "同一份图共用**一个快照标识**（基线＋生成时刻＋来源修订）。**完整性**：当前规模下一次请求返回完整数据；超过安全上限时给 " +
     "`total`/`returned`/同一快照 `cursor` 与 `incomplete:true` 并允许续取——**不静默截断还称「全图」**。" +
+    "**模式**：`mode=overview`（缺省）＝概览（主视图 5–15 分组聚合、技术层 15 节点/40 边防爆炸上限，隐藏量进 `counts.hidden_members`）；" +
+    "`mode=full`＝全量（同一份 builder 换**未聚合并集**上限组：主视图分组全列、技术层节点/边不再聚合截断、扇出过滤关闭，" +
+    "上限外对象**逐项可取**，配 cursor 同快照分页）——隐藏节点/关系的取回入口就是 `mode=full`；" +
+    "`counts.underlying_nodes/edges` 两种模式都给**未聚合并集真值**（同一口径，区分「本图返回数」与「底层候选总数」）。" +
+    "**complete 语义**：`complete` 只指**本次请求返回的对象**已取完，**不含**概览聚合隐藏的对象（那些要 `mode=full` 才返回）。" +
+    "顶层 `collection` 给机器可判读的采集完整性（status/budget_exhausted/legacy_other_bucket/reasons/ignored_dir_segments），与分页 `complete` 语义独立（两者可同时成立：分页取完但采集不完整）。" +
     "**数据流向图分两层**：`current_implementation`（当前实现＝三张技术图共用的静态 import 依赖层方向渲染，**不是**业务数据流）与 " +
     "`target_semantics`（目标＝输入源→处理→存储→输出/外部系统的实际路径，逐跳带出处与验证态，含已验证链与缺口）——" +
     "静态依赖**不得**被称为已验证业务数据流。图更新中/失败/过期时返回真实状态与原因（预计用时只用有依据的实测值，依据不足写「无法估计」）。" +
@@ -56,6 +62,12 @@ export const getProjectGraphsTool: McpTool = {
           "取哪张图：all（缺省＝全部六图）／functional（功能全景）／architecture（系统架构）／construction（施工依赖）／" +
           "module_map（模块方框图）／data_flow（数据流向图）／mind_map（思维导图）",
       },
+      mode: {
+        type: "string",
+        enum: ["overview", "full"],
+        description:
+          "overview（缺省）＝概览（主视图 5–15 分组聚合、技术层 15 节点/40 边防爆炸上限，hidden_members 计隐藏量）；full＝全量（同一份 builder 换未聚合并集上限组：主视图分组全列、技术层节点/边不再聚合截断、扇出过滤关闭，上限外对象逐项可取，配 cursor 同快照分页）。两种模式同一快照标识与节点身份；游标跨模式明确拒绝（不能拿概览游标续 full，反之亦然）。",
+      },
       node_id: {
         type: "string",
         description:
@@ -69,7 +81,7 @@ export const getProjectGraphsTool: McpTool = {
       cursor: {
         type: "string",
         description:
-          "续取游标（上一轮 completeness.cursor 或 completeness.cursors[<graphKey>]，格式 <snapshot_id>:<graphKey>:<下一位置>）：**同一快照内有效**，快照对不上明确拒绝（不跨快照拼数据）；续取时请同时传 graph（两者指向不同图会被拒）。取完（complete:true）时为 null、终页不再给游标。",
+          "续取游标（上一轮 completeness.cursor 或 completeness.cursors[<graphKey>]，格式 <snapshot_id>:<mode>:<graphKey>:<下一位置>；旧三段 <snapshot_id>:<graphKey>:<offset> 按 overview 兼容解释）：**同一快照且同一模式内有效**，快照对不上或模式不匹配都明确拒绝（不跨快照拼数据、不跨模式续取，请从首页重取）；续取时请同时传 graph 与 mode（graph 指向不同图会被拒）。取完（complete:true）时为 null、终页不再给游标。",
       },
       limit: {
         type: "number",
@@ -91,10 +103,16 @@ export const getProjectGraphsTool: McpTool = {
           "六图的键与标题见工具描述",
       );
     }
+    // V09-22：读取模式（缺省 overview＝概览，行为逐字不变；full＝全量上限）
+    const rawMode = typeof args.mode === "string" ? args.mode.trim() : "";
+    if (rawMode !== "" && rawMode !== "overview" && rawMode !== "full") {
+      return errorResult(`get_project_graphs 的 mode 只认 overview/full（给的是 ${rawMode}）`);
+    }
     const limit = typeof args.limit === "number" && Number.isFinite(args.limit) ? Math.max(1, Math.floor(args.limit)) : undefined;
     try {
       const snapshot = sixGraphsOf(projectId, {
         ...(graphKey === undefined ? {} : { graph: graphKey }),
+        ...(rawMode === "" ? {} : { mode: rawMode as "overview" | "full" }),
         ...(typeof args.node_id === "string" && args.node_id.trim() !== "" ? { node_id: args.node_id.trim() } : {}),
         ...(typeof args.relation_id === "string" && args.relation_id.trim() !== "" ? { relation_id: args.relation_id.trim() } : {}),
         ...(typeof args.cursor === "string" && args.cursor.trim() !== "" ? { cursor: args.cursor.trim() } : {}),

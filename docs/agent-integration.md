@@ -253,13 +253,21 @@ HTTP 读口：`GET /api/projects/:id/arch/dataflow`（只读，与 `get_arch` �
   **更新中或过期状态**（`update_state`/`update_phase`/`update_reason`/`update_eta_text`/`banners`）＋**异常** `anomalies`＋
   交付读数与用户待验数＋**下一读取入口** `next_read_entry`。
 - **`get_project_graphs` 四档**：① 缺省＝**全部六图**；② `graph=<六图之一>`；③ `node_id=<稳定 ID>`；④ `relation_id=<稳定关系 ID>`。
+  另有读取模式 `mode`：缺省 `overview`（概览，人看概要）；`mode=full`＝**全量模式**取回概览聚合隐藏的节点/关系。
   六图键：`functional`（功能全景）／`architecture`（系统架构）／`construction`（施工依赖）／`module_map`（模块方框图）／
   `data_flow`（数据流向图）／`mind_map`（思维导图）。
 - **逐对象给什么**：稳定 ID、名称、**状态键**与**界面短标/颜色口径**（同一份 `statusColor.ts`）、来源（需求/设计/代码）、
   映射（需求 id／设计章节／代码模块）、**证据状态**（verified／unverified／missing／invalidated／user_pending）、
   **有效版本**、**阻断原因**、**用户待验标记**。
-- **完整性**：当前规模下一次请求返回完整数据；超过安全上限时给 `total`/`returned`/同一快照 `cursor` 与 `incomplete:true`，
-  **不允许**静默截断后仍称「全图」。
+- **技术图来源分层**：`module_map`／`data_flow` 的 `counts.by_origin={code,plan,chat}` 给三类计数，逐节点带 `origin_layer`（`code`／`plan`／`chat`）——
+  **「节点总数」不等于「代码模块数」**（塔台实测 80 节点＝8 代码模块＋72 规划对象＋0 聊天补全）。
+  `by_origin` 只数**本图可见真实实体**（`__more__` 聚合占位不计入、不冒充代码模块）；**真实代码模块数**读 `counts.by_origin_underlying`（底层未聚合并集口径，两种模式同值），
+  隐藏的真实代码模块数＝`by_origin_underlying.code − by_origin.code`（2026-09-29 返工 F4 定版）。
+- **完整性（`mode=full`）**：`mode=full` 走**未聚合并集**、按 **4000 对象/页**在**同一快照**上分页续取
+  （四段游标 `<snapshot_id>:<mode>:<graphKey>:<offset>`）；**没有 20000 生产上限**——`MCP_FULL_LIMITS=20000` 自 V09-22 返工起不再是生产读口上限，仅存于验证夹具。
+  合并视图超限时给 `total`/`returned`／`incomplete:true` 与 `completeness.cursors`（逐图游标），带 `graph=<六图之一>` ＋对应游标把该图取齐：
+  **`complete:true` 只表示本次请求图对象分页取完，不等于源码全覆盖**——采集完整性看顶层 **`collection`**（机器可判读：`status`＝not_parsed/unknown/incomplete/complete、`budget_exhausted`、`legacy_other_bucket`、`reasons[]`、`ignored_dir_segments[]`，2026-09-29 返工 F5 定版；与分页 `complete` 语义独立、可同时成立），人读解释另见各图 `notes` 与顶层 `anomalies`。
+  概览模式（`mode=overview`）只适合人看概要，被聚合隐藏的对象不在其中；**不允许**静默截断后仍称「全图」。
 - **模型待审线索单列**（`model_leads`／`model_node_leads`，标「未审定」）：不混进正式节点或正式关系、不计入任何验证读数（§4.1）。
 - **三种「到哪一步」分开**（`separate_readouts`）：交付读数 `delivery.verdict`（可请求验收／不可判定项目可交付，
   **仍不等于用户接受**）、工作流 `next_action`、**用户 Gate** 各自表达，任一项都不等于「已交付」。

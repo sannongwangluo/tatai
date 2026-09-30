@@ -44,6 +44,8 @@ import { getArchTool } from "../src/mcp/tools/getArch";
 import { getProjectGraphsTool } from "../src/mcp/tools/getProjectGraphs";
 import { projectEntryTool } from "../src/mcp/tools/projectEntry";
 import { TOOLS } from "../src/mcp/tools/index";
+// 安装包文件名带产品版本号；唯一来源见 src/shared/version.ts（读仓库根 package.json）
+import { APP_VERSION } from "../src/shared/version";
 
 let pass = 0;
 let fail = 0;
@@ -348,7 +350,8 @@ if (realBp === null) {
 section("⑤ 六图完整状态读口：同一快照标识、逐对象字段、线索单列、两层数据流、三种读数分开");
 const snap = sixGraphsOf("tatai");
 {
-  ok(/^gs-[0-9a-f]{8}$/.test(snap.snapshot_id), `⑤ 快照标识在场且稳定格式（${snap.snapshot_id}）`);
+  // V09-22 返工契约 5：快照标识改 sha256 截 16 hex（旧 8 位 FNV 已升级），格式断言同步
+  ok(/^gs-[0-9a-f]{16}$/.test(snap.snapshot_id), `⑤ 快照标识在场且稳定格式（${snap.snapshot_id}）`);
   ok(
     snap.baseline.baseline_id !== null && snap.generated_at !== null && snap.generated_at === realBp?.generated_at,
     `⑤ 基线/生成时刻与蓝图同源（baseline=${snap.baseline.baseline_id}、generated_at=${snap.generated_at}）`,
@@ -373,7 +376,8 @@ const snap = sixGraphsOf("tatai");
   );
   const arch = snap.graphs.architecture!;
   ok(
-    arch.counts.groups === 12 && arch.counts.intra_relations >= 132,
+    // 2026-09-28 开源 CI 轮给仓库加 .github（ecb6006），蓝图重生成后多一个未归属模块组 github ⇒ 组数钉值 12→13
+    arch.counts.groups === 13 && arch.counts.intra_relations >= 132,
     `⑤ 分组与同组关系逐条可见（系统架构 ${arch.counts.groups} 组／${arch.counts.intra_relations} 条同组关系；≥ V09-18 当时的 132）`,
   );
   const df = snap.graphs.data_flow!;
@@ -471,7 +475,7 @@ section("⑦ 反例簇：大图分页、缺图、旧 get_arch 兼容");
       pages.push(seqOf(page.graphs[key]!));
       samePosition = samePosition && page.completeness.cursor === (page.completeness.cursors[key] ?? null);
       const next: string | null = page.completeness.cursors[key] ?? null;
-      if (next !== null && Number(next.split(":")[2]) <= Number(cur.split(":")[2])) break; // 原地/倒退 = 坏
+      if (next !== null && Number(next.split(":")[3]) <= Number(cur.split(":")[3])) break; // 原地/倒退 = 坏（V09-22 返工后游标四段制，offset 在第 4 段）
       cur = next;
       rounds++;
     }
@@ -551,7 +555,7 @@ section("⑦ 反例簇：大图分页、缺图、旧 get_arch 兼容");
       last = p.parsed;
       pages.push(...seqOf(p.parsed.graphs.functional));
       const next: string | null = p.parsed.completeness.cursors?.functional ?? null;
-      if (next !== null && Number(next.split(":")[2]) <= Number(cur.split(":")[2])) break;
+      if (next !== null && Number(next.split(":")[3]) <= Number(cur.split(":")[3])) break;
       cur = next;
       rounds++;
     }
@@ -744,7 +748,7 @@ section("⑫ 交付报告按非作者复审 §六 逐项勘误（只追加；原
   //         记录值（三件都查，不只 NSIS）；报告 §八 的 `3,363,927` 作为**历史留痕**仍在册（只追加、不回改）｜
   //   保留意图＝「盘上产物与绑定记录一致（同源）」这条判据一条不减｜
   //   判据不放宽：盘上字节数或 sha256 与绑定记录不符仍判红（旧写法只比字节数，新写法连内容哈希一起比）。
-  const installArtifacts = ["nsis/Tatai_0.1.1_x64-setup.exe", "msi/Tatai_0.1.1_x64_en-US.msi", "tatai.exe"];
+  const installArtifacts = [`nsis/Tatai_${APP_VERSION}_x64-setup.exe`, `msi/Tatai_${APP_VERSION}_x64_en-US.msi`, "tatai.exe"];
   const mismatches: string[] = [];
   for (const suffix of installArtifacts) {
     const rec = bind.artifacts.find((a) => a.path.endsWith(suffix));

@@ -78,7 +78,15 @@ export interface GraphEdge {
   origin?: "plan";
 }
 
-export type SharedLimits = Partial<typeof ARCH_LIMITS>;
+/** 生效的硬上限数值（各维都是数字；具体口径字面量集中在 `config.ts` 的 `ARCH_LIMITS` /
+ *  `RENDER_FULL_LIMITS` / `MCP_FULL_LIMITS`）。写成映射类型而不是 `typeof ARCH_LIMITS` 本身：
+ *  后者被 `as const` 收成字面量（MAX_NODES 只能等于 15），V09-22 的全量上限（2000/20000）
+ *  根本传不进来；而 config.ts 不 import 本类型（config ← shared-graph 反向 import 会成环），
+ *  由使用侧按结构收窄。 */
+export type GraphLimits = { [K in keyof typeof ARCH_LIMITS]: number };
+
+/** 上限覆盖入参（只给要改的维，缺的维取 `ARCH_LIMITS` 默认） */
+export type SharedLimits = Partial<GraphLimits>;
 
 /** **单层**的截断计数（R1-ZS-005：各层分开如实记，不许把上一层的计数吞掉或重复计）。
  *  三个口径对应 §4.3 的三种削减：nodes = 被聚合成「还有 N 个」的节点数；
@@ -101,7 +109,7 @@ export interface SharedGraph {
   version: 1;
   generated_at: string;
   /** 生效的硬上限数值（config.ts 口径，随渲染结果带出供界面展示） */
-  limits: typeof ARCH_LIMITS;
+  limits: GraphLimits;
   nodes: GraphNode[];
   /** E_ALL：已过 §4.3 防爆炸的全量聚合边，未按视图过滤 */
   edges: GraphEdge[];

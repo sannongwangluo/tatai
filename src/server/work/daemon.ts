@@ -17,6 +17,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { resolveDataDir } from "../registry";
 import { createWorkHost } from "../workHost";
+import { startSyncDiscovery, stopSyncDiscovery } from "./syncDiscovery";
 import { WorkServiceClient, WORK_TOKEN_HEADER, SERVICE_DESCRIPTOR_FILE, type WorkServiceDescriptor } from "./service";
 
 const dataDir = resolveDataDir();
@@ -77,14 +78,23 @@ async function main(): Promise<void> {
   function shutdown(reason: string): void {
     if (exiting) return;
     exiting = true;
-    try {
-      workHost.unpublish();
-    } catch {
-      // 撤不掉也不挡退出——残留描述符由客户端自愈清理
-    }
     console.log(`[write-service] 退出（${reason}）`);
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 1500).unref();
+    void (async () => {
+      // V09-23：先停后台同步发现——关监听/定时器并 await 在途扫描，返回后不再有扫描写入
+      try {
+        await stopSyncDiscovery();
+      } catch {
+        // 停止失败不挡退出（描述符照撤，客户端自愈）
+      }
+      try {
+        workHost.unpublish();
+      } catch {
+        // 撤不掉也不挡退出——残留描述符由客户端自愈清理
+      }
+      server.close(() => process.exit(0));
+    })();
+    // 兜底：stopSyncDiscovery 自身有界（≤10s），这里留一点余量后强制退出
+    setTimeout(() => process.exit(0), 12_000).unref();
   }
   process.on("SIGINT", () => shutdown("sigint"));
   process.on("SIGTERM", () => shutdown("sigterm"));
@@ -96,20 +106,22 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     workHost.publish(bound.port, bound.address);
-    console.log(`[write-service] data dir: ${dataDir}`);
-    // 并发双拉起的收尾仲裁：两个 daemon 可能都通过了启动探活并先后发布（窗口毫秒级）。
-    // 发布后复核描述符——若所有权已被后来者覆盖（pid 非本进程），本进程输掉竞争：
-    // 静默退出**且不撤描述符**（那是赢家的锁，撤了会把赢家打死）。输家本来就没被任何
-    // 客户端指向（客户端每次提交都现读描述符），多活 300ms 无害。
+    // V09-23：**发布描述符之后、且确认描述符属于本进程**才启动后台同步发现（退位候选不先扫）。
+    // 并发双拉起时两个 daemon 可能都通过启动探活并先后发布（毫秒级窗口），故这里用发布后仲裁：
+    // 描述符已被别人覆盖（pid 非本进程）就静默退位**且不启动发现**；赢家才扫。
+    // `startSyncDiscovery` 内部还会再复核一次描述符 pid（两宿主共用同一门槛，不靠调用方自觉）。
     setTimeout(() => {
       const now = readServiceDescriptorSafe(dataDir);
-      if (now !== null && now.pid !== process.pid) {
-        console.log(`[write-service] 描述符已被 pid ${now.pid} 接管（并发双拉起，本进程输）——静默退位`);
+      if (now === null || now.pid !== process.pid) {
+        console.log(`[write-service] 描述符不属于本进程（pid ${now?.pid ?? "无"}）——静默退位，不启动后台发现`);
         exiting = true; // 跳过 unpublish：描述符属于赢家
         server.close(() => process.exit(0));
         setTimeout(() => process.exit(0), 500).unref();
+        return;
       }
+      startSyncDiscovery({ service: workHost.service, dataDir });
     }, 300).unref();
+    console.log(`[write-service] data dir: ${dataDir}`);
   });
 }
 

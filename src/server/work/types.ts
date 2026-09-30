@@ -140,6 +140,11 @@ export const REGISTERED_EVENT_TYPES: readonly EventTypeRegistration[] = [
   // T23 / C-017：项目预算约束到顶导致认领被拒的**留证**（§5.7：达到约束不是省略验证的理由）。
   // 项目级单实体 `budget:<project_id>`（约束是项目可配置约束，不是某张卡的属性）。
   { type: "budget.blocked", owner: "T23", entity_prefix: "budget:", payload: "usage/max/task_id/reason（下次认领因达到项目预算约束上限被拒的留证）" },
+  // V09-23（DESIGN §2.10；docs/sync-evidence-contract.md）：同步证据领域两事件，实体 `sync:<batch_id>`。
+  // 登记面与 eventSurface 同步；证据包真实字节经现有 putEvidence 语义保存（本域不另存副本），
+  // 写口在唯一写入服务文件锁内按**当前实际目标**复核（伪造 passed 与计算后变化一律拒、零字节）。
+  { type: "sync.contract_registered", owner: "V09-23", entity_prefix: "sync:", payload: "schema_version/batch_id/project_id/title/sources[{path,sha256}]/items[{id,label,required,check}]/blocks_entry/supersedes?（闭键；冻结内容地址 SHA256；同批次改内容拒）" },
+  { type: "sync.evidence_checked", owner: "V09-23", entity_prefix: "sync:", payload: "batch_id/contract_sha256/evidence_sha256/evidence_path/overall/target_fingerprint/items[{id,required,verdict}]（稳定幂等键；写口按当前实际目标重算并逐项比对）" },
 ];
 
 /** 未挂变更批次的实体（需求注册、批次自身）在事件信封里用的批次占位值（信封的 change_id 必须非空） */

@@ -44,6 +44,7 @@ pnpm attach:agents-md -- <project_id>
 │   ├── work/                         v2 事实与投影（V06-01/V06-03，程序自建）    [不预置]
 │   │   ├── events.jsonl              唯一事实源：一行一条事件（只追加）
 │   │   ├── state.json                可重建快照（带 last_seq）
+│   │   ├── sync-inbox/               同步证据收件目录（V09-23）：写 `<批次号>.evidence.json`
 │   │   └── migration-backup/          v1→v2 迁移备份（含逐字节哈希清单，V06-03）
 │   ├── evidence/                     任务证据与交接包（按卡号分目录，程序自建）  [不预置]
 │   ├── chat/
@@ -183,9 +184,14 @@ pnpm attach:agents-md -- <project_id>
 ├── state.json                          可重建快照（带 last_seq）；删掉可全量重放
 ├── projection-error.json               投影失败标记（有它 = 快照落后于事件）
 ├── recovery.jsonl / quarantine/        半截尾行的恢复留痕与隔离原文
+├── sync-inbox/                         同步证据收件目录（V09-23）：Agent 写 `<批次号>.evidence.json`，
+│                                       塔台后台自动发现并逐项对账（用户无需手工维护；契约见
+│                                       `docs/sync-evidence-contract.md`）
 └── migration-backup/<时间戳>/          v1→v2 迁移前的整份备份 + manifest.json（逐字节哈希清单）
     migration-archived/<时间戳>/        回滚时移进来的 v2 事件/快照（保留事实，不删）
 ```
+
+`sync-inbox/` 由程序在第一次需要时自建（不预置）；它连同整个 `.工作台/` 默认被 `.gitignore` 覆盖，**不会进 git**。
 
 **任务状态来自事件**（`.工作台/work/events.jsonl` 的已提交事件），`tasks.json` 与 `progress.json`
 里被标记的状态区是**兼容投影**。迁移后 `tasks.json` 会长成下面这样——带 `projection_of` 标记，

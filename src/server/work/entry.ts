@@ -10,6 +10,7 @@
 //
 // §6.7 判定规则的**优先顺序**（本文件 `decideNextAction` 逐条落地，短路先中者胜）：
 //   1. 现场事实读不出来 → blocked（不拿"读不到"当空状态）
+//   1.5 项目级阶段必读指针（`.工作台/work/stage-reads.json`）不合法/来源漂移 → blocked（不派活；缺文件不算）
 //   2. 有效基线核对：没有生效基线 → await_decision（先审定，塔台不派活）
 //   3. 源在基线激活后变过 → blocked（影响待查，不派发；§5.6）
 //   4. 用户暂停/退回：任务级退回 → 停受影响任务资格；批次级退回 → await_decision（§5.8）
@@ -27,6 +28,7 @@
 // 能力发现（§6.2）：`client_capabilities` 未声明一律按「仅可读取」处理——只读客户端只拿到读取与
 // 明确的接续指令，**不假称全自动**；要认领/执行必须声明可接续（`continuable`）或可协调执行（`coordination`）。
 import fs from "node:fs";
+import path from "node:path";
 import { getProject, resolveDataDir } from "../registry";
 import { projectWorkDir } from "../workstation";
 import { readAuditRecords, type AcceptanceRecord } from "./audit";
@@ -53,6 +55,9 @@ import {
   type StatusProjectionSet,
 } from "./statusProjection";
 import { alignDefinitionsAndStates, readTaskStates, TASK_STATUS_LABELS, type TaskState } from "./tasks";
+import { loadStageReads, STAGE_READS_REL, type StageReadKind, type StageReadsLoad } from "./stageReads";
+import { computeSyncBlock, SYNC_INBOX_REL, type SyncBlockInfo } from "./sync";
+import type { SyncVerdict } from "../../shared/syncEvidence";
 import { WorkError } from "./types";
 import { compareIsoTime, latestByTime } from "../time";
 
@@ -79,7 +84,7 @@ export const PROJECT_ENTRY_INPUT_FIELDS = [
   "resume_hint",
 ] as const;
 
-/** §6.7 只读返回字段（顺序即契约顺序） */
+/** §6.7 只读返回字段（顺序即契约顺序）；末项 `sync_summary` 为 V09-23 的响应层同步摘要（DESIGN §2.10） */
 export const PROJECT_ENTRY_RESULT_FIELDS = [
   "project",
   "baseline",
@@ -89,6 +94,7 @@ export const PROJECT_ENTRY_RESULT_FIELDS = [
   "next_action",
   "reasons",
   "required_reads",
+  "sync_summary",
 ] as const;
 
 /** 七个枚举各自的触发条件（给人读的措辞；与 `decideNextAction` 的分支一一对应） */
@@ -125,6 +131,12 @@ export interface ProjectEntryOptions {
   dataDir?: string;
   /** 验证钩子：把"现在"固定下来（租约判定用；产品路径不传） */
   now?: string;
+  /**
+   * V09-23 返工C（Codex 反例12）：唯一宿主的**同一份**后台发现错误——MCP 另一进程从只读读口取来后注入，
+   * 使 entry 的 `sync_summary` 与宿主 HTTP/read 读口同源（MCP 自己进程汇为空，不能冒充"后台无故障"）。
+   * 不给＝读本进程汇（宿主自身路径；老调用方行为不变）。
+   */
+  syncDiscoveryIssues?: string[];
 }
 
 // ── 能力发现（§6.2：如实区分 只读 / 可接续 / 可协调执行） ──
@@ -331,7 +343,8 @@ export interface EntryReason {
 
 export interface RequiredRead {
   path: string;
-  kind: "design" | "plan" | "baseline" | "task_facts" | "evidence" | "checkpoint" | "audit" | "decisions";
+  /** 取值 = `stageReads.STAGE_READ_KINDS` 的既有联合（项目级指针不发明新 kind） */
+  kind: StageReadKind;
   why: string;
   revision?: string | null;
   range?: { start: number; end: number } | null;
@@ -420,6 +433,16 @@ export interface ProjectEntry {
   next_action: ProjectEntryAction;
   reasons: EntryReason[];
   required_reads: RequiredRead[];
+  /** 同步证据摘要（V09-23／DESIGN §2.10）：在**响应层**拼，不塞进 collectProjectFacts（findings D）。未配置项目为 null。 */
+  sync_summary: EntrySyncSummary | null;
+}
+
+/** 同步证据的响应层摘要（判据来源＝sync.computeSyncBlock，与 claimTask / 写口**同一份**） */
+export interface EntrySyncSummary {
+  configured: boolean;
+  overall: SyncVerdict;
+  blocked: boolean;
+  blocking_batches: { batch_id: string; title: string; verdict: SyncVerdict; reasons: string[] }[];
 }
 
 // ── 现场事实（只读；读不出来如实标 unreadable，不假装空状态） ──
@@ -443,6 +466,10 @@ interface EntryFacts {
   live: Record<string, ClaimRecord | null>;
   baseline: ProjectBaseline | null;
   baselineRevalidate: string[];
+  /** 项目级阶段必读指针（`.工作台/work/stage-reads.json`；不存在=absent，老项目原样兼容） */
+  stageReads: StageReadsLoad;
+  /** 同步证据阻断（V09-23／DESIGN §2.10；未配置项目为 null，保持兼容） */
+  syncBlock: SyncBlockInfo | null;
   design: ReturnType<typeof loadDocument>;
   plan: ReturnType<typeof loadDocument>;
   context: ContextPackage | null;
@@ -542,12 +569,24 @@ export function baselineRevalidateOf(
 }
 
 /** 汇总现场事实（全部只读；任何一步读不出来都记进 `unreadable`，由判定层 fail-closed） */
-function gatherFacts(projectId: string, dataDir: string, now: string): EntryFacts {
+function gatherFacts(projectId: string, dataDir: string, now: string, syncDiscoveryIssues?: string[]): EntryFacts {
   const project = getProject(projectId, dataDir);
   if (!project) {
     throw new WorkError("INVALID_COMMAND", `项目不存在: ${projectId}`, { project_id: projectId });
   }
   const workDir = projectWorkDir(projectId, dataDir);
+  // 项目级阶段必读指针（§6.7 required_reads 的项目级扩展；只读、fail-closed）。
+  // 读不出/不合法的**不抛**（入口要如实给 blocked，而不是让调用方收一个错误），
+  // 只有"文件真的不存在"才 absent——老项目因此完全兼容。
+  let stageReads: StageReadsLoad;
+  try {
+    stageReads = loadStageReads(path.resolve(project.path));
+  } catch (e) {
+    stageReads = {
+      status: "invalid",
+      reasons: [`${STAGE_READS_REL} 读取失败：${e instanceof Error ? e.message : String(e)}`],
+    };
+  }
   let unreadable: string | null = null;
   let states: Record<string, TaskState> = {};
   let claims: Record<string, ClaimRecord[]> = {};
@@ -556,6 +595,15 @@ function gatherFacts(projectId: string, dataDir: string, now: string): EntryFact
     claims = claimRecordsOf(readClaimEvents(workDir));
   } catch (e) {
     unreadable = `事件现场读不出来（${(e as Error).message}）`;
+  }
+
+  // 同步证据阻断（V09-23／DESIGN §2.10）：只读、fail-closed。未配置项目 computeSyncBlock 返回
+  // blocked=false（老项目零影响）；读不出来**不抛**——入口如实按"读不出"处理（见 decideNextAction 第 1.6 步）。
+  let syncBlock: SyncBlockInfo | null = null;
+  try {
+    syncBlock = computeSyncBlock(projectId, dataDir, syncDiscoveryIssues === undefined ? {} : { discoveryIssues: syncDiscoveryIssues });
+  } catch (e) {
+    unreadable ??= `同步证据现场读不出来（${(e as Error).message}）`;
   }
 
   const design = loadDocument(projectId, "design", dataDir);
@@ -651,6 +699,8 @@ function gatherFacts(projectId: string, dataDir: string, now: string): EntryFact
     ),
     baseline,
     baselineRevalidate,
+    stageReads,
+    syncBlock,
     design,
     plan,
     context,
@@ -873,6 +923,40 @@ function decideNextAction(input: DecideInput): Decision {
     return { action: "blocked", reasons: [unreadableReason(facts.unreadable)], required_reads: reads };
   }
 
+  // ── 1.5 项目级阶段必读指针（`.工作台/work/stage-reads.json`）──
+  // 指针是机器派生的事实：坏 JSON/类型不对/来源哈希漂移/路径逃逸 —— 一律**不派活**（fail-closed），
+  // 不静默按旧口径给出接续包。指针不存在 = 老项目原样兼容（不加理由、不阻断，见 stageReads.ts 口径）。
+  if (facts.stageReads.status === "invalid") {
+    reasons.push({
+      code: "stage_reads_invalid",
+      text:
+        `项目级阶段必读指针不可用：${facts.stageReads.reasons.join("；")}。` +
+        "指针是机器派生的来源声明（不是新设计、不是授权源）：**来源缺失或改过就拒发**——" +
+        "先修好/重新生成该指针（或删掉它回到无指针口径），再回来取接续工作；本条不派任何任务",
+      blocking: true,
+    });
+    return { action: "blocked", reasons, required_reads: reads };
+  }
+
+  // ── 1.6 同步证据阻断（V09-23／DESIGN §2.10）──
+  // active 且 blocks_entry 的批次未当前通过时：列出差项、required_reads 带上证据入口、next_action=blocked，
+  // 与 claimTask / 唯一写服务锁内 task.claimed 门禁**同一份判据**（computeSyncBlock），避免绕开入口。
+  if (facts.syncBlock !== null && facts.syncBlock.blocked) {
+    for (const b of facts.syncBlock.batches) {
+      reasons.push({
+        code: "sync_blocked",
+        text:
+          `同步批次「${b.title}」（${b.batch_id}）未当前通过（verdict=${b.verdict}）：` +
+          `${b.reasons.slice(0, 6).join("；") || "缺项/目标不符"}。` +
+          "本批次声明 blocks_entry：其登记范围对账通过前不派发新任务、不放行实际认领；" +
+          "先补齐/修复证据或按契约收口，或以新批次显式 supersede 旧批次（DESIGN.md §2.10）",
+        blocking: true,
+        missing_items: b.reasons.slice(0, 6),
+      });
+    }
+    return { action: "blocked", reasons, required_reads: requiredReads(facts, null) };
+  }
+
   // ── 2. 有效基线 ──
   if (facts.baseline === null) {
     reasons.push({
@@ -1002,7 +1086,8 @@ function decideNextAction(input: DecideInput): Decision {
     if (c.conflicts.length > 0) return false;
     return c.dependencies.every((d) => d.released);
   });
-  const hinted = pickHint(ready, resumeHint, reasons);
+  const stagePreferred = facts.stageReads.status === "ok" ? facts.stageReads.preferred_task_id : null;
+  const hinted = pickHint(ready, resumeHint, reasons, stagePreferred);
   if (hinted !== null) {
     const c = hinted;
     if (ready.length > 1) {
@@ -1256,15 +1341,18 @@ function pickStable<T extends { def: TaskDefinition; depLevel: number }>(list: r
   )[0];
 }
 
-/** 接续提示：命中且合格就用它；指不动就如实记下并回落到默认排序（不越权、不静默） */
+/** 接续提示：命中且合格就用它；指不动就如实记下并回落到默认排序（不越权、不静默）。
+ *  调用方显式给的 `resume_hint` **优先于**项目级指针里的 `preferred_task_id`；两者都只能指向
+ *  真实就绪候选（角色/依赖/范围/状态校验早在上游 `ready` 集合里算过，提示不越权绕过）。 */
 function pickHint(
   ready: readonly Candidate[],
   resumeHint: string | null,
   reasons: EntryReason[],
+  stagePreferred: string | null = null,
 ): Candidate | null {
   if (ready.length === 0) return null;
   const hint = (resumeHint ?? "").trim();
-  if (hint === "") return pickStable(ready);
+  if (hint === "") return pickProjectPreferred(ready, stagePreferred, reasons);
   const hit = ready.find((c) => c.def.task_id === hint || `${c.def.task_id}@${c.def.stable_key}` === hint);
   if (hit === undefined) {
     reasons.push({
@@ -1272,8 +1360,37 @@ function pickHint(
       text: `resume_hint=${hint} 不在当前可派队列里（可能已不在就绪态/依赖未释放/角色不符）：按默认规则选，不因为提示就越权`,
       blocking: false,
     });
+    return pickProjectPreferred(ready, stagePreferred, reasons);
+  }
+  return hit;
+}
+
+/** 项目级指针的优选卡：只在真实就绪候选里选；指不动就如实记下并回落默认排序（不越权） */
+function pickProjectPreferred(
+  ready: readonly Candidate[],
+  stagePreferred: string | null,
+  reasons: EntryReason[],
+): Candidate {
+  const preferred = (stagePreferred ?? "").trim();
+  if (preferred === "") return pickStable(ready);
+  const hit = ready.find((c) => c.def.task_id === preferred || `${c.def.task_id}@${c.def.stable_key}` === preferred);
+  if (hit === undefined) {
+    reasons.push({
+      code: "stage_preferred_unusable",
+      text:
+        `项目级阶段指针 ${STAGE_READS_REL} 的 preferred_task_id=${preferred} 不在当前可派队列里` +
+        "（依赖未释放/角色不符/已在途或已交付/范围冲突）：按默认规则选，指针不构成授权、也不越权绕过任何校验",
+      blocking: false,
+    });
     return pickStable(ready);
   }
+  reasons.push({
+    code: "stage_preferred_selected",
+    text:
+      `本次按项目级阶段指针 ${STAGE_READS_REL} 的 preferred_task_id=${preferred} 从就绪队列里选中它` +
+      "（该卡本就在真实就绪候选集合内：依赖已释放、角色相符、无范围冲突；指针只是排序意见，不放行任何本来领不了的卡）",
+    task_id: hit.def.task_id,
+  });
   return hit;
 }
 
@@ -1518,6 +1635,39 @@ function requiredReads(facts: EntryFacts, def: TaskDefinition | null): RequiredR
       why: "上一轮中断留下的续接位置（服务器保留的现场：已确认来源、未读清单、续读游标）",
     });
   }
+  // 项目级阶段必读（`.工作台/work/stage-reads.json` 派生指针）：本阶段必须读到的原文——
+  // 项目总图、AGENTS.md、当前交接等。指针合法才追加；同一个 `kind+path` 已在上面出现就不重复列。
+  // 指针缺失/不合法**不在这里**表达：缺失=老项目原样兼容，不合法由判定层给 blocked（见 decideNextAction 第 1.5 步）。
+  if (facts.stageReads.status === "ok") {
+    const listed = new Set(out.map((r) => `${r.kind}:${r.path}`));
+    for (const entry of facts.stageReads.entries) {
+      const key = `${entry.kind}:${entry.path}`;
+      if (listed.has(key)) continue;
+      listed.add(key);
+      out.push({
+        path: entry.path,
+        kind: entry.kind,
+        why: `本阶段必读（项目级指针 ${STAGE_READS_REL}）：${entry.why}`,
+        revision: entry.revision,
+      });
+    }
+  }
+  // 同步证据阻断时带出证据入口（V09-23／DESIGN §2.10）：让接续 Agent 一眼看到缺哪一批、证据包放哪
+  // （`kind` 复用既有枚举 evidence；同一 kind+path 不重复列）。
+  if (facts.syncBlock !== null && facts.syncBlock.blocked) {
+    const listed = new Set(out.map((r) => `${r.kind}:${r.path}`));
+    for (const b of facts.syncBlock.batches) {
+      const rel = `${SYNC_INBOX_REL}/${b.batch_id}.evidence.json`;
+      const key = `evidence:${rel}`;
+      if (listed.has(key)) continue;
+      listed.add(key);
+      out.push({
+        path: rel,
+        kind: "evidence",
+        why: `同步批次「${b.title}」（${b.batch_id}）未当前通过（verdict=${b.verdict}）：见证它缺什么、期望与实际差在哪；blocks_entry 阻断接续与认领`,
+      });
+    }
+  }
   return out;
 }
 
@@ -1536,7 +1686,7 @@ export function evaluateProjectEntry(input: ProjectEntryInput, opts: ProjectEntr
   const dataDir = opts.dataDir ?? resolveDataDir();
   // 租约判定用毫秒精度的 ISO（`nowIso()` 只到秒：秒级以下租约会被算成"还没到期"）
   const now = opts.now ?? new Date().toISOString();
-  const facts = gatherFacts(projectId, dataDir, now);
+  const facts = gatherFacts(projectId, dataDir, now, opts.syncDiscoveryIssues);
   const capability = capabilityOf(input.client_capabilities);
   const knownRevision = typeof input.known_revision === "string" && input.known_revision.trim() !== "" ? input.known_revision.trim() : null;
   const resumeHint = typeof input.resume_hint === "string" && input.resume_hint.trim() !== "" ? input.resume_hint.trim() : null;
@@ -1635,6 +1785,15 @@ export function evaluateProjectEntry(input: ProjectEntryInput, opts: ProjectEntr
     next_action: decision.action,
     reasons: [...decision.reasons, ...extra],
     required_reads: decision.required_reads,
+    sync_summary:
+      facts.syncBlock === null || !facts.syncBlock.configured
+        ? null
+        : {
+            configured: facts.syncBlock.configured,
+            overall: facts.syncBlock.overall,
+            blocked: facts.syncBlock.blocked,
+            blocking_batches: facts.syncBlock.batches.map((b) => ({ batch_id: b.batch_id, title: b.title, verdict: b.verdict, reasons: b.reasons })),
+          },
   };
 }
 

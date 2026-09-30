@@ -259,11 +259,14 @@ export async function removeProject(id: string): Promise<ReleaseResult> {
 // 类型走纯模块 shared-graph.ts，前端不引服务端壳 render.ts（避免 tree-sitter 进前端包）。
 import type { SharedGraph } from "../arch/shared-graph";
 
-/** A3：GET /api/projects/:id/arch/render —— 渲染数据；exists:false = 未解析（200 空态） */
+/** A3：GET /api/projects/:id/arch/render —— 渲染数据；exists:false = 未解析（200 空态）。
+ *  V09-22：`opts.full=true` 时拼 `?full=1` 取全量上限（同一 builder 的另一组参数，超限仍聚合计数）。 */
 export async function getArchRender(
   id: string,
+  opts?: { full?: boolean },
 ): Promise<{ exists: boolean; graph?: SharedGraph }> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/arch/render`);
+  const query = opts?.full === true ? "?full=1" : "";
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/arch/render${query}`);
   const body = (await res.json()) as
     | { ok: true; render: { exists: boolean; graph?: SharedGraph } }
     | WsFail;
@@ -352,20 +355,64 @@ export async function postArchName(id: string): Promise<{ named: number; cache_h
 // ── A4：逐级下钻 + 懒加载 + 布局记忆（DESIGN.md §3.3 / §4.1 下钻层 / §4.4）──
 
 import type { ExpandResult } from "../arch/expand";
+import type { ArchItemsResult } from "../arch/items";
 import type { GraphMode } from "../arch/graph-mode";
 import type { ArchLayoutFile, NodePosition } from "../arch/layoutStore";
 import { PROJECT_ARCH_LAYOUT_KEY } from "../arch/graph-mode";
 
-/** A4：POST /api/projects/:id/arch/expand —— 就地展开模块直接子级（纯静态，llm_calls 恒 0） */
-export async function postArchExpand(id: string, modulePath: string): Promise<ExpandResult> {
+/** A4：POST /api/projects/:id/arch/expand —— 就地展开模块直接子级（纯静态，llm_calls 恒 0）。
+ *  V09-22：`opts.full=true` 时 body 带 `full:true`（单枝子级上限放到全量值，子树遍历仍走预算）；
+ *  `opts.childrenOffset` 给了（含 0）时拼进 body → 服务端切**稳定分页**模式（返回体带
+ *  children_total/offset/returned/has_more，子级全是真实子级、逐页可取回上限外的子级）；缺省不传＝旧行为。 */
+export async function postArchExpand(
+  id: string,
+  modulePath: string,
+  opts?: { full?: boolean; childrenOffset?: number },
+): Promise<ExpandResult> {
   const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/arch/expand`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ module_path: modulePath }),
+    body: JSON.stringify({
+      module_path: modulePath,
+      ...(opts?.full === true ? { full: true } : {}),
+      ...(opts?.childrenOffset !== undefined ? { childrenOffset: opts.childrenOffset } : {}),
+    }),
   });
   const body = (await res.json()) as { ok: true; result: ExpandResult } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.result;
+}
+
+/**
+ * V09-22（契约 1）：GET /api/projects/:id/arch/items 的响应体——未聚合并集上「先过滤后开窗」的一页。
+ * `kind` 是路由回显；其余字段与 `src/arch/items.ts` 的 `ArchItemsResult` 同构（**type-only** 复用，
+ * 值 import 会把服务端 `node:fs` 依赖链拖进前端包——同本文件其它 type-only 引用的口径）。
+ */
+export interface ArchItemsPage extends ArchItemsResult {
+  kind: "nodes" | "edges";
+}
+
+/**
+ * V09-22（契约 1）：逐项取回被聚合/扇出过滤丢弃的对象（未聚合并集，先过滤后开窗、逐页可取完）。
+ * `kind` 必填（nodes/edges）；`q` 大小写不敏感子串（节点 id/name/path、边 from/to）；
+ * `offset` 缺省 0、负数/非整数服务端按 400 报错；`limit` 缺省 200、服务端 clamp 到 [1,2000]。
+ * 错误口径沿用本文件既有 fetch 封装（`[code] message` 抛错）。
+ */
+export async function getArchItems(
+  id: string,
+  opts: { kind: "nodes" | "edges"; q?: string; offset?: number; limit?: number },
+): Promise<ArchItemsPage> {
+  const params = new URLSearchParams();
+  params.set("kind", opts.kind);
+  if (opts.q !== undefined && opts.q !== "") params.set("q", opts.q);
+  if (opts.offset !== undefined) params.set("offset", String(opts.offset));
+  if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+  const res = await apiFetch(
+    `/api/projects/${encodeURIComponent(id)}/arch/items?${params.toString()}`,
+  );
+  const body = (await res.json()) as ({ ok: true } & ArchItemsPage) | WsFail;
+  if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
+  return { kind: body.kind, total: body.total, offset: body.offset, returned: body.returned, has_more: body.has_more, nodes: body.nodes, edges: body.edges };
 }
 
 /** A4/F4：GET /api/projects/:id/arch/layout —— 读布局记忆（缺文件返回空 positions；
@@ -1477,4 +1524,141 @@ export async function postRestoreBackup(
   const body = (await res.json()) as { ok: true; restore: BackupRestoreResult } | WsFail;
   if (!body.ok) throwBackupFail(body);
   return body.restore;
+}
+
+// ── V09-24：同步证据状态只读读口（DESIGN.md §2.10 / docs/sync-evidence-contract.md）──
+// 只读 GET，不触发扫描写账、不调模型；返回体与判据的单一出处是 src/shared/syncEvidence.ts
+// （纯类型与常量、无 node 依赖，故 UI 可以直接引，与 getLive/getGitStatus 的 type-only 口径一致）。
+import type { SyncStatusReport } from "../shared/syncEvidence";
+import { SYNC_ITEM_VERDICTS, SYNC_VERDICTS } from "../shared/syncEvidence";
+
+export type { SyncStatusReport };
+
+/**
+ * V09-24：GET /api/projects/:id/sync-status —— 本次**实际核对**的同步状态（结论/逐项/核对时间）。
+ * 只读读口每次重读必要文件与实际目标；历史 passed 不等于当前 passed。
+ *
+ * 返回体形状由 shared 契约定死，但**信封**按本仓库既有惯例是 `{ok:true, sync:{…}}`；
+ * 为免与并行施工的 V09-23 后端在信封键名上错位，这里按序认 `sync` → `sync_status` → 顶层即报告体。
+ * 认不出就**如实报错**：返回体逐层按下文边界校验（project_id 必须等于请求项目、各层对象/数组/布尔/
+ * 字符串与 verdict 值集），缺一项或坏一项都不放行——界面是主工作面，宁可显示「读取失败」，
+ * 也不拿半截/坏形状的返回体渲染出误导性的绿或直接崩屏。
+ */
+export async function getSyncStatus(
+  id: string,
+  opts?: { signal?: AbortSignal },
+): Promise<SyncStatusReport> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/sync-status`, {
+    ...(opts?.signal ? { signal: opts.signal } : {}),
+  });
+  const body = (await res.json()) as {
+    ok?: boolean;
+    sync?: unknown;
+    sync_status?: unknown;
+    error?: { code?: string; message?: string };
+    configured?: unknown;
+  };
+  if (body.ok === false) {
+    throw new Error(`[${body.error?.code ?? "UNKNOWN"}] ${body.error?.message ?? "同步状态读取失败"}`);
+  }
+  const raw =
+    body.sync ??
+    body.sync_status ??
+    (typeof body.configured === "boolean" ? body : null);
+  const shape = syncStatusShapeError(raw, id);
+  if (shape !== null) throw new Error(`[SYNC_STATUS_SHAPE] ${shape}`);
+  return raw as SyncStatusReport;
+}
+
+// ── 返回体边界校验（2026-09-30 Codex 复查扩充）──
+// 只用 shared 契约里的字段与值集，不为未知形状猜新语义；任何一层不达标都点名缺什么/哪一项非法。
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+function inValueSet(v: unknown, set: readonly string[]): boolean {
+  return typeof v === "string" && set.includes(v);
+}
+
+/** 数组且每一项都是字符串 */
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every((x) => typeof x === "string");
+}
+
+/** 逐项（`SyncItemReport`）必要字段边界校验；返回 null 表示合格 */
+function itemShapeError(it: unknown, at: string): string | null {
+  if (!isRecord(it)) return `${at} 不是对象`;
+  if (typeof it.id !== "string") return `${at}.id 不是字符串`;
+  if (typeof it.label !== "string") return `${at}.label 不是字符串`;
+  if (typeof it.required !== "boolean") return `${at}.required 不是布尔`;
+  if (!inValueSet(it.verdict, SYNC_ITEM_VERDICTS)) {
+    return `${at}.verdict 不是逐项值集内的取值：${JSON.stringify(it.verdict)}`;
+  }
+  if (!isStringArray(it.reasons)) return `${at}.reasons 不是字符串数组`;
+  if (!Array.isArray(it.artifacts)) return `${at}.artifacts 不是数组`;
+  for (let ai = 0; ai < it.artifacts.length; ai++) {
+    const a = it.artifacts[ai] as unknown;
+    if (!isRecord(a)) return `${at}.artifacts[${ai}] 不是对象`;
+    if (typeof a.path !== "string") return `${at}.artifacts[${ai}].path 不是字符串`;
+    if (typeof a.sha256 !== "string") return `${at}.artifacts[${ai}].sha256 不是字符串`;
+  }
+  return null;
+}
+
+/** 批次（`SyncBatchReport`）必要字段边界校验；返回 null 表示合格 */
+function batchShapeError(b: unknown, i: number): string | null {
+  const at = `batches[${i}]`;
+  if (!isRecord(b)) return `${at} 不是对象`;
+  if (typeof b.batch_id !== "string") return `${at}.batch_id 不是字符串`;
+  if (typeof b.title !== "string") return `${at}.title 不是字符串`;
+  if (typeof b.active !== "boolean") return `${at}.active 不是布尔`;
+  if (typeof b.blocks_entry !== "boolean") return `${at}.blocks_entry 不是布尔`;
+  if (!inValueSet(b.verdict, SYNC_VERDICTS)) {
+    return `${at}.verdict 不是契约值集内的取值：${JSON.stringify(b.verdict)}`;
+  }
+  if (typeof b.contract_sha256 !== "string") return `${at}.contract_sha256 不是字符串`;
+  if (b.evidence_path !== null && typeof b.evidence_path !== "string") {
+    return `${at}.evidence_path 既不是 null 也不是字符串`;
+  }
+  if (!Array.isArray(b.items)) return `${at}.items 不是数组`;
+  for (let ii = 0; ii < b.items.length; ii++) {
+    const err = itemShapeError(b.items[ii], `${at}.items[${ii}]`);
+    if (err !== null) return err;
+  }
+  return null;
+}
+
+/** 返回体是否符合 `SyncStatusReport` 契约；不符合就给出缺什么/哪一项非法（返回 null 表示合格） */
+function syncStatusShapeError(raw: unknown, expectedProjectId: string): string | null {
+  if (!isRecord(raw)) return "同步状态返回体不是对象";
+  if (typeof raw.project_id !== "string") return "缺少 project_id（字符串）";
+  if (raw.project_id !== expectedProjectId) {
+    return `返回体的 project_id（${JSON.stringify(raw.project_id)}）与请求项目（${JSON.stringify(expectedProjectId)}）不一致`;
+  }
+  if (typeof raw.configured !== "boolean") return "缺少 configured（布尔）";
+  if (!inValueSet(raw.overall, SYNC_VERDICTS)) {
+    return `overall 不是契约值集内的取值：${JSON.stringify(raw.overall)}`;
+  }
+  if (typeof raw.checked_at !== "string") return "缺少 checked_at（本次实际核对时间）";
+  if (raw.scan_error !== null && typeof raw.scan_error !== "string") return "scan_error 既不是 null 也不是字符串";
+  if (!Array.isArray(raw.batches)) return "缺少 batches 数组";
+  for (let bi = 0; bi < raw.batches.length; bi++) {
+    const err = batchShapeError(raw.batches[bi], bi);
+    if (err !== null) return err;
+  }
+  if (!Array.isArray(raw.unregistered_evidence)) return "缺少 unregistered_evidence 数组";
+  for (let ui = 0; ui < raw.unregistered_evidence.length; ui++) {
+    const u = raw.unregistered_evidence[ui] as unknown;
+    if (!isRecord(u)) return `unregistered_evidence[${ui}] 不是对象`;
+    if (typeof u.path !== "string") return `unregistered_evidence[${ui}].path 不是字符串`;
+    if (u.batch_id !== null && typeof u.batch_id !== "string") {
+      return `unregistered_evidence[${ui}].batch_id 既不是 null 也不是字符串`;
+    }
+    if (typeof u.reason !== "string") return `unregistered_evidence[${ui}].reason 不是字符串`;
+  }
+  if (!isRecord(raw.collection)) return "缺少 collection{complete,reasons}";
+  if (typeof raw.collection.complete !== "boolean") return "collection.complete 不是布尔";
+  if (!isStringArray(raw.collection.reasons)) return "collection.reasons 不是字符串数组";
+  return null;
 }

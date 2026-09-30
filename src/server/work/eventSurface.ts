@@ -82,6 +82,9 @@ export const EVENT_SURFACE: Readonly<Record<string, string>> = {
   "change.blueprint_inheritance_recorded": "internal:blueprintInheritance(图纸继承事实，经命令面落账)",
   // ── 预算闸 ──
   "budget.blocked": "internal:WorkService(认领配额闸自发拒绝事件，§5.7)",
+  // ── 同步证据域（V09-23；DESIGN §2.10）──
+  "sync.contract_registered": "mcp:register_sync_contract",
+  "sync.evidence_checked": "mcp:scan_sync_evidence",
 };
 
 export interface SurfaceCheckResult {

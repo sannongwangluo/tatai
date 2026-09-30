@@ -78,6 +78,10 @@ interface MmNode {
 /** A4 下钻子级节点（目录/文件/聚合）的中性色：文件层没有模块状态（§4.1 LLM 不碰文件层） */
 const SUBLEVEL_COLOR = "#94a3b8";
 
+/** V09-22（契约 2）：巨枝「加载全部子级」按 `childrenOffset` 稳定分页续取的**安全上限**——
+ *  到顶仍未取完就如实停止并 `console.warn` 留痕（不静默丢页、不冒充全量）。与 ArchCanvas 同值同口径。 */
+const MAX_EXPAND_PAGES = 50;
+
 /** 定位入口要去的目标视图（从导图出发只有这两个 React Flow 视图可选） */
 type LocateTo = "MODULE_BOX" | "DATA_FLOW";
 
@@ -95,6 +99,9 @@ interface ExpandLog {
   dropped: number;
   /** 本次生效的子级上限（服务端口径） */
   limit: number;
+  /** V09-22：本次子树遍历/解析是否因预算到点收工（`ExpandResult.stats.budget_exhausted`）——
+   *  巨枝降级行据此追加「清单可能不含全部」标注，不宣称假全量。 */
+  budget_exhausted: boolean;
 }
 
 /** 节点该折叠吗（§3.3 规则 5：默认全部折叠，只显示顶层；根节点恒展开）。
@@ -160,6 +167,7 @@ function logOf(id: string, path: string, result: ExpandResult, ms: number): Expa
     children: result.children.filter((c) => c.kind !== "aggregate").length,
     dropped: result.truncated.children,
     limit: result.limit.children,
+    budget_exhausted: result.stats.budget_exhausted,
   };
 }
 
@@ -300,6 +308,9 @@ export function MindMapView({
   onLocate: (id: string, label: string, to: LocateTo) => void;
 }) {
   const [graph, setGraph] = useState<SharedGraph | null>(null);
+  /** V09-22「显示全部」：顶层模块按全量上限拉取（`getArchRender full:true`，同一 builder 换上限）；
+   *  概览默认逐字不变。换模式 = 重取共用层 + 按落盘展开态补拉枝（逻辑复用现有）。 */
+  const [showAll, setShowAll] = useState(false);
   const [exists, setExists] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   /** Q49：重试计数——错误态点「重试」时 +1，把项目 effect 重跑一遍（重取数据层，不动折叠记忆） */
@@ -341,6 +352,15 @@ export function MindMapView({
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   const mmRef = useRef<Markmap | null>(null);
+  /** V09-22：markmap 实例创建时绑定的 SVG 节点。数据 effect 的 `setExists(null)` 会让组件走
+   *  「加载中…」早退、卸载旧 SVG，数据回来后 React 挂上**新的** SVG；实例 effect 若按
+   *  `mmRef.current ?? create` 复用旧实例，图就全画进已脱附的旧节点（屏幕上的新 SVG 永远为空）。
+   *  以本字段为唯一判据：一旦与当前 `svgRef.current` 不同 ⇒ 旧实例作废，销毁重建。 */
+  const mmSvgNodeRef = useRef<SVGSVGElement | null>(null);
+  /** V09-22：当前项目 id 的实时 ref——`postArchExpand` 的应答跨 await 回来时项目可能已换，
+   *  守卫比较要用这里的当前值（不能拿闭包里发起时的 project.id 比）。 */
+  const mmProjectIdRef = useRef(project.id);
+  mmProjectIdRef.current = project.id;
   /** markmap 节点 path（markmap 自己的 state.path）→ 我们的树节点：点击回查用 */
   const pathMapRef = useRef(new Map<string, MindTreeNode>());
   /** 容器尺寸观测（每次观测都更新，含隐藏时的 0×0）：`sized` = 现在能画。markmap 的 fit() 在
@@ -544,7 +564,14 @@ export function MindMapView({
   }, [sized, enqueueRender, renderAndPaint]);
 
   // 换项目 = 初次进入：清空后读数（共用数据层 + 落盘的展开态），把上次展开过的枝补回来
+  /** V09-22：上次见过的项目 id——`setShowAll(false)` 的换项目重置只许在**项目真变了**时发生。
+   *  本 effect 依赖里有 showAll（切「显示全部/返回概览」要重取共用层），重置若不带守卫会把
+   *  刚点的 true 立刻打回概览（verify-v09-22-ui ⑥ 实测打回）；ArchCanvas 同类开关同款 ref 守卫。 */
+  const lastProjectIdRef = useRef<string | null>(null);
   useEffect(() => {
+    const projectChanged = lastProjectIdRef.current !== project.id;
+    lastProjectIdRef.current = project.id;
+    if (projectChanged) setShowAll(false); // 换项目回概览默认口径（显示全部不跨项目沿用）
     setExists(null);
     setGraph(null);
     setChildrenById({});
@@ -563,7 +590,7 @@ export function MindMapView({
     let cancelled = false;
     void (async () => {
       const [r, saved] = await Promise.all([
-        getArchRender(project.id),
+        getArchRender(project.id, { full: showAll }),
         // 折叠态读不出来（文件损坏/权限）不打断导图：按空态 = 默认全折叠（§3.3 规则 5）
         getArchMindMapFold(project.id).catch(() => [] as MindMapExpandEntry[]),
       ]);
@@ -593,22 +620,34 @@ export function MindMapView({
       expandedRef.current = restoredExpanded;
       setExpandedPaths(restoredExpanded);
       setLoadLog(log);
-    })().catch((e: Error) => setError(e.message));
+      // V09-22：cancelled 旗标已在，但错误也要走它——换项目/重试后上一轮请求的失败不该写到新场景上
+    })().catch((e: Error) => {
+      if (!cancelled) setError(e.message);
+    });
     return () => {
       cancelled = true;
     };
-    // Q49：reloadNonce 在依赖里 —— 错误态点「重试」重跑本 effect（重取渲染数据与折叠记忆）
-  }, [project.id, reloadNonce]);
+    // Q49：reloadNonce 在依赖里 —— 错误态点「重试」重跑本 effect（重取渲染数据与折叠记忆）；
+    // V09-22：showAll 在依赖里 —— 切「显示全部/返回概览」重取共用层（同一 builder 换上限）
+  }, [project.id, reloadNonce, showAll]);
 
   // markmap 实例只建一次；markdown 变了就 setData（折叠/懒加载/切视图都走这条路）。
   // 容器没尺寸（`!sized`）时不画：挂载首帧与隐藏态都不该在 0 尺寸上 setData/fit（见 sized 的注释）；
   // 等尺寸到位/重新可见时本 effect 会再跑一次（sized 在依赖里），画最近这棵树。
   useEffect(() => {
     if (!sized || !svgRef.current || !tree || markdown === "") return;
+    const svgEl = svgRef.current;
+    // V09-22：实例只跟**当前这个 SVG 节点**走。数据 effect 的 `setExists(null)` 让 React 换过一次
+    // SVG 节点时，旧实例闭死在已脱附的旧节点上（fit() 还会算出 translate(NaN,NaN)）——节点一换
+    // 就销毁旧实例、按新节点重建，不复用（复用判据见 mmSvgNodeRef 注释）。
+    if (mmRef.current && mmSvgNodeRef.current !== svgEl) {
+      mmRef.current.destroy();
+      mmRef.current = null;
+    }
     const mm =
       mmRef.current ??
       Markmap.create(
-        svgRef.current,
+        svgEl,
         {
           autoFit: sized,
           duration: 200,
@@ -626,6 +665,7 @@ export function MindMapView({
         null,
       );
     mmRef.current = mm;
+    mmSvgNodeRef.current = svgEl;
 
     const { root } = transformer.transform(markdown);
     const bound = bindPayloads(root, tree.root, isExpandedNode, statusOverride ?? {});
@@ -648,7 +688,14 @@ export function MindMapView({
     });
   }, [markdown, tree, isExpandedNode, enqueueRender, sized]);
 
-  useEffect(() => () => mmRef.current?.destroy(), []);
+  // V09-22：卸载清理照旧销毁实例；把实例绑定的 SVG 节点也一并清掉（下次挂载按新节点重建）
+  useEffect(
+    () => () => {
+      mmRef.current?.destroy();
+      mmSvgNodeRef.current = null;
+    },
+    [],
+  );
 
   /**
    * 点节点（§3.3 规则 2/4，N2 口径）：
@@ -681,6 +728,7 @@ export function MindMapView({
       const t0 = performance.now();
       postArchExpand(project.id, node.path)
         .then((result) => {
+          if (mmProjectIdRef.current !== project.id) return; // 应答跨 await：项目已换则丢弃
           setChildrenById((prev) => ({ ...prev, [node.id]: result.children }));
           const next = { ...expandedRef.current, [node.id]: node.path };
           expandedRef.current = next;
@@ -702,6 +750,61 @@ export function MindMapView({
     setLoadLog([]);
     persist({});
   }, [persist]);
+
+  /**
+   * V09-22：按全量口径重新展开一条巨枝——**稳定分页取全**后覆盖该枝的 `childrenById[父 id]`
+   * （该枝已展开；markmap 随 markdown 重渲染）。首拉带 `childrenOffset:0` → 服务端进分页模式
+   * （子级全是真实子级、不再为「还有 N 个」聚合节点保留名额）；`children_has_more` 为真就按
+   * `offset + returned` 续取到完。合并后 `truncated.children` 取末页值：取完归零则降级行消失，
+   * 到安全上限仍未取完则照实显示余量（`capped` 取每枝**最新一次**实测）。
+   * 合并后**按一次加载落一条 log**（验证脚本只读该枝末条即合并总量）——若每页各落一条，
+   * 末条只剩最后一页，读不准"整枝现在有多少子级"。
+   */
+  const loadAllChildren = useCallback(
+    (entry: ExpandLog) => {
+      setBusy({ id: entry.id, path: entry.path });
+      setError(null);
+      const t0 = performance.now();
+      void (async () => {
+        try {
+          let last = await postArchExpand(project.id, entry.path, { full: true, childrenOffset: 0 });
+          if (mmProjectIdRef.current !== project.id) return; // 应答跨 await：项目已换则丢弃
+          let merged = [...last.children];
+          let pages = 1;
+          while (last.children_has_more === true) {
+            if (pages >= MAX_EXPAND_PAGES) {
+              console.warn(
+                `[arch/expand] 思维导图巨枝分页达到安全上限 ${MAX_EXPAND_PAGES} 页仍未取完` +
+                  `（path=${entry.path}，已取 ${merged.length}/${last.children_total ?? "?"}）——如实停止，不冒充全量`,
+              );
+              break;
+            }
+            const returned = last.children_returned ?? last.children.length;
+            if (returned <= 0) break; // 空页：offset 不前进，避免死循环（页数由安全上限兜底）
+            const next = await postArchExpand(project.id, entry.path, {
+              full: true,
+              childrenOffset: (last.children_offset ?? 0) + returned,
+            });
+            if (mmProjectIdRef.current !== project.id) return; // 应答跨 await：项目已换则丢弃
+            merged = merged.concat(next.children);
+            last = next;
+            pages++;
+          }
+          const mergedResult: ExpandResult = { ...last, children: merged };
+          setChildrenById((prev) => ({ ...prev, [entry.id]: mergedResult.children }));
+          setLoadLog((prev) => [
+            ...prev,
+            logOf(entry.id, entry.path, mergedResult, Math.round(performance.now() - t0)),
+          ]);
+        } catch (err) {
+          setError((err as Error).message);
+        } finally {
+          setBusy(null);
+        }
+      })();
+    },
+    [project.id],
+  );
 
   const copyMarkdown = useCallback(() => {
     void navigator.clipboard?.writeText(markdown).then(() => {
@@ -847,11 +950,17 @@ export function MindMapView({
   const lastMs = loadLog.length > 0 ? loadLog[loadLog.length - 1].ms : 0;
   const droppedTotal = loadLog.reduce((s, l) => s + l.dropped, 0);
   const expandedCount = Object.keys(expandedPaths).length;
-  const capped = loadLog.filter((l) => l.dropped > 0);
+  // V09-22：每枝取**最新一次**实测——「加载全部子级」重拉后该枝 dropped 归零，降级行随之消失；
+  // 仍超上限则照实显示余量（droppedTotal 仍是历史累计口径，见上）。
+  const latestLogById = new Map<string, ExpandLog>();
+  for (const l of loadLog) latestLogById.set(l.id, l);
+  const capped = [...latestLogById.values()].filter((l) => l.dropped > 0);
   return (
     <div
       className="flex min-h-0 flex-1 flex-col"
       data-mindmap-view
+      // V09-22：概览/全量（显示全部）模式状态常驻可读
+      data-mindmap-mode-state={showAll ? "full" : "overview"}
       data-mindmap-source="selectGraph:MIND_MAP"
       data-mindmap-nodes={tree.nodeCount}
       data-mindmap-depth={tree.depth}
@@ -888,6 +997,27 @@ export function MindMapView({
           >
             {copied ? "已复制" : "复制 markdown"}
           </button>
+          {/* V09-22：显示全部 / 返回概览——顶层模块按全量上限重取（同一 builder 换上限）；
+              概览超量（有被聚合的顶层模块）时才给「显示全部」入口，不做项目特例。 */}
+          {!showAll && (graph?.truncated.nodes ?? 0) > 0 && (
+            <button
+              onClick={() => setShowAll(true)}
+              data-mindmap-show-all
+              title="放开渲染上限：顶层模块全部列出（大图布局会变慢）；采集侧 budget_exhausted 时仍如实标注"
+              className="rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:bg-neutral-800"
+            >
+              显示全部
+            </button>
+          )}
+          {showAll && (
+            <button
+              onClick={() => setShowAll(false)}
+              data-mindmap-show-overview
+              className="rounded border border-neutral-700 px-1.5 py-0.5 text-neutral-300 hover:bg-neutral-800"
+            >
+              返回概览
+            </button>
+          )}
         </p>
         <p
           className="text-neutral-600"
@@ -912,6 +1042,12 @@ export function MindMapView({
               ? "；模块集产自未带完整性标记的旧版解析（有没有扫完未知）"
               : ""}
         </p>
+        {/* V09-22：全量态一行说明——顶层节点按全量上限列出（同一份共用层节点身份不变） */}
+        {showAll && (
+          <p className="text-neutral-500" data-mindmap-full-note>
+            全量模式：顶层 {tree.root.children.length} 个节点全部列出（上限 {limits?.MAX_NODES ?? "?"}）
+          </p>
+        )}
         {/* V09-08 ③：技术详情三图里这一支也要分类分计（与方框图/数据流向图共用的那份面板同口径、同渲染） */}
         <ReconcileCats entries={onlyInCode ?? []} anchor="data-mindmap-reconcile-cats" />
         {/* V09-13：来源与证据——本视图的节点是**代码模块**（代码来源）；未映射/未验证/证据失效
@@ -987,6 +1123,22 @@ export function MindMapView({
             巨枝降级：`{l.path}` 的子级超过单枝上限 {l.limit}，超出的 {l.dropped} 个
             <span className="text-amber-200">不遍历、不解析、不渲染</span>
             （§4.3 第 1 招），图上只留前 {l.limit - 1} 个 + 一个「还有 {l.dropped} 个」聚合节点。
+            {/* V09-22：按全量口径重拉这一枝（覆盖该枝子级缓存）；重拉后 dropped 归零则该行消失 */}
+            <button
+              data-mindmap-load-all
+              data-mindmap-load-all-path={l.path}
+              onClick={() => loadAllChildren(l)}
+              disabled={busy !== null}
+              title="按全量口径重新展开这一枝：列出全部直接子级（postArchExpand full:true，覆盖该枝子级缓存）"
+              className="ml-2 rounded border border-amber-600/60 px-1.5 py-0.5 text-amber-200 hover:bg-amber-500/20 disabled:opacity-40"
+            >
+              加载全部子级
+            </button>
+            {l.budget_exhausted && (
+              <span data-mindmap-budget-note className="ml-2 text-amber-300">
+                ⚠ 子树统计受预算限制（budget_exhausted）：清单可能不含全部
+              </span>
+            )}
           </p>
         ))}
       </div>

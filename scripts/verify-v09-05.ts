@@ -15,8 +15,12 @@
 //      且 AGENTS.md 的 § 引用全部能在 DESIGN.md 的章节号里解析（改文档不破引用契约）。
 //   ③ 工具面口径：文档计数 == 注册表 `TOOLS.length`（**不写死数字**）；`verify:u2` / `verify:m2` 的点名清单
 //      与注册表**互等**（少点名或多点名都红）；模板不再含旧 v1「任务状态自动汇总成模块四色状态」的说法。
-//   ④ README：`.工作台/` 目录说明与 `templates/README.md` 的树**同源**（一级条目集合相等）；验证脚本表补
-//      v0.7 / v0.8 / v0.9 批次；安全口径如实——通配绑定默认拒绝（用 `resolveRemoteConfig` 真跑反证）。
+//   ④ 用户面文档（2026-09-30 首页精简后，`.工作台/` 目录说明与验证脚本表从 README 移入 docs/，判据不放宽）：
+//      ① `docs/getting-started.md` 的 `.工作台/` 目录说明与 `templates/README.md` 的树**同源**（一级条目集合相等）、
+//         逐条标「预置/程序自建·不预置」、与真实结构一致（对照塔台自己的 `.工作台/`）；
+//      ② 验证脚本表（v0.7 / v0.8 / v0.9 批次）落在 `docs/development.md`，且 README **链到**该文档（不孤立）；
+//      ③ 安全口径如实——通配绑定默认拒绝（用 `resolveRemoteConfig` 真跑反证），口径落在 `docs/capabilities.md`
+//         且 README 链到它。
 //   ⑤ 模板与体例：模板树每个一级条目要么在模板里存在、要么写明 `[不预置]`（与 `verify:l3` 同判据）；
 //      `PLAN.md` 写明「卡行状态是唯一状态源」。
 //   ⑥ 点名断言定向更新：`verify:v06-02` 里塔台 PLAN 行数的**期望值 == 当前实际解析行数**，
@@ -362,13 +366,16 @@ ok(
 );
 
 const m2Src = read(path.join(REPO, "scripts", "verify-m2.ts"));
-const m2Groups = ["EXPECTED", "M5_TOOLS", "V0610_TOOLS", "C015_TOOLS", "V0702_TOOLS", "V0704_TOOLS", "V0919_TOOLS"];
+// 2026-09-30（V09-23 同步域收口）：`verify-m2.ts` 新增分组常量 `V0923_TOOLS`（同步证据域三接口，
+// 注册表 19 → 22）。本清单是"分组名的唯一来源"，按同一口径补一个分组名——判据未放宽（仍是
+// 各组非空 + 合计恰好 == 注册表 + 逐个成员在注册表内；不动态从注册表生成期望）。
+const m2Groups = ["EXPECTED", "M5_TOOLS", "V0610_TOOLS", "C015_TOOLS", "V0702_TOOLS", "V0704_TOOLS", "V0919_TOOLS", "V0923_TOOLS"];
 const m2Names = m2Groups.flatMap((g) => extractArray(m2Src, g));
 ok(
   m2Groups.every((g) => extractArray(m2Src, g).length > 0) &&
     m2Names.length === toolNames.length &&
     m2Names.every((n) => toolSet.has(n)),
-  `③ verify:m2 的分组点名清单（${m2Names.length} 个：一期 8 + 扩充 2 + V06-10 三件套 + C-015 三件套 + rebind_task + doctor + V09-19 六图读口）与注册表互等——多 ${m2Names
+  `③ verify:m2 的分组点名清单（${m2Names.length} 个：一期 8 + 扩充 2 + V06-10 三件套 + C-015 三件套 + rebind_task + doctor + V09-19 六图读口 + V09-23 同步域三接口）与注册表互等——多 ${m2Names
     .filter((n) => !toolSet.has(n))
     .join("/") || "无"}／缺 ${toolNames.filter((n) => !m2Names.includes(n)).join("/") || "无"}`,
 );
@@ -386,8 +393,13 @@ ok(
   `③ docs/agent-integration.md 不含 MCP 工具计数（有计数就必须同源对账；实测 ${integrationCounts.length} 处）`,
 );
 
-// ───────────────────────── ④ README ─────────────────────────
-section("④ README：目录说明同源 / 脚本表补批次 / 安全口径如实");
+// ───────────────────────── ④ 用户面文档 ─────────────────────────
+section("④ 用户面文档：目录说明同源 / 脚本表补批次 / 安全口径如实");
+// 2026-09-30 首页精简：README 只留首页动线，`.工作台/` 长目录树与验证脚本表移入 docs/ 并加链接。
+// 判据不放宽——事实源换成承载它的文档；同时要求 README 仍链到这些文档，避免"搬走了却没人找得到"。
+const GETTING_STARTED_DOC = read(path.join(REPO, "docs", "getting-started.md"));
+const DEVELOPMENT_DOC = read(path.join(REPO, "docs", "development.md"));
+const CAPABILITIES_DOC = read(path.join(REPO, "docs", "capabilities.md"));
 
 /** 取一份文档树里某个缩进层级的一级条目（含该行原文，用于逐条核对行尾标注） */
 function treeEntries(text: string, depth: number): { name: string; line: string }[] {
@@ -406,44 +418,44 @@ function treeEntries(text: string, depth: number): { name: string; line: string 
   }
   return out;
 }
-const readmeTree = treeEntries(README, 0); // README 的树根就是 `.工作台/`
+const workbenchTree = treeEntries(GETTING_STARTED_DOC, 0); // 树根就是 `.工作台/`（2026-09-30 起落在 docs/getting-started.md）
 const tplReadme = read(TEMPLATE_README);
 const tplTree = treeEntries(tplReadme, 1); // templates/README 的树根是 `<项目根>/`
-const readmeSet = new Set(readmeTree.map((e) => e.name));
-const readmeUnmarked = readmeTree.filter((e) => !e.line.includes("[预置]") && !e.line.includes("[程序自建"));
-ok(readmeTree.length >= 12, `④ README 的 .工作台 目录树可解析（${readmeTree.length} 条一级条目）`);
+const workbenchSet = new Set(workbenchTree.map((e) => e.name));
+const workbenchUnmarked = workbenchTree.filter((e) => !e.line.includes("[预置]") && !e.line.includes("[程序自建"));
+ok(workbenchTree.length >= 12, `④ docs/getting-started.md 的 .工作台 目录树可解析（${workbenchTree.length} 条一级条目）`);
 ok(
-  readmeTree.length === tplTree.length && tplTree.every((e) => readmeSet.has(e.name)),
-  `④ README 的 .工作台 目录说明与 templates/README.md 的树**同源**（README ${readmeTree.length} 条／模板 ${
+  workbenchTree.length === tplTree.length && tplTree.every((e) => workbenchSet.has(e.name)),
+  `④ 上手文档的 .工作台 目录说明与 templates/README.md 的树**同源**（上手文档 ${workbenchTree.length} 条／模板 ${
     tplTree.length
-  } 条，模板里有而 README 没有的：${tplTree.filter((e) => !readmeSet.has(e.name)).map((e) => e.name).join("、") || "无"}）`,
+  } 条，模板里有而上手文档没有的：${tplTree.filter((e) => !workbenchSet.has(e.name)).map((e) => e.name).join("、") || "无"}）`,
 );
 ok(
-  readmeUnmarked.length === 0 &&
-    readmeTree.some((e) => e.line.includes("[预置]")) &&
-    readmeTree.some((e) => e.line.includes("[程序自建")),
-  `④ README 的目录树**逐条**标了「预置 / 程序自建·不预置」两档口径（未标：${readmeUnmarked.map((e) => e.name).join("、") || "无"}）`,
+  workbenchUnmarked.length === 0 &&
+    workbenchTree.some((e) => e.line.includes("[预置]")) &&
+    workbenchTree.some((e) => e.line.includes("[程序自建")),
+  `④ 上手文档的目录树**逐条**标了「预置 / 程序自建·不预置」两档口径（未标：${workbenchUnmarked.map((e) => e.name).join("、") || "无"}）`,
 );
 {
-  const presetMissing = readmeTree.filter(
+  const presetMissing = workbenchTree.filter(
     (e) => e.line.includes("[预置]") && !fs.existsSync(path.join(TEMPLATE_DIR, e.name)),
   );
   ok(
     presetMissing.length === 0,
-    `④ README 标「预置」的条目真的在 templates/.工作台.example/ 里存在（不在：${
+    `④ 上手文档标「预置」的条目真的在 templates/.工作台.example/ 里存在（不在：${
       presetMissing.map((e) => e.name).join("、") || "无"
     }）`,
   );
   // 「与真实结构一致」：拿塔台自己的 `.工作台/` 实测（它就是本仓库里可直接核对的一份真实结构）。
   // 允许例外**逐条点名并给理由**（不是"允许缺失"的兜底）：自举项目不复制 design.md/design.discuss.md
-  // （README 紧接着那段已写明），施工图是仓库根 PLAN.md 所以没有 `.工作台/plan.md`。
+  // （上手文档紧接着那段已写明），施工图是仓库根 PLAN.md 所以没有 `.工作台/plan.md`。
   const SELF_MANAGED_EXCEPTIONS: Record<string, string> = {
     "design.md": "塔台自举：设计书事实源是仓库根 DESIGN.md，`.工作台/` 里不复制一份",
     "design.discuss.md": "塔台自举：待议区在根 DESIGN.md 附录 B，`.工作台/` 里不复制一份",
     "plan.md": "塔台自举：施工图是仓库根 PLAN.md（不是 `.工作台/plan.md`）",
   };
   const selfWorkbench = path.join(REPO, ".工作台");
-  const realMissing = readmeTree.filter(
+  const realMissing = workbenchTree.filter(
     (e) => SELF_MANAGED_EXCEPTIONS[e.name] === undefined && !fs.existsSync(path.join(selfWorkbench, e.name)),
   );
   ok(
@@ -453,16 +465,26 @@ ok(
     }；例外 ${Object.keys(SELF_MANAGED_EXCEPTIONS).length} 条已在脚本内逐条给理由）`,
   );
 }
+// 搬走了也要找得到：README 必须链到承载这些事实的文档（否则"首页精简"就变成"信息消失"）。
+for (const [label, rel] of [
+  ["上手文档", "docs/getting-started.md"],
+  ["开发文档", "docs/development.md"],
+  ["能力文档", "docs/capabilities.md"],
+] as const) {
+  ok(README.includes(rel), `④ README 链到${label} ${rel}（事实源搬走后仍可达）`);
+}
 for (const marker of ["verify:v07-01", "verify:v08-01", "verify:v09-05"]) {
-  ok(README.includes(marker), `④ 验证脚本表补 ${marker}`);
+  ok(DEVELOPMENT_DOC.includes(marker), `④ 验证脚本表（docs/development.md）补 ${marker}`);
 }
 ok(
-  README.includes("其余 V09 卡尚未交付"),
-  "④ README 的 v0.9 行如实写明同批其余卡尚未交付（不把未实现写成现有能力）",
+  DEVELOPMENT_DOC.includes("交付结果 ≠ 已验收") && DEVELOPMENT_DOC.includes("提交 ≠ 验收"),
+  "④ v0.9 行口径如实：执行结果已交付，但「交付结果 ≠ 已验收／提交 ≠ 验收」——不把未审计、未验收写成已验收（2026-09-30 修正 README 里过期的「其余 V09 卡尚未交付」）",
 );
 ok(
-  README.includes(REMOTE_WILDCARD_ENV) && README.includes("默认拒绝") && README.includes("公网路径没有开关"),
-  `④ 安全口径如实：README 写明 ${REMOTE_WILDCARD_ENV} 存在、**默认拒绝**、公网路径没有开关`,
+  CAPABILITIES_DOC.includes(REMOTE_WILDCARD_ENV) &&
+    CAPABILITIES_DOC.includes("默认拒绝") &&
+    CAPABILITIES_DOC.includes("公网路径没有开关"),
+  `④ 安全口径如实：docs/capabilities.md 写明 ${REMOTE_WILDCARD_ENV} 存在、**默认拒绝**、公网路径没有开关`,
 );
 
 /** 安全边界不是只写在文档里：真跑配置解析，反证"默认拒绝" */
@@ -600,7 +622,12 @@ ok(
 //   故与"不带映射的复算"不同键 ⇒ 出现在 needs_rebind 属**已登记的已知口径**，由有授权者按 §5.6 处置，
 //   不属未解释漂移；V09-20 随本批重导（R2：需求映射表补 req-2026-09-26-r4 行使定义哈希变化，seq 2765，
 //   属任务书登记的预期处置）。
-const JUSTIFIED_REBIND = ["V08-06", "V09-05", "V08-01", "V08-02", "V09-18", "V09-19", "V09-20", "V09-21"];
+// 定向更新（V09-22，2026-09-28）：判据未放宽——仍是「逐条点名可解释 + 成员资格 + V08-05 不在其中」：
+//   新增可解释来源（第 11 稿，批次 change-20260928-d7982446）：V09-22＝本批次新卡（六图聚合节点全量可查看），
+//   已经 `import_plan_definitions` 受检导入（账本 seq 3025/3026；`requirement_ids=[req-2026-09-28-r1]` 收进
+//   任务定义哈希，故与"不带映射的复算"不同键 ⇒ 出现在 needs_rebind 属**已登记的已知口径**，由有授权者按 §5.6
+//   处置，不属未解释漂移；上一批 V09-18…V09-21 已按 §5.6 处置完，本批实测集合收缩到只剩 [V09-22]）。
+const JUSTIFIED_REBIND = ["V08-06", "V09-05", "V08-01", "V08-02", "V09-18", "V09-19", "V09-20", "V09-21", "V09-22"];
 ok(
   !rebindIds.includes("V08-05"),
   `⑧ V08-05 不在 needs_rebind 里（实测 needs_rebind=[${rebindIds.join("、") || "空"}]）`,
@@ -609,8 +636,8 @@ ok(
   rebindIds.every((id) => JUSTIFIED_REBIND.includes(id)),
   `⑧ 待重绑每一条都能点名解释（只允许 ${JSON.stringify(JUSTIFIED_REBIND)}：V08-06＝E.14.1 的依赖方证据恢复、` +
     `V09-05＝本卡新增检查项⑩；V08-01/02＝第 7 稿裁定 4 补登卡节（已按 §5.6 rebind continue 处置）；` +
-    `V09-18／V09-19／V09-20／V09-21＝各批次新卡（均已受检导入并带 requirement_ids 映射，属已登记已知口径；` +
-    `V09-20 另含第 10 稿 R2 的需求映射表补行重导））——` +
+    `V09-18／V09-19／V09-20／V09-21／V09-22＝各批次新卡（均已受检导入并带 requirement_ids 映射，属已登记已知口径；` +
+    `V09-20 另含第 10 稿 R2 的需求映射表补行重导；V09-22 为第 11 稿新卡））——` +
     `实测 [${rebindIds.join("、") || "空"}]`,
 );
 info(

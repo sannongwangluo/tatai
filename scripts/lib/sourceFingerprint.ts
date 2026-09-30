@@ -5,6 +5,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+// 安装包文件名带产品版本号（Tatai_<ver>_x64-*）；版本号唯一来源见 src/shared/version.ts
+import { APP_VERSION } from "../../src/shared/version";
 
 /** 不参与指纹的目录（产物/私有/版本控制噪音，以及**确定的可再生缓存**）。
  *  2026-09-26（V09-18／附录 E.17，GPT-6 裁定 10）新增 `__pycache__`：Python 字节码缓存是**可再生**
@@ -71,13 +73,16 @@ export function buildOutputManifest(root: string): { entries: ArtifactEntry[]; m
   pushDir(path.join(root, "dist"), "dist");
   pushDir(path.join(root, "src-tauri", "resources", "server"), "src-tauri/resources/server");
   pushFile(path.join(root, "src-tauri", "target", "release", "tatai.exe"), "src-tauri/target/release/tatai.exe");
+  // 两个安装器文件名由产品版本号拼出（此前写死版本号，bump 时漏改就会悄悄漏收产物）
+  const nsisName = `Tatai_${APP_VERSION}_x64-setup.exe`;
+  const msiName = `Tatai_${APP_VERSION}_x64_en-US.msi`;
   pushFile(
-    path.join(root, "src-tauri", "target", "release", "bundle", "nsis", "Tatai_0.1.1_x64-setup.exe"),
-    "src-tauri/target/release/bundle/nsis/Tatai_0.1.1_x64-setup.exe",
+    path.join(root, "src-tauri", "target", "release", "bundle", "nsis", nsisName),
+    `src-tauri/target/release/bundle/nsis/${nsisName}`,
   );
   pushFile(
-    path.join(root, "src-tauri", "target", "release", "bundle", "msi", "Tatai_0.1.1_x64_en-US.msi"),
-    "src-tauri/target/release/bundle/msi/Tatai_0.1.1_x64_en-US.msi",
+    path.join(root, "src-tauri", "target", "release", "bundle", "msi", msiName),
+    `src-tauri/target/release/bundle/msi/${msiName}`,
   );
   entries.sort((a, b) => a.path.localeCompare(b.path));
   const h = crypto.createHash("sha256");

@@ -38,7 +38,9 @@ const RELEASE_EXE = path.join(TAURI_DIR, "target", "release", "tatai.exe");
 //   + 2026-09-20 V06-10 扩充 project_entry/claim_task/submit_task_result（§6.7）
 //   + 批3 C-015 接线 manage_requirement/manage_change/import_plan_definitions（§2.5/§2.6）= 16 个
 //   + 2026-09-22 V07-02 的 rebind_task（§5.6）+ V07-04 的 doctor（附录 C.5-4）= 18 个
-//   + 2026-09-26 V09-19 的 get_project_graphs（六图完整状态读口，§6.4／附录 E.18 四）= **19 个**。
+//   + 2026-09-26 V09-19 的 get_project_graphs（六图完整状态读口，§6.4／附录 E.18 四）
+//   + 2026-09-30 V09-23 的 register_sync_contract / scan_sync_evidence / read_sync_status
+//     （同步证据域三接口，DESIGN §2.10 / docs/sync-evidence-contract.md）= **22 个**。
 // 如实记一句（2026-09-20 V06-10）：本常量自 2026-09-19 加 get_arch/ask_flash 起就已滞后
 // （当时应为 10），只是没人跑到这条断言；V06-10 一并订正为 13，不是 V06-10 弄红的。
 // 2026-09-21 收口裁定（先例 m2 25→31、u2 46→47：只改期望集合、不放宽判据）：
@@ -49,6 +51,9 @@ const RELEASE_EXE = path.join(TAURI_DIR, "target", "release", "tatai.exe");
 // 逐个点名的"恰好"）；注册表 = src/mcp/tools/index.ts 的 TOOLS。README 的工具数同源对账见 verify:v09-05。
 // 2026-09-26（V09-19）定向订正：新增六图读口 get_project_graphs（只读，§6.4／附录 E.18 四），
 // 说明与清单同步为 **19 个**——判据一字不动（仍是逐个点名的"恰好"，不放过、不放宽）。
+// 2026-09-30（V09-23）定向订正：注册表新增同步证据域三接口 register_sync_contract / scan_sync_evidence /
+// read_sync_status（DESIGN §2.10 / docs/sync-evidence-contract.md），说明与清单同步为 **22 个**——
+// 判据一字不动（仍是逐个点名的"恰好"，不放过、不放宽；**不**改成从注册表动态生成期望）。
 const MCP_TOOL_NAMES = [
   "list_projects",
   "select_project",
@@ -72,8 +77,15 @@ const MCP_TOOL_NAMES = [
   // 新增的 rebind_task（当时无人跑到这条断言），V07-04 一并补齐并加上 doctor；判据仍是"恰好"。
   "rebind_task",
   "doctor",
+  // 2026-09-30 V09-23（DESIGN §2.10 / docs/sync-evidence-contract.md）：同步证据域三个规范接口——
+  // register_sync_contract（写）/ scan_sync_evidence（写，经宿主）/ read_sync_status（只读）。
+  // 同一个口径（V06-10/V07-02/V07-04/V09-19 先例）：**逐个点名登记**、数量判据仍是"恰好"；
+  // 三接口的契约/反例语义由 verify:sync-evidence 等各自守着，本脚本只做身份/集合断言。
+  "register_sync_contract",
+  "scan_sync_evidence",
+  "read_sync_status",
 ] as const;
-const MCP_TOOL_COUNT = MCP_TOOL_NAMES.length; // 19
+const MCP_TOOL_COUNT = MCP_TOOL_NAMES.length; // 22
 
 const ok = (cond: boolean, label: string) => {
   console.log(`[verify] ${cond ? "PASS" : "FAIL"} ${label}`);
@@ -576,7 +588,7 @@ try {
   const extraTools = toolNames.filter((n) => !(MCP_TOOL_NAMES as readonly string[]).includes(n));
   ok(
     missingTools.length === 0 && extraTools.length === 0,
-    `⑦ 包内工具逐个点名对账（${MCP_TOOL_NAMES.length} 个：一期 8 + get_arch/ask_flash + V06-10 三件套 + C-015 三件套 + V07-02 rebind_task + V07-04 doctor）——缺 ${missingTools.join("/") || "无"}，多 ${extraTools.join("/") || "无"}`,
+    `⑦ 包内工具逐个点名对账（${MCP_TOOL_NAMES.length} 个：一期 8 + get_arch/ask_flash + V06-10 三件套 + C-015 三件套 + V07-02 rebind_task + V07-04 doctor + V09-19 get_project_graphs + V09-23 同步域三接口 register_sync_contract/scan_sync_evidence/read_sync_status）——缺 ${missingTools.join("/") || "无"}，多 ${extraTools.join("/") || "无"}`,
   );
   const listed2 = await client.callTool({ name: "list_projects", arguments: {} });
   const projectsText = (listed2.content as { type: string; text?: string }[])[0]?.text ?? "";

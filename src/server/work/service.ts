@@ -79,8 +79,25 @@ import {
 // V07-02 彩排闸：读侧同一份解析器（loadDocument→importTaskDefinitions→taskDefinitionHash）
 import { loadDocument } from "./documents";
 import { importTaskDefinitions, taskDefinitionHash } from "./plan";
+import { BLOCKED_NOT_CLAIMABLE_DETAIL_REASON, TASK_STATUS_LABELS, taskStatusOfEvents } from "./tasks";
 // V09-10（附录 F）：task.reopened 的写边界核实与 reopenTask 同一份判据（防直连写口旁路，C017 同类防线）
 import { verifyReopenCommand } from "./claims";
+// V09-23（DESIGN §2.10 / docs/sync-evidence-contract.md）：同步域命令的写边界核实（锁内按当前实际目标重算）
+// 与接续阻断判据。六个探针模块的注册由组合根负责（见 syncGraph.ts），service 是其中之一。
+import {
+  assertClaimSyncGate,
+  assertSyncContractWriteCommand,
+  assertSyncEvidenceWriteCommand,
+  prepareClaimSyncGate,
+  prepareSyncEvidenceCheck,
+  readProjectDiscoveryIssues,
+  readSyncStatus,
+  type SyncClaimGatePrep,
+  type SyncEvidencePreparation,
+} from "./sync";
+import "./syncGraph";
+import { runSyncScanForRequest } from "./syncDiscovery";
+import type { SyncStatusReport } from "../../shared/syncEvidence";
 
 // ── 项目 → work 目录（路径只走注册表；未知项目按 INVALID_COMMAND 拒，不猜路径）──
 
@@ -459,7 +476,7 @@ export class WorkService {
    * 提交一份写入命令（唯一入口）。成功返回回执，失败抛 `WorkError`。
    *
    * 顺序（DESIGN.md §2.6）：校验 → 幂等 → 版本 → 认领类门禁（自称 renew 先凭事件现场核实资格，
-   * 伪造拒零字节；首次认领过预算门禁）→ 需求/变更实体折叠校验（§2.5 一致校验面，C-015）→
+   * 伪造拒零字节；**阻塞卡不许新领**；首次认领过预算门禁）→ 需求/变更实体折叠校验（§2.5 一致校验面，C-015）→
    * task.definition_imported 引用校验（C-015 复核返修，新形态才查）→ 追加并持久化 → 回执 → 投影。
    * 追加前各步任一失败，**被拒命令本身一个字节都不写**；投影失败不回滚已提交的事件，只如实标记。
    * 唯一例外：预算门禁拒绝认领时，在同一临界区额外提交一条 `budget.blocked` 留证事件
@@ -487,6 +504,17 @@ export class WorkService {
       }
     }
     const workDir = resolveWorkDir(cmd.project_id, this.dataDir);
+
+    // V09-23／DESIGN §2.10 锁边界：`sync.evidence_checked` 由唯一服务在**锁外**按当前实际目标做**独立全量评估**
+    // （含六图 canonical builder），与命令声称的 overall/逐项 verdict/目标指纹逐项比对——不符在进锁前就拒（零字节），
+    // 不信任调用方摘要。锁内只做**有界**真实目标指纹复核（不跑 sixGraphsOf 全量；见 assertSyncEvidenceWriteCommand）。
+    const syncEvidencePrep: SyncEvidencePreparation | null =
+      cmd.type === "sync.evidence_checked" ? prepareSyncEvidenceCheck({ cmd, dataDir: this.dataDir, workDir }) : null;
+
+    // V09-23 返工C（Codex 反例14 后半）：非续约 `task.claimed` 的同步门禁同样**锁外独立评估 + 锁内有界快照校验**——
+    // 锁内不再跑 computeSyncBlock 全量六图；锁内只用有界图源探针/文件字节重算指纹比对（见 assertClaimSyncGate）。
+    const claimSyncPrep: SyncClaimGatePrep | null =
+      cmd.type === "task.claimed" && cmd.payload?.claim_action !== "renew" ? prepareClaimSyncGate({ cmd, dataDir: this.dataDir, workDir }) : null;
 
     return withFileLock(eventsPath(workDir), () => {
       const { events, tail } = loadEvents(workDir);
@@ -582,6 +610,36 @@ export class WorkService {
             );
           }
           renewVerified = true;
+        }
+        // ②′.2 阻塞卡不许**新领**（2026-09-30 有界修正；与 `claims.claimTask` 同一判据）：
+        // 直连通用写口手写 `task.claimed` 也走这条唯一写入临界区，所以门禁挂在这一点，
+        // "只从就绪队列领"这条规则就不能被绕过。合法的续约（renewVerified）不受此限——
+        // 续约是持有者对**已有认领**的延长，不是新领；取消/已交付的原规则不变。
+        // 被拒命令**零字节**；不落 budget.blocked 留证（这不是预算拒绝，是状态不符）。
+        if (!renewVerified) {
+          const snapshot = taskStatusOfEvents(events, cmd.entity_id);
+          if (snapshot !== null && snapshot.status === "blocked") {
+            const blockedReason = snapshot.blocked_reason ?? "（事件里未记录 blocked_reason）";
+            throw new WorkError(
+              "INVALID_COMMAND",
+              `任务 ${cmd.entity_id} 当前是「${TASK_STATUS_LABELS.blocked}」：阻塞卡不许新领，` +
+                `拒绝提交 ${cmd.type}（${cmd.entity_id}），本次命令没有写入任何字节。` +
+                `阻塞原因（事件账本 blocked_reason）：${blockedReason}。` +
+                "解阻按**原启动条件**经协调器处理——先满足该前置，再由协调器写一条 " +
+                'task.status_changed(status="ready") 解除阻塞；随便一句授权的话不构成解阻凭据' +
+                "（凭据是事件账本里的状态与依据，DESIGN.md §5.4/§6.7）",
+              {
+                reason: BLOCKED_NOT_CLAIMABLE_DETAIL_REASON,
+                entity_id: cmd.entity_id,
+                status: snapshot.status,
+                blocked_reason: snapshot.blocked_reason,
+              },
+            );
+          }
+          // ②′.3 同步批次阻断（V09-23／DESIGN §2.10；返工C 锁边界）：active 且 blocks_entry 的批次未当前通过时，
+          // 锁内**按当前实际事实重算有界指纹**与锁外独立预评估逐字节比对并拒绝新领——直连通用写口手写 task.claimed
+          // 因此不能绕开接续门禁，且锁内**不跑 sixGraphsOf 全量**（判据与 entry/claimTask 同一份 computeSyncBlock 语义）。
+          assertClaimSyncGate({ events, cmd, dataDir: this.dataDir, workDir, prep: claimSyncPrep! });
         }
         if (isBudgetGatedClaimEvent(cmd.type, renewVerified)) {
           const budgetCheck = checkProjectBudget(readProjectBudget(workDir), countTaskClaims(events));
@@ -682,6 +740,16 @@ export class WorkService {
             { reason: "reopen_verification_failed", entity_id: cmd.entity_id, failures: verification.failures },
           );
         }
+      }
+
+      // ②ⅸ 同步域命令的写边界核实（V09-23／DESIGN §2.10）：`sync.contract_registered` 锁内全字段闭键 +
+      // 来源实核 + 同批次改内容拒 + supersedes 不成环 + 职责边界；`sync.evidence_checked` 锁内重核身份与真实字节，
+      // 并用**有界**图源/文件/业务投影重算指纹与锁外预评估比对（**不跑 sixGraphsOf 全量**）。伪造 passed、
+      // "计算后目标又变"、超预算一律拒绝且零字节（直连通用写口不能绕过；见 sync.ts）。
+      if (cmd.type === "sync.contract_registered") {
+        assertSyncContractWriteCommand({ events, cmd, dataDir: this.dataDir, workDir });
+      } else if (cmd.type === "sync.evidence_checked") {
+        assertSyncEvidenceWriteCommand({ events, cmd, dataDir: this.dataDir, workDir, prep: syncEvidencePrep! });
       }
 
       // ③ 追加并持久化（fsync 后才回执）
@@ -966,6 +1034,20 @@ export async function handleWorkRequest(
       sendJson(res, 200, ctx.service.readSnapshot(projectId));
       return true;
     }
+    // V09-23 返工C（Codex 反例12）：**只读**同步状态/健康读口——MCP stdio 是另一个进程，不能拿本进程空内存
+    // 的 syncRuntimeHealth 冒充"后台无故障"；这里由**唯一宿主**（桌面/daemon 同一 handleWorkRequest）给出
+    // **同一份** report 与后台发现错误，MCP 只读转发、**不**触发扫描/写账、**不**按需拉起写者。
+    if (method === "GET" && ctx.pathname === "/api/work/sync/status") {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      const projectId = (url.searchParams.get("project_id") ?? "").trim();
+      if (projectId === "") {
+        sendJson(res, 400, { code: "INVALID_COMMAND", message: "sync/status 缺 project_id", detail: {} });
+        return true;
+      }
+      const dataDir = ctx.service.info().data_dir;
+      sendJson(res, 200, { ok: true, sync: readSyncStatus(projectId, dataDir), discovery_issues: readProjectDiscoveryIssues(projectId, dataDir) });
+      return true;
+    }
     if (method === "POST" && ctx.pathname === "/api/work/command") {
       const text = await readBody(req);
       let parsed: unknown;
@@ -987,6 +1069,28 @@ export async function handleWorkRequest(
       const text = await readBody(req);
       const parsed = JSON.parse(text || "{}") as { project_id?: string };
       sendJson(res, 200, ctx.service.repair(parsed.project_id ?? ""));
+      return true;
+    }
+    // V09-23（DESIGN §2.10）：显式同步扫描——与后台自动发现**共用同一逻辑与单飞队列**（syncDiscovery），
+    // 真正唯一写口仍是本服务（submit）；返回值与只读 read_sync_status 同一份契约（src/shared/syncEvidence.ts）。
+    if (method === "POST" && ctx.pathname === "/api/work/sync/scan") {
+      const text = await readBody(req);
+      const parsed = JSON.parse(text || "{}") as { project_id?: string; role?: string; actor_id?: string };
+      const projectId = typeof parsed.project_id === "string" ? parsed.project_id.trim() : "";
+      if (projectId === "") {
+        sendJson(res, 400, { code: "INVALID_COMMAND", message: "sync/scan 缺 project_id", detail: {} });
+        return true;
+      }
+      const role = typeof parsed.role === "string" && parsed.role.trim() !== "" ? parsed.role.trim() : "coordinator";
+      const actorId = typeof parsed.actor_id === "string" && parsed.actor_id.trim() !== "" ? parsed.actor_id.trim() : "sync-scan";
+      const outcome = await runSyncScanForRequest({
+        projectId,
+        dataDir: ctx.service.info().data_dir,
+        submitter: ctx.service,
+        role,
+        actorId,
+      });
+      sendJson(res, 200, outcome);
       return true;
     }
     sendJson(res, 405, {
@@ -1138,6 +1242,34 @@ export class WorkServiceClient {
   }
 
   /**
+   * V09-23 返工C（Codex 反例12）：**只读**取唯一宿主的同步状态/健康——**只用已有描述符，绝不 ensure/拉起写者**
+   * （read 是纯只读，不得自动 spawn 任何 writer/写 events）。独立 daemon 只服务 `/api/work/*`；桌面宿主把
+   * `/api/projects/:id/sync-status` 直挂 8787（未转发 work 面），故先试 work 读口再退回该只读项目读口。
+   * 描述符不存在/不可达/读口不完整 → `null`（调用方按「无法核对宿主后台健康」fail-closed，绝不静默当通过）。
+   */
+  async readSyncStatusRemote(projectId: string): Promise<{ report: SyncStatusReport; discovery_issues: string[] } | null> {
+    const desc = readServiceDescriptor(this.dataDir);
+    if (!desc) return null;
+    const tryGet = async (p: string, withToken: boolean): Promise<{ report: SyncStatusReport; discovery_issues: string[] } | null> => {
+      try {
+        const headers: Record<string, string> = {};
+        if (withToken) headers[WORK_TOKEN_HEADER] = desc.token;
+        const res = await fetch(`http://${desc.host}:${desc.port}${p}`, { headers, signal: AbortSignal.timeout(this.timeoutMs) });
+        if (!res.ok) return null;
+        const body = (await res.json().catch(() => null)) as { ok?: boolean; sync?: SyncStatusReport; discovery_issues?: unknown } | null;
+        if (body?.ok !== true || body.sync === undefined || body.sync === null) return null;
+        return { report: body.sync, discovery_issues: Array.isArray(body.discovery_issues) ? (body.discovery_issues as string[]).filter((s) => typeof s === "string") : [] };
+      } catch {
+        return null;
+      }
+    };
+    return (
+      (await tryGet(`/api/work/sync/status?project_id=${encodeURIComponent(projectId)}`, true)) ??
+      (await tryGet(`/api/projects/${encodeURIComponent(projectId)}/sync-status`, false))
+    );
+  }
+
+  /**
    * 唯一写入服务自愈（V07-01）：探活 → 清陈旧描述符（pid 已死）→ 按需拉起独立写入服务
    * （detached daemon）→ 等健康。`TATAI_NO_AUTOSTART=1` 关自愈闸（排查用）。绝不本地代写。
    */
@@ -1208,6 +1340,40 @@ export class WorkServiceClient {
       throw new WorkError(code, body?.message ?? `写入服务返回 HTTP ${res.status}`, body?.detail ?? {});
     }
     return body as unknown as WorkReceipt;
+  }
+
+  /**
+   * V09-23：请求**唯一写服务宿主**扫描某项目的同步证据（与后台自动发现共用同一逻辑/单飞队列）。
+   * 服务不可达时按自愈重试一次；仍不可达抛 `SERVICE_UNAVAILABLE`（不退化为本地自己写）。
+   */
+  async scanSyncEvidence(projectId: string, opts: { role?: string; actorId?: string } = {}): Promise<unknown> {
+    const body = JSON.stringify({ project_id: projectId, ...(opts.role === undefined ? {} : { role: opts.role }), ...(opts.actorId === undefined ? {} : { actor_id: opts.actorId }) });
+    const doPost = async (desc: WorkServiceDescriptor): Promise<Response | null> => {
+      try {
+        return await fetch(`http://${desc.host}:${desc.port}/api/work/sync/scan`, {
+          method: "POST",
+          headers: { "content-type": "application/json", [WORK_TOKEN_HEADER]: desc.token },
+          body,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch {
+        return null;
+      }
+    };
+    let desc = readServiceDescriptor(this.dataDir);
+    if (!desc) {
+      desc = await this.ensureWorkService();
+      if (desc === null) throw new WorkError("SERVICE_UNAVAILABLE", "sync 扫描需要唯一写入服务：未启动且按需拉起未果", { data_dir: this.dataDir });
+    }
+    let res = await doPost(desc);
+    if (res === null) {
+      const recovered = await this.ensureWorkService();
+      if (recovered !== null) res = await doPost(recovered);
+      if (res === null) throw new WorkError("SERVICE_UNAVAILABLE", `sync 扫描入口不可达（${desc.host}:${desc.port}）`, { host: desc.host, port: desc.port });
+    }
+    const bodyText = (await res.json().catch(() => null)) as { code?: WorkErrorCode; message?: string; detail?: Record<string, unknown> } | null;
+    if (!res.ok) throw new WorkError((bodyText?.code ?? "SERVICE_UNAVAILABLE") as WorkErrorCode, bodyText?.message ?? `sync 扫描返回 HTTP ${res.status}`, bodyText?.detail ?? {});
+    return bodyText;
   }
 
   /**

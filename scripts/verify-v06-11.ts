@@ -121,9 +121,14 @@ const appendixBOf = (text: string): string => {
  *   对第 176 行 `audit.self_check_recorded` 行做了契约细化（补 `verifies`/采信分档说明，
  *   git diff 实测仅此一处一行改动），当时漏同步本钉值｜新钉值 b4d38d17…（＝当前前缀实测）｜
  *   保留意图：此后前缀再有任何字节改动仍必须红。
+ * 定向重定基线（2026-09-30 接续缺口有界修正）：正文 §8.1 追加「写边界的认领门禁（阻塞卡不许新领）」、
+ *   §12.1 追加 `required_reads` 的项目级阶段必读指针、§12.2 追加对应一条 —— 三处都在 70992 之前插段，
+ *   按本卡既定程序**重钉前缀为当时全文**（旧钉值 b4d38d17… → 新钉值 36d8e74b…，字节 70992 → 82558）。
+ *   判据未放宽：前缀仍逐字节钉死、尾部仍只许追加；本批改动出处见 `PLAN.md` 同日「附记（非卡）」与
+ *   `D:/demo-project/.工作台/tatai-alignment/20260930-entry-patch/`。
  */
-const CONTRACT_PREFIX_BYTES = 70992;
-const CONTRACT_PREFIX_SHA256 = "b4d38d17e5cec61374af79e9233c35073e3a02d0cba91076f05e1c049c62ea11";
+const CONTRACT_PREFIX_BYTES = 82558;
+const CONTRACT_PREFIX_SHA256 = "36d8e74b55557c4cfd6610c7ca171c710f89f9103ea0dd7fa32311b86ba328ab";
 /** §6.5「不替用户选择新服务」的口径句头（断言里引用，避免把长句抄两遍） */
 const NO_SUBSTITUTE_HEAD = "不替用户选择新服务";
 

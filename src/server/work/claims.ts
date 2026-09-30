@@ -32,6 +32,7 @@ import { loadEvents } from "./eventStore";
 import { evidenceBlobPath, readEvidence } from "./evidence";
 import { importTaskDefinitions, taskDefinitionHash, type TaskDefinition } from "./plan";
 import { dependencyRelease, projectFromFacts } from "./statusProjection";
+import { computeSyncBlock } from "./sync";
 import {
   assertReopenPayload,
   foldTaskStates,
@@ -517,6 +518,46 @@ export async function claimTask(
       workDir,
       { current_revision: state.revision },
     );
+  }
+  // 阻塞卡不许**新领**（2026-09-30 有界修正）：状态是事件账本里的事实，阻塞的理由与解除条件也在里面。
+  // 解阻只能由协调器按**原启动条件**处理（先满足前置，再写 task.status_changed(status="ready") 解除），
+  // 不接受"谁谁口头说要授权"当凭据——判据永远是可取回的事件与依据，不是一句话（DESIGN.md §5.4/§6.7）。
+  // 续约（renewClaim）与释放不受影响：它们作用于**已有认领**，不是新领。
+  if (state.status === "blocked") {
+    const reason = state.blocked_reason ?? "（事件里未记录 blocked_reason）";
+    return failure(
+      "NOT_CLAIMABLE",
+      `任务 ${taskId} 当前是「${TASK_STATUS_LABELS.blocked}」：阻塞卡不许新领。` +
+        `阻塞原因（事件账本 blocked_reason）：${reason}。` +
+        "解阻按**原启动条件**经协调器处理——先满足该前置（如取得用户授权、补齐前置卡证据），" +
+        '再由协调器写一条 task.status_changed(status="ready") 解除阻塞，然后重新取接续入口领取；' +
+        "随便一句授权的话不构成解阻凭据（凭据是事件账本里的状态与依据，DESIGN.md §5.4/§6.7）",
+      projectId,
+      taskId,
+      workDir,
+      { current_revision: state.revision, failures: [`任务 ${taskId} 处于阻塞态：${reason}`] },
+    );
+  }
+
+  // ── 同步批次阻断（V09-23／DESIGN §2.10）──
+  // active 且 blocks_entry 的批次未当前通过时，拒绝**新领**——与 project_entry 的 sync_blocked、
+  // 唯一写服务文件锁内的 task.claimed 门禁**同一份判据**（computeSyncBlock），避免绕开入口。
+  // 只读预查（真正的原子拒绝仍在写口锁内）。
+  {
+    const syncBlock = computeSyncBlock(projectId, dataDir ?? resolveDataDir());
+    if (syncBlock.blocked) {
+      const lines = syncBlock.batches.map((b) => `批次 ${b.batch_id}（${b.title}）verdict=${b.verdict}：${b.reasons.slice(0, 3).join("；")}`);
+      return failure(
+        "NOT_CLAIMABLE",
+        `任务 ${taskId} 暂不可领：同步批次未当前通过（阻断接续与认领）。` +
+          lines.join(" / ") +
+          "。先让该批次所登记范围对账通过，或按契约收口/显式 supersede（DESIGN.md §2.10）",
+        projectId,
+        taskId,
+        workDir,
+        { current_revision: state.revision, failures: lines },
+      );
+    }
   }
 
   // ── 项目预算约束（§5.7 / TPL-10 §六③）──
