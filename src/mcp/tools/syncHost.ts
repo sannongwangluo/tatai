@@ -37,16 +37,14 @@ export async function hostSyncView(projectId: string, dataDir: string, work?: Wo
     }
   }
   const reason = work === undefined ? "MCP 未拿到转接客户端（ctx.work）" : "唯一宿主不可达或只读读口不完整";
-  const local = readSyncStatus(projectId, dataDir);
-  if (!local.configured) {
-    // 旧项目（无同步配置）：宿主可达与否都不影响——保持 not_configured（旧项目完全兼容）。
-    return { report: local, discovery_issues: [], host_reachable: false, unreachable_reason: reason };
-  }
   const issue = `无法核对唯一宿主后台发现健康（${reason}）：按 fail-closed 处理——不把「宿主不可达」当成「后台无故障」（DESIGN.md §2.10）`;
-  return {
-    report: readSyncStatus(projectId, dataDir, { discoveryIssues: [issue] }),
-    discovery_issues: [issue],
-    host_reachable: false,
-    unreachable_reason: reason,
-  };
+  // **一次同源构造**：`unreachableIssues` 只在项目已配置同步契约时并入（顶替本进程不可信的错误汇），
+  // 未配置的旧项目完全忽略它、保持 not_configured。这样不必「先探 configured 再重算一遍」——那会
+  // 把整仓六图重复构建两轮（2026-10-02 诊断的 17 秒本地回退就是这么来的）。
+  const report = readSyncStatus(projectId, dataDir, { unreachableIssues: [issue] });
+  if (!report.configured) {
+    // 旧项目（无同步配置）：宿主可达与否都不影响——保持 not_configured（旧项目完全兼容）。
+    return { report, discovery_issues: [], host_reachable: false, unreachable_reason: reason };
+  }
+  return { report, discovery_issues: [issue], host_reachable: false, unreachable_reason: reason };
 }

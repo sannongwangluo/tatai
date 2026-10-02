@@ -165,7 +165,12 @@
     "remote:token": "tsx scripts/remote-token.ts",
     "remote:write": "tsx scripts/remote-write.ts",
     "verify:c014-outbox-real": "tsx scripts/verify-c014-outbox-real.ts",
-    "verify:plan-segment-binding": "tsx scripts/verify-plan-segment-binding.ts"
+    "verify:plan-segment-binding": "tsx scripts/verify-plan-segment-binding.ts",
+    "verify:forward-baseline": "tsx scripts/verify-forward-baseline.ts",
+    "verify:forward-journey": "tsx scripts/verify-forward-journey.ts",
+    "verify:host-ownership": "tsx scripts/verify-host-ownership.ts",
+    "verify:definition-align": "tsx scripts/verify-definition-align.ts",
+    "verify:http-source-freshness": "tsx scripts/verify-http-source-freshness.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

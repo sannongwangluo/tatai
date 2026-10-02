@@ -6,7 +6,9 @@
 // by 固定 "user"；打回 note 必填；当前步是 deliver 时提供「迭代回需求」入口（§5.1，回第 ② 步重走）。
 // 权限红线：MCP 工具（M 系卡）没有任何改 Gate 的接口（§5.2 / §6.3 工具清单无 gate 写入工具），
 // 转移只能从这里由人点出来。
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useBoundedReloader, useProjectRefresh } from "../useProjectRefresh";
+import { useProjectScope } from "../projectScope";
 // GATE_STEPS 的**值**从浏览器安全的 src/shared/gateSteps.ts 取（2026-09-20 构建回归修复：
 // 从 server/workstation 值导入会把 node:child_process 拉进前端包）；Gate 数据类型仍走 type-only 导入。
 import { GATE_STEPS } from "../../shared/gateSteps";
@@ -52,7 +54,10 @@ export function GateTimeline({ project }: { project: ProjectItem }) {
   const [action, setAction] = useState<"pass" | "reject" | null>(null);
   // 打回目标步（2026-09-19 主人拍板：任意步可打回，含已过的历史步）；过关仍只对当前步
   const [rejectTarget, setRejectTarget] = useState<string | null>(null);
-  const [noteInput, setNoteInput] = useState("");
+  // V09-26：Gate 说明（打回理由/过关备注）是用户输入，按项目隔离保存（切项目不串、对账不丢，§3.1/§3.14）
+  const { scope, setBucket } = useProjectScope(project.id);
+  const noteInput = scope.selections["gate:note"] ?? "";
+  const setNoteInput = (v: string): void => setBucket("selections", "gate:note", v);
   const [iterating, setIterating] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -65,37 +70,56 @@ export function GateTimeline({ project }: { project: ProjectItem }) {
     gateReconcile !== null && !("error" in gateReconcile) ? gateReconcile.matched : [],
   );
 
-  // 切项目联动（G2 DoD④）：project.id 一变就重取两个数据源，并收起已展开的详情与操作态
-  useEffect(() => {
-    let stale = false;
-    setProgress(null);
-    setLines([]);
-    setLoadError(null);
-    setExpandedStep(null);
-    setAction(null);
-    setNoteInput("");
-    setIterating(false);
-    setActionError(null);
-    setGateReconcile(null);
-    Promise.all([getProgress(project.id), getGateLines(project.id)])
+  const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
+  /** 项目 id 的镜像：回包落地前先问"还是不是本项目"（§3.1 旧项目响应不许写进新界面） */
+  const projectIdRef = useRef(project.id);
+  projectIdRef.current = project.id;
+  /** V09-26：换项目才清现场（收起已展开的详情与操作态）；周期对账保留最后成功数据与输入 */
+  const loadedForRef = useRef<string | null>(null);
+  const load = useCallback((signal: AbortSignal): Promise<void> => {
+    const id = project.id;
+    if (loadedForRef.current !== id) {
+      loadedForRef.current = id;
+      setProgress(null);
+      setLines([]);
+      setLoadError(null);
+      setExpandedStep(null);
+      setAction(null);
+      setIterating(false);
+      setActionError(null);
+      setGateReconcile(null);
+      setLastSuccessAt(null);
+    }
+    return Promise.all([getProgress(id, { signal }), getGateLines(id, { signal })])
       .then(([p, l]) => {
-        if (stale) return;
+        // 换项目/卸载时 signal 被 abort：旧项目晚到回包一律丢弃（§3.1）
+        if (signal.aborted || projectIdRef.current !== id) return;
         setProgress(p);
         setLines(l);
+        setLoadError(null);
+        setLastSuccessAt(new Date().toISOString());
       })
       .catch((e: Error) => {
-        if (!stale) setLoadError(e.message);
+        if (signal.aborted || projectIdRef.current !== id) return;
+        setLoadError(e.message); // 保留最后成功数据，只标陈旧
       });
-    return () => {
-      stale = true;
-    };
   }, [project.id]);
 
+  // V09-26：Gate（progress.json / gate.jsonl 只有文件变化时账本序号不动）统一走周期对账
+  const token = useProjectRefresh(project.id);
+  const reload = useBoundedReloader(project.id, load);
+  useEffect(() => {
+    reload();
+  }, [project.id, token, reloadTick, reload]);
+
   // G3：操作后即时刷新——重新拉 progress + gate.jsonl（界面状态与落盘文件一致）
-  async function reload() {
+  async function refreshAfterAction() {
     const [p, l] = await Promise.all([getProgress(project.id), getGateLines(project.id)]);
+    if (projectIdRef.current !== project.id) return;
     setProgress(p);
     setLines(l);
+    setLastSuccessAt(new Date().toISOString());
   }
 
   // G3：提交过关/打回（by 固定 user，见 api.ts；后端另有同样强制，双保险）。
@@ -116,7 +140,7 @@ export function GateTimeline({ project }: { project: ProjectItem }) {
       setAction(null);
       setNoteInput("");
       setRejectTarget(null);
-      await reload();
+      await refreshAfterAction();
     } catch (e) {
       setActionError((e as Error).message);
     } finally {
@@ -131,7 +155,7 @@ export function GateTimeline({ project }: { project: ProjectItem }) {
     try {
       await postGateBack(project.id);
       setIterating(false);
-      await reload();
+      await refreshAfterAction();
     } catch (e) {
       setActionError((e as Error).message);
     } finally {
@@ -139,16 +163,23 @@ export function GateTimeline({ project }: { project: ProjectItem }) {
     }
   }
 
-  if (loadError) {
+  if (loadError !== null && progress === null) {
     return (
-      <div className="mx-auto w-full max-w-3xl p-8">
+      <div className="mx-auto w-full max-w-3xl p-8" data-gate-timeline data-gate-load-error>
         <p className="text-sm text-red-400">Gate 时间线加载失败：{loadError}</p>
+        <button
+          data-gate-retry
+          onClick={() => setReloadTick((t) => t + 1)}
+          className="mt-2 rounded border border-red-500/40 px-2 py-1 text-xs text-red-300 hover:bg-red-500/20"
+        >
+          重试
+        </button>
       </div>
     );
   }
   if (!progress) {
     return (
-      <div className="mx-auto w-full max-w-3xl p-8">
+      <div className="mx-auto w-full max-w-3xl p-8" data-gate-timeline data-gate-loading>
         <p className="text-sm text-neutral-500">加载 Gate 时间线…</p>
       </div>
     );
@@ -162,7 +193,27 @@ export function GateTimeline({ project }: { project: ProjectItem }) {
   const expandedLines = expandedStep ? lines.filter((l) => l.step === expandedStep) : [];
 
   return (
-    <div data-gate-timeline className="mx-auto w-full max-w-4xl space-y-6 p-8">
+    <div
+      data-gate-timeline
+      data-gate-stale={loadError !== null ? "1" : "0"}
+      data-gate-stale-at={lastSuccessAt ?? ""}
+      className="mx-auto w-full max-w-4xl space-y-6 p-8"
+    >
+      {/* V09-26：读失败保留最后成功数据（不把 Gate 状态清成未知/健康），只标陈旧 */}
+      {loadError !== null && (
+        <p className="flex flex-wrap items-center gap-2 rounded border border-amber-800/60 bg-amber-950/30 px-3 py-1 text-[11px] text-amber-200">
+          <span className="min-w-0 flex-1">
+            Gate 时间线读取失败：{loadError}（显示的是 {lastSuccessAt ?? "上次成功"} 读到的数据；后台每 5 秒自动重试）
+          </span>
+          <button
+            data-gate-retry
+            onClick={() => setReloadTick((t) => t + 1)}
+            className="shrink-0 rounded border border-amber-600/50 px-2 py-0.5 text-amber-200 hover:bg-amber-500/20"
+          >
+            重试
+          </button>
+        </p>
+      )}
       <header className="flex items-baseline gap-3">
         <h2 className="text-lg font-semibold">{project.name} · Gate 时间线</h2>
         <span data-gate-current className="text-xs text-neutral-500">

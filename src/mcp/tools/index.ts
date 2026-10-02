@@ -17,6 +17,9 @@ import { doctorTool } from "./doctor";
 import { readDesignTool } from "./readDesign";
 import { readProgressTool } from "./readProgress";
 import { reportTaskStatusTool } from "./reportTaskStatus";
+import { reportExecutionTool } from "./reportExecution";
+import { recordWorkEvidenceTool } from "./recordWorkEvidence";
+import { manageBaselineTool } from "./manageBaseline";
 import { selectProjectTool } from "./selectProject";
 import { updateProgressTool } from "./updateProgress";
 import { SYNC_EVIDENCE_TOOLS } from "./syncEvidence";
@@ -58,6 +61,15 @@ export const TOOLS: readonly McpTool[] = [
   // V09-23（DESIGN §2.10 / docs/sync-evidence-contract.md）：同步域三个规范接口——
   // register_sync_contract（写）/ scan_sync_evidence（写，经宿主）/ read_sync_status（只读）。
   ...SYNC_EVIDENCE_TOOLS,
+  // V09-27（DESIGN.md §5.4/§5.5/§6.7；契约 F3）：Agent 完整上报链的可达入口——
+  // report_execution（执行回执/心跳/检查点/停止/失败的受控适配）、
+  // record_work_evidence（证据正文经宿主 + 成果登记/自检/独审/修复/复测/缺陷的受控适配）。
+  // 两者都经 ctx.work 转接唯一写入服务；report_task_status 的 v2 扩展复用同一份写边界判据。
+  reportExecutionTool,
+  recordWorkEvidenceTool,
+  // V09-28（DESIGN.md §2.9/§6.7；契约 F1）：正向成套图纸入口（read/preserve/activate 经唯一宿主）。
+  // 由 V09-27 统一在本注册表集成（基线工人产出该文件，不在别处另注册）。
+  manageBaselineTool,
 ];
 
 export function findTool(name: string): McpTool | undefined {

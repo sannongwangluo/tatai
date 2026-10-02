@@ -400,7 +400,12 @@ for (const dep of NATIVE_DEPS) {
     // 所以用 createRequire 从包根解析，再取真实路径；落地到产物 node_modules 根（Node 向上查找自会命中）
     let real: string;
     try {
-      const req = createRequire(path.join(pkgRoot, "package.json"));
+      // 从**真实路径**起解析：pnpm 布局下 `node_modules/<pkg>` 是指向 `.pnpm/<pkg>@ver/node_modules/<pkg>`
+      // 的 symlink，而它的运行时依赖（node-gyp-build）是**同级** symlink（在 `.pnpm/<pkg>@ver/node_modules/`
+      // 下）。直接对 symlink 路径 createRequire 时 Node 按 symlink 目录向父级找 node_modules，命中不到同级
+      // 依赖（顶层无 node-gyp-build）→ 解析失败。realpath 后从真实目录起解析才能命中 .pnpm 的布局
+      // （Node 运行时 require 本就对 symlink 做 realpath，这里对齐同一口径）。
+      const req = createRequire(path.join(fs.realpathSync(pkgRoot), "package.json"));
       real = fs.realpathSync(path.dirname(req.resolve(`${nested}/package.json`)));
     } catch (e) {
       ok(false, `② ${dep.name} 的运行时依赖 ${nested} 解析不到：${(e as Error).message}`);

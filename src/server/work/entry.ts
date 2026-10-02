@@ -43,10 +43,12 @@ import {
 import { readDecisions, discussionRefKey, type DecisionRecord } from "./decisions";
 import { activeBaseline, loadDocument, loadDocuments, type ProjectBaseline } from "./documents";
 import { readFindings } from "./evidence";
+// V09-27（契约 F3）：运行现场（执行回执/liveness）只读接入 `current_runs`——无事件为未知，缺心跳不等于停机。
+import { livenessOf, readExecutions, type ExecutionRecord, type RunSiteState } from "./executionReceipts";
 import { importTaskDefinitions, taskDefinitionHash, type TaskDefinition } from "./plan";
 import {
   acceptanceDimensionOf,
-  checksFromAudit,
+  checksFromFacts,
   collectProjectFacts,
   dependencyRelease,
   objectsFromFacts,
@@ -364,6 +366,25 @@ export interface CurrentRun {
   lease: ReturnType<typeof leaseStateOf>;
   /** 本角色的续接前置条件（隔离目录 / 确认旧进程停止；如实给出，不当"已停止"） */
   resume_preconditions: string[];
+  /**
+   * 运行现场（V09-27／契约 F3；只读派生自 `execution.*`，用既有 `livenessOf` 判据）：
+   * 无事件 = `no_events`（未知）；心跳缺失/超期 = `unknown`（**不等于已停止**）；
+   * 只有带确认依据的 `execution.stopped` 才是 `confirmed_stopped`。绝不把缺心跳当停机。
+   */
+  run_site: {
+    observed: boolean;
+    execution_id: string | null;
+    state: "confirmed_alive" | "confirmed_stopped" | "unknown" | "no_events";
+    /** `unreadable` = 执行回执读不出来（现场未知）；`no_events` = 确实没有回执 */
+    site_state: RunSiteState | "no_events" | "unreadable";
+    last_signal_at: string | null;
+    silent_ms: number | null;
+    heartbeat_stale: boolean;
+    note: string;
+    /// 停止确认依据（没有就是 null；**不**把停止请求/失联当成依据）
+    confirmation: string | null;
+    last_checkpoint: { at: string; note: string; artifacts: string[]; effects_in_flight: string[] } | null;
+  };
 }
 
 export interface ProjectEntry {
@@ -464,6 +485,13 @@ interface EntryFacts {
   openFindings: { task_id: string | null; must_block: boolean; status: string; finding_id: string }[];
   claims: Record<string, ClaimRecord[]>;
   live: Record<string, ClaimRecord | null>;
+  /** 执行回执域现场（V09-27；无事件为空数组）：current_runs 的运行现场只读派生来源 */
+  executions: ExecutionRecord[];
+  /**
+   * 执行回执**读不出来**的原因（V09-29／复审第 4 项）：非 null = 现场未知，
+   * 不能伪装成"没有事件"（no_events）——读失败与"确实没有回执"是两种不同事实。
+   */
+  executions_unreadable: string | null;
   baseline: ProjectBaseline | null;
   baselineRevalidate: string[];
   /** 项目级阶段必读指针（`.工作台/work/stage-reads.json`；不存在=absent，老项目原样兼容） */
@@ -497,6 +525,9 @@ export function projectWithReleases(facts: {
   const projectFacts = collectProjectFacts(facts.projectId, facts.dataDir);
   const defs = facts.definitions.length > 0 ? facts.definitions : projectFacts.definitions;
   const acceptances = Object.values(projectFacts.audit.acceptances);
+  // V09-29（契约 F4）：检查输入带**源清单现读复核**（绑 code 且证据带 source_manifest 的那些）；
+  // 其余检查逐字照旧。project_entry/get_arch 与 HTTP 读口共用**同一份** checksFromFacts 装配口径。
+  const checksNow = () => checksFromFacts(projectFacts);
   const withAcceptance = (objs: ReturnType<typeof objectsFromFacts>) =>
     objs.map((o) => ({
       ...o,
@@ -505,7 +536,7 @@ export function projectWithReleases(facts: {
   const pass1 = projectStatuses({
     objects: withAcceptance(objectsFromFacts(facts.projectId, facts.dataDir, projectFacts)),
     findings: projectFacts.findings,
-    checks: checksFromAudit(projectFacts.audit),
+    checks: checksNow(),
     source_revision: projectFacts.revisions,
     binding_segments: projectFacts.binding_segments,
   });
@@ -524,7 +555,7 @@ export function projectWithReleases(facts: {
   return projectStatuses({
     objects: withAcceptance(objectsFromFacts(facts.projectId, facts.dataDir, projectFacts, { dependency_releases: releases })),
     findings: projectFacts.findings,
-    checks: checksFromAudit(projectFacts.audit),
+    checks: checksNow(),
     source_revision: projectFacts.revisions,
     binding_segments: projectFacts.binding_segments,
   });
@@ -667,6 +698,16 @@ function gatherFacts(projectId: string, dataDir: string, now: string, syncDiscov
     }
   })();
 
+  // 执行回执域现场（V09-27）：读得出来就是记录数组，**读不出来如实标原因**——
+  // 不能把"读失败"伪装成"没有事件"（no_events），那是两种不同的事实（codex 复审第 4 项）。
+  let executions: ExecutionRecord[] = [];
+  let executionsUnreadable: string | null = null;
+  try {
+    executions = readExecutions(workDir);
+  } catch (e) {
+    executionsUnreadable = e instanceof Error ? e.message : String(e);
+  }
+
   return {
     projectId,
     dataDir,
@@ -705,6 +746,8 @@ function gatherFacts(projectId: string, dataDir: string, now: string, syncDiscov
     plan,
     context,
     decisions,
+    executions,
+    executions_unreadable: executionsUnreadable,
     unreadable,
   };
 }
@@ -962,8 +1005,14 @@ function decideNextAction(input: DecideInput): Decision {
     reasons.push({
       code: "baseline_missing",
       text:
-        `没有生效的成套图纸基线：${facts.baselineRevalidate.join("；")}。先由用户或获授权设计角色审定基线（§2.9），` +
-        "塔台在基线生效前不派发新任务（否则就是拿不确定的输入开工）",
+        `没有生效的成套图纸基线：${facts.baselineRevalidate.join("；")}。` +
+        "先由**用户本人或获授权的设计/协调角色**审定并激活基线（§2.9），塔台在基线生效前不派发新任务（否则就是拿不确定的输入开工）。" +
+        "可执行入口：① MCP `manage_baseline {op:\"read\", project_id}` 只读当前两份图纸与生效基线（零副作用）；" +
+        "② MCP `manage_baseline {op:\"activate\", project_id, role:\"designer\"|\"coordinator\", approved_by, approval_basis, " +
+        "expected:{design_content_sha256, plan_content_sha256}}` 做**技术审定**激活（审定类型固定 delegated_technical_review，" +
+        "零差异、不调模型、不写用户 Gate；expected 两份哈希取自 ① 的当前值）；" +
+        "③ 或由人在设计书页「现有成套图纸 · 审定与激活」区点「审定并激活基线」（用户确认走界面，Agent 不代签）。" +
+        "缺图纸/结构冲突/读取后源变化会被明确拒绝，按返回原因补齐再重试。",
       blocking: true,
     });
     return { action: "await_decision", reasons, required_reads: reads };
@@ -1327,6 +1376,7 @@ function runOf(facts: EntryFacts, c: Candidate): CurrentRun | null {
     workspace: record.workspace ?? "",
     lease,
     resume_preconditions: [...RESUME_PRECONDITIONS],
+    run_site: runSiteOf(facts, c.def.task_id, record),
   };
 }
 
@@ -1867,9 +1917,74 @@ function currentRunsOf(facts: EntryFacts): CurrentRun[] {
       workspace: record.workspace ?? "",
       lease,
       resume_preconditions: [...RESUME_PRECONDITIONS],
+      run_site: runSiteOf(facts, taskId, record),
     });
   }
   return out.sort((a, b) => a.task_id.localeCompare(b.task_id));
+}
+
+/**
+ * 运行现场（V09-27；只读派生）：按 attempt/run 找对应执行回执，用既有 `livenessOf` 判活。
+ * 无事件 = `no_events`（未知）；心跳缺失/超期 = `unknown`（**不等于已停止**）；只有带确认依据的
+ * `execution.stopped` 才 `confirmed_stopped`。最后检查点原样带出（恢复第一步读它，§5.4）。
+ */
+function runSiteOf(facts: EntryFacts, taskId: string, record: ClaimRecord): CurrentRun["run_site"] {
+  // 执行回执读不出来 → **现场未知**（不是 no_events，更不能当"没有执行"）：如实带出读取失败原因
+  if (facts.executions_unreadable !== null) {
+    return {
+      observed: false,
+      execution_id: null,
+      state: "unknown",
+      site_state: "unreadable",
+      last_signal_at: null,
+      silent_ms: null,
+      heartbeat_stale: false,
+      note: `执行回执读不出来（${facts.executions_unreadable}）：运行现场未知——读失败不等于没有回执，也不等于停机（DESIGN.md §5.4）`,
+      confirmation: null,
+      last_checkpoint: null,
+    };
+  }
+  const matches = facts.executions.filter((x) => x.task_id === taskId);
+  const rec =
+    matches.find((x) => record.attempt_id !== null && record.attempt_id !== "" && x.attempt_id === record.attempt_id) ??
+    matches.find((x) => record.run_id !== null && record.run_id !== "" && x.run_id === record.run_id) ??
+    latestByTime(matches, (x) => x.updated_at);
+  if (rec === null) {
+    return {
+      observed: false,
+      execution_id: null,
+      state: "no_events",
+      site_state: "no_events",
+      last_signal_at: null,
+      silent_ms: null,
+      heartbeat_stale: false,
+      note: "没有该 run 的执行回执（execution.*）：运行现场未知——无心跳不等于停机（DESIGN.md §5.4）",
+      confirmation: null,
+      last_checkpoint: null,
+    };
+  }
+  const live = livenessOf(rec, facts.now);
+  const lastCheckpoint = latestByTime(rec.checkpoints, (c) => c.at);
+  return {
+    observed: true,
+    execution_id: rec.execution_id,
+    state: live.state,
+    site_state: live.site_state,
+    last_signal_at: live.last_signal_at,
+    silent_ms: live.silent_ms,
+    heartbeat_stale: live.heartbeat_stale,
+    note: live.note,
+    confirmation: live.confirmation,
+    last_checkpoint:
+      lastCheckpoint === null
+        ? null
+        : {
+            at: lastCheckpoint.at,
+            note: lastCheckpoint.note,
+            artifacts: lastCheckpoint.artifacts,
+            effects_in_flight: lastCheckpoint.effects_in_flight,
+          },
+  };
 }
 
 /** 认领凭证类型透传（实现在 `claims.ts`；MCP 层与调用方共用同一份类型） */

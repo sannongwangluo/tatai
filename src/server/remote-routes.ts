@@ -151,6 +151,60 @@ export const REMOTE_ROUTES: readonly RemoteRoute[] = [
     anchors: ['if (req.method === "GET" && reqPath === "/api/work/sync/status") {'],
     query: "?project_id=:id",
   },
+  // ── V09-29 集成：V09-27 上报域（证据正文存/读）与 V09-28 正向基线（preserve/activate）──
+  // 桌面宿主 `index.ts` 对 work 面**逐条列名**转发，未登记的精确路径会落本文件兜底 404；
+  // 这四条与上面六条同款（方法 + 精确路径），用于让 MCP 在桌面宿主下也能拿到证据正文写/读口与基线路由
+  // （此前 MCP 只能经 404 后回退；证据正文两条**没有**回退路由，加转发后桌面宿主才真正可用）。
+  // 写两条在只读模式下由远程红线先拒（`kind: "write"`），读一条放行；四条都另有描述符令牌那一关。
+  {
+    id: "work-reporting-evidence-write",
+    method: "POST",
+    path: "/api/work/reporting/evidence",
+    kind: "write",
+    note:
+      "证据正文落盘（内容寻址、不可变、读时复核哈希）：由唯一写服务宿主保存，**stdio 进程不本地写项目目录**；" +
+      "读时同一份哈希复核，缺失/不符如实报错，不返回空证据",
+    anchors: ['if (req.method === "POST" && reqPath === "/api/work/reporting/evidence") {'],
+    body: { project_id: "tatai", note: "只读模式下在路由前就被 403，body 仅作可读性说明" },
+  },
+  {
+    id: "work-reporting-evidence-read",
+    method: "GET",
+    path: "/api/work/reporting/evidence",
+    kind: "read",
+    note:
+      "证据正文读回（query: project_id + sha256；宿主只读不自动启动服务；严格 64 位十六进制、拒路径穿越、" +
+      "读时同一份哈希复核）；无/错令牌 401 SERVICE_UNAVAILABLE",
+    anchors: ['if (req.method === "GET" && reqPath === "/api/work/reporting/evidence") {'],
+    query: "?project_id=:id&sha256=<64 位十六进制>",
+  },
+  {
+    id: "work-baseline-preserve",
+    method: "POST",
+    path: "/api/work/baseline/preserve",
+    kind: "write",
+    note:
+      "把当前一份图纸存成不可变历史（Git 可取回的直接引用/blob，否则落副本并校验哈希）；" +
+      "经唯一宿主 `work/baselineHost.ts`，与直挂 `/documents/preserve` 同一份 documents 判据",
+    anchors: ['if (req.method === "POST" && reqPath === "/api/work/baseline/preserve") {'],
+    body: { project_id: "tatai", kind: "design" },
+  },
+  {
+    id: "work-baseline-activate",
+    method: "POST",
+    path: "/api/work/baseline/activate",
+    kind: "write",
+    note:
+      "审定配套版本 → 双版本激活（只追加 baselines.jsonl；不写 gate.jsonl、不伪造用户 Gate）；" +
+      "MCP 面固定 delegated_technical_review，服务端强校验两份源 current expected 内容哈希",
+    anchors: ['if (req.method === "POST" && reqPath === "/api/work/baseline/activate") {'],
+    body: {
+      project_id: "tatai",
+      approved_by: "remote",
+      approval_basis: "只读模式探针",
+      approval_kind: "delegated_technical_review",
+    },
+  },
 
   // ── 补修 A（V06-14）：注册表恢复入口（显式触发；只读模式下必须被拒）──
   {

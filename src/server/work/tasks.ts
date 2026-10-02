@@ -109,6 +109,14 @@ export interface TaskState {
    * 读侧重解析不带绑定——对齐/回执要复算哈希时必须**回放**这个值，否则带 bind 的导入会被误判待重绑。
    */
   definition_change_id: string | null;
+  /**
+   * 定义级需求映射（`task.definition_imported` payload 的 requirement_ids；旧形态事件没有这个键 = 未记录）。
+   * 需求映射同样进定义哈希 canonical（`shared/planCardHash.ts`：`requirement_ids` 是 canonical 的键），
+   * 读侧现解析的定义在**施工图没有需求映射表**时是 null——对齐时若不回放就会把这张刚经工具参数映射
+   * 导入的卡误判 `needs_rebind`（V09-29 集成发现 F-2）。回放口径与 `definition_change_id` 一致：
+   * 绑定事实随事件携带，读侧按状态回放，两个事实不互相覆盖。
+   */
+  definition_requirement_ids?: string[] | null;
   /** 事件实体版本（1 起） */
   revision: number;
   /**
@@ -162,6 +170,10 @@ function assertStatus(value: unknown, event: WorkEvent): TaskExecutionStatus {
 }
 
 const strOrNull = (v: unknown): string | null => (typeof v === "string" && v !== "" ? v : null);
+
+/** 事件里的需求映射回放口径：null / 非字符串数组一律归一为 null（写侧已在服务边界校验形态） */
+const strListOrNull = (v: unknown): string[] | null =>
+  Array.isArray(v) && v.every((x) => typeof x === "string" && x !== "") ? [...(v as string[])] : null;
 
 /** task.reopened 的 payload 闭键（V09-10／附录 F；多一个键少一个键都拒——读侧 fail-closed，写侧同闸） */
 export const REOPEN_PAYLOAD_KEYS = [
@@ -316,6 +328,11 @@ export function foldTaskStates(events: WorkEvent[]): TaskProjection {
         if (DEFINITION_CHANGE_ID_KEY in p) {
           next.definition_change_id = strOrNull(p[DEFINITION_CHANGE_ID_KEY]);
         }
+        // 需求映射与 change_id 同一形态：键在就按事件如实刷新（显式 null = 本次导入声明"无映射"，
+        // 重导不带映射时不能残留上一版）；键不在 = 旧形态事件，保持原值。回放值供对齐复算哈希。
+        if (DEFINITION_REQUIREMENT_IDS_KEY in p) {
+          next.definition_requirement_ids = strListOrNull(p[DEFINITION_REQUIREMENT_IDS_KEY]);
+        }
         break;
       }
       case "task.rebound": {
@@ -324,8 +341,9 @@ export function foldTaskStates(events: WorkEvent[]): TaskProjection {
         next.definition_revision =
           typeof p.to_definition_revision === "number" ? p.to_definition_revision : next.definition_revision;
         // 重绑绑到的是**当前施工图的定义**（submitTaskRebind 对现解析定义算哈希，不带旧绑定），
-        // 旧的定义级批次绑定对新定义不再成立——归空，读侧回放才不会拿旧批次算错哈希（V07-02）
+        // 旧的定义级批次绑定与需求映射对新定义不再成立——归空，读侧回放才不会拿旧值算错哈希（V07-02）
         next.definition_change_id = null;
+        next.definition_requirement_ids = null;
         break;
       }
       case "task.reopened": {
@@ -530,10 +548,19 @@ export function alignDefinitionsAndStates(
       continue;
     }
     seenKeys.add(def.stable_key);
-    // 回放定义级批次绑定再算哈希：定义哈希把 change_id 揉进 canonical（导入时带不带 bind 都进哈希），
-    // 现解析的定义不带绑定——直接比会把"带 bind_change_id 导入"的任务全部误判 needs_rebind
-    // （2026-09-21 塔台自举实测缺陷；绑定事实在事件 payload 里，读侧按状态回放，两个事实不互相覆盖）
-    const currentHash = taskDefinitionHash({ ...def, change_id: state.definition_change_id });
+    // 回放定义级引用元数据再算哈希：定义哈希把 change_id 与 requirement_ids 都揉进 canonical
+    // （`shared/planCardHash.ts`），现解析的定义在施工图**没有**这两张表时不带这些绑定——直接比会把
+    // "带 bind_change_id 导入"（2026-09-21 自举实测缺陷）与"经工具参数做施工图外需求映射导入"
+    // （V09-29 集成发现 F-2）的任务全部误判 needs_rebind。绑定事实在事件 payload 里，读侧按状态回放。
+    //
+    // 需求映射再叠一层"文档优先"：施工图**当前**解析出的 `requirement_ids`（需求映射表）非空时以它
+    // 为准——文档改稿带来的真实变化仍要判重绑，**不**用"忽略需求映射"把真实改稿掩盖过去；只有文档
+    // 给不出映射（null）时才回放事件里记录的工具外映射。
+    const currentHash = taskDefinitionHash({
+      ...def,
+      change_id: state.definition_change_id,
+      requirement_ids: def.requirement_ids ?? state.definition_requirement_ids ?? null,
+    });
     if (state.definition_sha256 !== currentHash) {
       needs_rebind.push({
         task_id: def.task_id,

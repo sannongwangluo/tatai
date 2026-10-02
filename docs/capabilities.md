@@ -18,20 +18,23 @@
 - 设计书展示与显式追加落稿、内置 AI 项目聊天（模型服务可配置）、概念图补全、逆向设计草稿。
 - 流程实况、文件变更、终端与 Tauri 桌面壳。终端仍在当前软件中，已移出用户主导航、收进辅助入口的「维护诊断」。
 - **Agent 任务认领与执行回执**：认领有 token 门禁，心跳/检查点/交付/效果确认经唯一写入服务落 v2 事件流；断线期间执行端在本地保留待提交回执并暂停领取新写任务，恢复后按原幂等键补交，不重复生效。
+- **正向成套图纸入口与上报链**：已有 DESIGN/PLAN 可直接保存并做**技术审定激活**（零差异即可，不要求模型生成）；Agent 的阶段、执行回执、成果、证据与自检/独立审计都有正式 MCP 入口，重试幂等；用于「已验证」的检查绑定服务端实际读取的**有限源码清单**，被覆盖文件变化、删除或不可读即失效或转待复核。
 - **用量统计**：项目概览显示任务认领额度（运营节流，不是费用或成本硬限）与事件可配对的执行耗时；Token 与金额没有可核对来源，显式标「未计量」。
 - **私有事实（`.工作台/`）的显式备份与隔离恢复**：「项目信息」页里可按事件提交边界取一份一致备份（清单含格式与事件 schema 版本、截止提交序号、逐份内容哈希与证据清单；同一提交边界重复备份幂等），落点由你选且**必须在项目外**。恢复**只落在隔离目录**并逐项核验，塔台**不会自动替换当前数据**——替换与否由你本人决定。`.工作台/` 默认不进 Git，**被忽略或被提交都不等于已备份**。
 
 ### 1.1 MCP 工具面
 
-一个 MCP 接口接入所有 Agent，走 **stdio**（Agent 客户端主动拉起）。工具数以 `src/mcp/tools/index.ts` 的注册表为唯一来源（`pnpm verify:v09-05` 对账）。当前 22 个：
+一个 MCP 接口接入所有 Agent，走 **stdio**（Agent 客户端主动拉起）。工具数以 `src/mcp/tools/index.ts` 的注册表为唯一来源（`pnpm verify:v09-05` 对账）。当前 25 个：
 
 | 类别 | 工具 |
 | --- | --- |
 | 项目与接续 | `list_projects`、`select_project`、`project_entry`、`doctor` |
 | 任务与进度 | `list_tasks`、`report_task_status`、`update_progress`、`read_progress` |
 | 认领与回执 | `claim_task`、`submit_task_result`、`rebind_task` |
+| 执行与证据上报 | `report_execution`、`record_work_evidence` |
 | 设计书与待议 | `read_design`、`append_discuss` |
 | 图纸与图 | `get_arch`、`get_project_graphs` |
+| 图纸基线 | `manage_baseline`（`read`/`preserve`/`activate`，经唯一宿主） |
 | 需求 / 变更 / 施工定义 | `manage_requirement`、`manage_change`、`import_plan_definitions` |
 | 同步证据对账 | `register_sync_contract`、`scan_sync_evidence`、`read_sync_status` |
 | 模型相关 | `ask_flash`（**会调用模型**，内部可写概念补全层，不是保证无副作用的只读工具） |

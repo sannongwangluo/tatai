@@ -9,9 +9,10 @@
 //     这类对齐结论；不把两者揉成一个"完成度"。
 //
 // 本组件只读：唯一写口是「用户验收」，那在 AcceptanceView 里（§5.8 人工验收只由用户记录）。
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getPlan, type PlanPayload, type ProjectItem } from "../api";
 import { useProjectScope } from "../projectScope";
+import { useBoundedReloader, useProjectRefresh } from "../useProjectRefresh";
 
 /** 运行状态标签的显示色（只借色相区分进度，语义仍以文字为准；不着"完成绿"给未验证状态） */
 const EXECUTION_TONE: Record<string, string> = {
@@ -30,30 +31,48 @@ type DepFilter = "all" | "none" | "has" | "unreleased" | "attention";
 export function PlanView({ project }: { project: ProjectItem }) {
   const [plan, setPlan] = useState<PlanPayload | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
-  const [depFilter, setDepFilter] = useState<DepFilter>("all");
   const { scope, setBucket } = useProjectScope(project.id);
   const selected = scope.selections["plan"] ?? null;
+  // V09-26：筛选是"用户输入"，按项目隔离保存（切项目不串、刷新不丢，§3.1/§3.14）
+  const statusFilter = (scope.selections["plan:statusFilter"] as StatusFilter | undefined) ?? "all";
+  const depFilter = (scope.selections["plan:depFilter"] as DepFilter | undefined) ?? "all";
   const scrollRef = useRef<HTMLDivElement>(null);
   /** 项目 id 的镜像：回包落地前先问"还是不是发起那个项目"（§3.1 旧项目响应不许写进新界面） */
   const projectIdRef = useRef(project.id);
   projectIdRef.current = project.id;
 
-  useEffect(() => {
+  /** V09-26：换项目才清现场；**周期对账不清空**（否则后台刷新会把页面闪成"加载施工图…"） */
+  const loadedForRef = useRef<string | null>(null);
+  const load = useCallback((signal: AbortSignal): Promise<void> => {
     const id = project.id;
-    setPlan(null);
-    setLoadError(null);
-    getPlan(id)
+    if (loadedForRef.current !== id) {
+      loadedForRef.current = id;
+      setPlan(null);
+      setLoadError(null);
+      setLastSuccessAt(null);
+    }
+    return getPlan(id, { signal })
       .then((p) => {
-        if (projectIdRef.current !== id) return;
+        // 换项目/卸载时 signal 被 abort：旧项目（含 A→B→A 的晚到旧 A）回包一律丢弃（§3.1）
+        if (signal.aborted || projectIdRef.current !== id) return;
         setPlan(p);
+        setLoadError(null);
+        setLastSuccessAt(new Date().toISOString());
       })
       .catch((e: Error) => {
-        if (projectIdRef.current !== id) return;
-        setLoadError(e.message);
+        if (signal.aborted || projectIdRef.current !== id) return;
+        setLoadError(e.message); // 保留最后成功数据，只标陈旧
       });
-  }, [project.id, reloadTick]);
+  }, [project.id]);
+
+  // V09-26：统一自动对账——token 每轮前进就重取；有界在途，慢响应不会被丢弃。
+  const token = useProjectRefresh(project.id);
+  const reload = useBoundedReloader(project.id, load);
+  useEffect(() => {
+    reload();
+  }, [project.id, token, reloadTick, reload]);
 
   // 滚动位置按项目隔离（§3.1：切项目保留滚动位置）
   useEffect(() => {
@@ -110,7 +129,7 @@ export function PlanView({ project }: { project: ProjectItem }) {
 
   const excerpt = plan?.exists && selected !== null ? plan.excerpts[selected] ?? null : null;
 
-  if (loadError !== null) {
+  if (loadError !== null && plan === null) {
     return (
       <div className="w-full p-8" data-plan-view data-plan-load-error>
         <p className="text-sm text-red-400">施工图加载失败：{loadError}</p>
@@ -146,7 +165,26 @@ export function PlanView({ project }: { project: ProjectItem }) {
   }
 
   return (
-    <div className="flex min-h-0 w-full flex-1 flex-col" data-plan-view>
+    <div className="flex min-h-0 w-full flex-1 flex-col" data-plan-view data-plan-stale={loadError !== null ? "1" : "0"}>
+      {/* V09-26：读失败**保留最后成功数据**，只标陈旧与最近成功时间；恢复后自行清除 */}
+      {loadError !== null && (
+        <p
+          data-plan-stale-banner
+          data-plan-stale-at={lastSuccessAt ?? ""}
+          className="flex shrink-0 flex-wrap items-center gap-2 border-b border-amber-800/60 bg-amber-950/30 px-4 py-1 text-[11px] text-amber-200"
+        >
+          <span className="min-w-0 flex-1">
+            施工图读取失败：{loadError}（显示的是 {lastSuccessAt ?? "上次成功"} 读到的数据，不是最新事实；后台每 5 秒自动重试）
+          </span>
+          <button
+            data-plan-retry
+            onClick={() => setReloadTick((t) => t + 1)}
+            className="shrink-0 rounded border border-amber-600/50 px-2 py-0.5 text-amber-200 hover:bg-amber-500/20"
+          >
+            重试
+          </button>
+        </p>
+      )}
       {/* ── 头：来源 + 生效版本 + 定义/状态分离的说明 ── */}
       <header className="shrink-0 border-b border-neutral-800 px-4 py-2">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-400">
@@ -173,7 +211,7 @@ export function PlanView({ project }: { project: ProjectItem }) {
             <select
               data-plan-status-filter
               value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value)}
+              onChange={(e) => setBucket("selections", "plan:statusFilter", e.target.value)}
               className="ml-1 rounded border border-neutral-700 bg-neutral-900 px-1 py-0.5 text-neutral-200"
             >
               <option value="all">全部</option>
@@ -190,7 +228,7 @@ export function PlanView({ project }: { project: ProjectItem }) {
             <select
               data-plan-dep-filter
               value={depFilter}
-              onChange={(e) => setDepFilter(e.target.value as DepFilter)}
+              onChange={(e) => setBucket("selections", "plan:depFilter", e.target.value)}
               className="ml-1 rounded border border-neutral-700 bg-neutral-900 px-1 py-0.5 text-neutral-200"
             >
               <option value="all">全部</option>
@@ -256,6 +294,16 @@ export function PlanView({ project }: { project: ProjectItem }) {
                         ? ""
                         : ` · ${plan.definition_hashes[d.task_id].slice(0, 8)}`}
                     </span>
+                    {/* V09-26（§3.9/F4 可见性）：最后上报时间与推进者用 v2 现成字段，不猜漏报 */}
+                    {st !== undefined && (
+                      <span
+                        data-plan-card-updated
+                        className="rounded bg-neutral-950/60 px-1.5 py-0.5 text-neutral-400"
+                        title={`最后一条事件 ${st.updated_at} · 推进者 ${st.last_actor} · seq ${st.seq}`}
+                      >
+                        最后上报 {st.updated_at.slice(0, 19).replace("T", " ")} · {st.last_actor}
+                      </span>
+                    )}
                     {d.dependency_ids.length === 0 ? (
                       <span className="rounded bg-neutral-950/60 px-1.5 py-0.5 text-neutral-400">无依赖</span>
                     ) : (

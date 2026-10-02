@@ -7,11 +7,11 @@
 // 数据源：GET :id/discuss——塔台 = 抽取 repo 根 DESIGN.md 附录 B 区段（自举例外），
 // 其他项目 = <项目根>/.工作台/design.discuss.md。
 // ████████████████████████████ 红线 ████████████████████████████
-// 设计书【只读】：没有 contenteditable、没有任何「编辑设计书」入口（§3.5：设计书只有两条笔——
-// Flash 聊天落稿 / Max 审改）。待议记录【只追加】：本视图没有任何「编辑/删除待议」的接口或
+// 设计书【只读】：没有 contenteditable、没有任何「编辑设计书」入口（§3.5：设计稿由人或获授权的
+// 设计角色落稿/审改，不绑定固定模型）。待议记录【只追加】：本视图没有任何「编辑/删除待议」的接口或
 // 按钮——「追加待议」输入框是提疑权入口，不是编辑设计书，也不是编辑已有待议条目。
 // ███████████████████████████████████████████████████████████████
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { DesignDoc, DiscussDoc } from "../../server/workstation";
@@ -35,6 +35,15 @@ import {
   type DiscussionsPayload,
   type ProjectItem,
 } from "../api";
+// V09-28：正向成套图纸入口——基线摘要/保存/激活的 API（本卡新增，走既有 documents 路由的同一份判据）
+import {
+  getDocumentsSummary,
+  postActivateBaseline,
+  postPreserveDocument,
+  type DocumentsSummary,
+} from "../forwardApi";
+// V09-28：正向工作面共用的自动重取令牌（契约 F2；本页把 token 加进加载 effect 依赖即自动刷新）
+import { useBoundedReloader, useProjectRefresh } from "../useProjectRefresh";
 
 /** 待议处置动作的中文名（与服务端 DECISION_ACTION_LABELS 同口径；前端只渲染不推断状态） */
 const DECISION_LABEL: Record<string, string> = {
@@ -109,12 +118,75 @@ const mdComponents: Components = {
   hr: () => <hr className="my-4 border-neutral-800" />,
 };
 
+// ── V09-28：设计页输入的**按项目**现场（§3.14「刷新不丢草稿与动作回执」）──
+// 为什么单开一层而不直接 useState：本页接入自动重取（token 前进会触发重取）后，输入必须**按项目**
+// 保留、且在后台重取时**不被清掉**。这里按项目 id 分桶，镜像到 sessionStorage（刷新不丢草稿）；
+// 切项目各读各的，绝不把 A 项目正在写的待议/处置/审定说明带进 B 项目。
+interface DispositionInput {
+  reason: string;
+  taskId: string;
+  designRevision: string;
+}
+interface InputBucket {
+  discuss: string;
+  finalizeNote: string;
+  approver: string;
+  basis: string;
+  dispositions: Record<string, DispositionInput>;
+}
+const INPUT_BUCKETS = new Map<string, InputBucket>();
+const INPUT_MIRROR_PREFIX = "tatai.design.inputs.";
+
+function emptyBucket(): InputBucket {
+  return { discuss: "", finalizeNote: "", approver: "", basis: "", dispositions: {} };
+}
+
+function bucketOf(projectId: string): InputBucket {
+  const hit = INPUT_BUCKETS.get(projectId);
+  if (hit !== undefined) return hit;
+  let loaded = emptyBucket();
+  try {
+    const raw = sessionStorage.getItem(`${INPUT_MIRROR_PREFIX}${projectId}`);
+    if (raw !== null) loaded = { ...emptyBucket(), ...(JSON.parse(raw) as Partial<InputBucket>) };
+  } catch {
+    // 存不下就退回纯内存（§3.1：不为存现场把界面搞崩）
+  }
+  INPUT_BUCKETS.set(projectId, loaded);
+  return loaded;
+}
+
+function saveBucket(projectId: string, bucket: InputBucket): void {
+  INPUT_BUCKETS.set(projectId, bucket);
+  try {
+    sessionStorage.setItem(`${INPUT_MIRROR_PREFIX}${projectId}`, JSON.stringify(bucket));
+  } catch {
+    // 同上：尽力而为，绝不让界面因存储异常崩掉
+  }
+}
+
+function useInputBucket(projectId: string): [InputBucket, (patch: Partial<InputBucket>) => void] {
+  const [bucket, setBucket] = useState<InputBucket>(() => bucketOf(projectId));
+  useEffect(() => {
+    setBucket(bucketOf(projectId));
+  }, [projectId]);
+  const update = useCallback(
+    (patch: Partial<InputBucket>) => {
+      setBucket((prev) => {
+        const next = { ...prev, ...patch };
+        saveBucket(projectId, next);
+        return next;
+      });
+    },
+    [projectId],
+  );
+  return [bucket, update];
+}
+
 export function DesignView({ project }: { project: ProjectItem }) {
   const [doc, setDoc] = useState<DesignDoc | null>(null);
   const [discuss, setDiscuss] = useState<DiscussDoc | null>(null);
   const [reverseDraft, setReverseDraft] = useState<ReverseDraftDoc | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [postError, setPostError] = useState<string | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
@@ -122,7 +194,6 @@ export function DesignView({ project }: { project: ProjectItem }) {
   const [revBusy, setRevBusy] = useState(false);
   const [revError, setRevError] = useState<string | null>(null);
   const [gateStep, setGateStep] = useState<string>(GATE_STEPS[0].id);
-  const [finalizeNote, setFinalizeNote] = useState("");
   // V06-07 双文档链：第二份草稿（剩余施工）+ 第二份没生成出来时的如实原因
   const [planDraft, setPlanDraft] = useState<ReverseDraftDoc | null>(null);
   const [planDraftError, setPlanDraftError] = useState<string | null>(null);
@@ -134,46 +205,133 @@ export function DesignView({ project }: { project: ProjectItem }) {
   const [decideError, setDecideError] = useState<string | null>(null);
   const [deciding, setDeciding] = useState<string | null>(null);
 
-  // 切项目联动：project.id 一变就重取设计书 + 待议记录 + 逆向草稿（stale 守卫防串数据）；
-  // 追加待议/起草/定版成功后 bump reloadTick 走同一条路径刷新（塔台的 DESIGN.md 附录 B 也在正文里，一起重拉）
-  useEffect(() => {
-    let stale = false;
+  // V09-28：自动重取令牌（契约 F2）+ 失败保留最后成功数据（§3.14）
+  const refreshToken = useProjectRefresh(project.id);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
+  // V09-28：现有成套图纸的审定激活区状态（摘要、保存、激活各自一槽，互不遮蔽）
+  const [documents, setDocuments] = useState<DocumentsSummary | null>(null);
+  const [documentsError, setDocumentsError] = useState<string | null>(null);
+  const [baselineBusy, setBaselineBusy] = useState<null | "preserve-design" | "preserve-plan" | "activate">(null);
+  const [baselineError, setBaselineError] = useState<string | null>(null);
+  const [baselineNotice, setBaselineNotice] = useState<string | null>(null);
+  const [approvalKind, setApprovalKind] = useState<"delegated_technical_review" | "user_confirmed">(
+    "delegated_technical_review",
+  );
+  // V09-28：待议/定版/处置/审定输入按项目分桶——后台自动重取**不触碰**，切项目各读各的
+  const [inputs, patchInputs] = useInputBucket(project.id);
+  const draft = inputs.discuss;
+  const finalizeNote = inputs.finalizeNote;
+  const approver = inputs.approver;
+  const basis = inputs.basis;
+  const setDraft = (v: string): void => patchInputs({ discuss: v });
+  const setFinalizeNote = (v: string): void => patchInputs({ finalizeNote: v });
+  const setApprover = (v: string): void => patchInputs({ approver: v });
+  const setBasis = (v: string): void => patchInputs({ basis: v });
+
+  // ── 切项目联动（§3.14「切项目不串数据」）：换项目时旧项目的读数与失败标记**在渲染期**先归零 ──
+  // 不放在下面的 load effect 里做：effect 在提交之后才跑，换项目那一次提交会先把
+  // 「B 的项目名 + A 的正文 / A 的失败横幅 / A 的『最近成功』时间」画进 DOM（真浏览器 MutationObserver
+  // 能采到的至少一帧）。§3.14 要的是「一帧都不带过去」，所以用 React 官方的「prop 变化时在渲染期调整
+  // state」写法：立即重渲染，这一帧根本不提交。同一项目内的后台重取不经过这里，仍保留最后成功数据。
+  const [stateProjectId, setStateProjectId] = useState(project.id);
+  // 「当前项目是否已成功取到数据」的标记：**只在成功后**置成 project.id，换项目归零时清空。
+  // 首屏判定（见 load）用它、而不是在 load 开头就置位——否则 dev StrictMode 双挂载把第一遍 abort 掉后，
+  // 第二遍会误判成"已有数据"，把**无数据**的首屏失败错记成 refreshError；而 refreshError 只在有正文的
+  // 分支渲染，页面就永久停在「加载设计书…」：既不显原因、也没重试入口（无数据必须显式失败）。
+  const loadedProjectRef = useRef<string | null>(null);
+  // 正向基线动作（保存/激活）的**代际**：换项目或发起新动作都 +1；晚到的旧代回执/错误/finally 一律
+  // 丢弃，绝不把 A 的成功/失败提示或忙状态写到 B（A→B→A 的旧 A 回包也按代际丢弃，见下面两个 submit）。
+  const baselineGenRef = useRef(0);
+  if (stateProjectId !== project.id) {
+    setStateProjectId(project.id);
     setDoc(null);
     setDiscuss(null);
     setReverseDraft(null);
     setPlanDraft(null);
     setDispositions(null);
     setDecideError(null);
+    setDocuments(null);
+    setDocumentsError(null);
     setLoadError(null);
-    Promise.all([
-      getDesign(project.id),
-      getDiscuss(project.id),
-      getReverseDraft(project.id),
-      getReversePlanDraft(project.id),
-      getDiscussions(project.id),
-      getActiveBaseline(project.id),
+    setRefreshError(null);
+    setLastSuccessAt(null);
+    // 正向基线动作的现场也随项目归零：忙/回执/错误绝不跨项目（§3.14）。
+    setBaselineBusy(null);
+    setBaselineError(null);
+    setBaselineNotice(null);
+    // 数据与动作现场都作废 → 首屏判定与动作代际同时重置；旧代回包随后一律丢弃。
+    loadedProjectRef.current = null;
+    baselineGenRef.current += 1;
+  }
+
+  // V09-26：改用**严格有界在途**外壳——同一项目不 abort 在途请求（慢响应最终落地显示），换项目/卸载
+  // abort 旧请求并丢弃旧回包（A→B→A 也不会把旧 A 写进新 A）。此前每 5 秒的 stale 闭包会把 >5s 的
+  // 慢响应永远作废、并让请求并发堆积。
+  const load = useCallback((signal: AbortSignal): Promise<void> => {
+    // 换项目后的第一次加载＝该项目的**首屏**：失败要上错误页；已有数据后的对账失败只标陈旧、留旧数据。
+    // 归零已在上面的 stateProjectId 块（渲染期）做完，这里只决定"这次失败记到哪个槽"。
+    const firstScreen = loadedProjectRef.current !== project.id;
+    return Promise.all([
+      getDesign(project.id, { signal }),
+      getDiscuss(project.id, { signal }),
+      getReverseDraft(project.id, { signal }),
+      getReversePlanDraft(project.id, { signal }),
+      getDiscussions(project.id, { signal }),
+      getActiveBaseline(project.id, { signal }),
     ])
       .then(([d, dis, rd, pd, disp, base]) => {
-        if (!stale) {
-          setDoc(d);
-          setDiscuss(dis);
-          setReverseDraft(rd);
-          setPlanDraft(pd);
-          setDispositions(disp);
-          setBaseline(base.active === null ? null : {
-            baseline_id: base.active.baseline_id,
-            design_revision: base.active.design_revision.content_sha256,
-            plan_revision: base.active.plan_revision.content_sha256,
-          });
-        }
+        if (signal.aborted) return;
+        // 成功才登记「本项目已有数据」：此后同项目的对账失败按「陈旧横幅」处理，不再上错误页。
+        loadedProjectRef.current = project.id;
+        setDoc(d);
+        setDiscuss(dis);
+        setReverseDraft(rd);
+        setPlanDraft(pd);
+        setDispositions(disp);
+        setBaseline(base.active === null ? null : {
+          baseline_id: base.active.baseline_id,
+          design_revision: base.active.design_revision.content_sha256,
+          plan_revision: base.active.plan_revision.content_sha256,
+        });
+        // V09-26：失败标记**只在成功后清除**（否则每轮对账开头先清、失败再置回，横幅会闪）
+        setRefreshError(null);
+        // 首屏失败同样要在成功后清：loadError 只在换项目时清过一次，若不在这里清，
+        // 一次首屏断线（/design 首次 503）会把此后所有成功的自动重取永久挡在错误页后面
+        // ——F2「首屏断线→恢复必须自动显示，不需手刷」在此失效。恢复即清，不需要人点重试。
+        setLoadError(null);
+        setLastSuccessAt(new Date().toISOString());
       })
       .catch((e: Error) => {
-        if (!stale) setLoadError(e.message);
+        if (signal.aborted) return;
+        // 首屏失败上错误页；已有数据时的刷新失败只标陈旧，保留最后成功数据
+        if (firstScreen) setLoadError(e.message);
+        else setRefreshError(e.message);
       });
-    return () => {
-      stale = true;
-    };
-  }, [project.id, reloadTick]);
+  }, [project.id]);
+  const reload = useBoundedReloader(project.id, load);
+  useEffect(() => {
+    reload();
+  }, [project.id, reloadTick, refreshToken, reload]);
+
+  // V09-28：成套图纸摘要单独取——它失败只影响审定区，不拖垮设计书正文/待议的刷新。
+  // 换项目归零（documents/documentsError）统一在渲染期的 stateProjectId 块里做，这里不再各清一遍。
+  const loadDocs = useCallback((signal: AbortSignal): Promise<void> => {
+    return getDocumentsSummary(project.id, { signal })
+      .then((d) => {
+        if (signal.aborted) return;
+        setDocuments(d);
+        setDocumentsError(null); // 只在成功后清失败标记（同正文：失败保留原因，不每轮开头先清）
+      })
+      .catch((e: Error) => {
+        if (signal.aborted) return;
+        setDocumentsError(e.message);
+      });
+  }, [project.id]);
+  const reloadDocs = useBoundedReloader(project.id, loadDocs);
+  useEffect(() => {
+    reloadDocs();
+  }, [project.id, reloadTick, refreshToken, reloadDocs]);
 
   // 待议条目 = `- \` 开头的列表行（与后端 countDiscussEntries 同口径）；处置派生态按 discussion_ref 对齐
   const entries: DiscussionEntryView[] =
@@ -271,7 +429,7 @@ export function DesignView({ project }: { project: ProjectItem }) {
     }
   };
 
-  // B3：定版（§9.3：只能由人/Max 触发——本按钮就是人的确认动作）。
+  // B3：定版（§9.3：由人或获授权的设计角色触发——本按钮就是人的确认动作）。
   // gate_step 默认值是草稿的推断初值，人可改选后再点；确认后草稿转正 design.md +
   // Gate 按确认步设置 + 对账钩子落盘（A5 消费）。
   const submitFinalize = async () => {
@@ -424,30 +582,43 @@ export function DesignView({ project }: { project: ProjectItem }) {
           {entries.length}
         </span>
         <span className="text-xs text-amber-200/50">
-          提疑权（§3.5）：只能追加，不能修改/删除已有条目；改不改由人和 Max 决定
+          提疑权（§3.5）：只能追加，不能修改/删除已有条目；改不改由人/获授权的设计角色决定
         </span>
       </div>
       {entries.length === 0 ? (
         <p className="text-xs text-neutral-500">暂无待议记录。</p>
       ) : (
         <ul className="space-y-2">
-          {entries.map((e) => (
-            <DiscussEntryCard
-              key={`${e.ref.source}#${e.ref.index}`}
-              entry={e}
-              implementation={
-                dispositions === null
-                  ? null
-                  : dispositions.implementations[
-                      `${e.ref.source}\u001f${e.ref.index}\u001f${e.ref.content_sha256}`
-                    ] ?? null
-              }
-              baselineDesignRevision={baseline?.design_revision ?? ""}
-              busy={deciding !== null}
-              deciding={deciding}
-              onSubmit={submitDecision}
-            />
-          ))}
+          {entries.map((e) => {
+            const impl =
+              dispositions === null
+                ? null
+                : dispositions.implementations[
+                    `${e.ref.source}\u001f${e.ref.index}\u001f${e.ref.content_sha256}`
+                  ] ?? null;
+            const dkey = `${e.ref.source}\u001f${e.ref.index}`;
+            // V09-28：处置输入按项目分桶（切项目各读各的、后台重取不清）
+            const draftInput: DispositionInput =
+              inputs.dispositions[dkey] ?? {
+                reason: "",
+                taskId: impl?.task_id ?? "",
+                designRevision: baseline?.design_revision ?? "",
+              };
+            return (
+              <DiscussEntryCard
+                key={`${project.id}:${e.ref.source}#${e.ref.index}`}
+                entry={e}
+                implementation={impl}
+                draft={draftInput}
+                onDraftChange={(patch) =>
+                  patchInputs({ dispositions: { ...inputs.dispositions, [dkey]: { ...draftInput, ...patch } } })
+                }
+                busy={deciding !== null}
+                deciding={deciding}
+                onSubmit={submitDecision}
+              />
+            );
+          })}
         </ul>
       )}
       <form
@@ -483,10 +654,232 @@ export function DesignView({ project }: { project: ProjectItem }) {
     </section>
   );
 
+  // ── V09-28：现有成套图纸的审定激活区（§2.9）──
+  // 展示两源当前版本与生效基线；用户不必理解哈希内部细节（短标 + title 全文）。
+  const shortSha = (h?: string | null): string => (h === undefined || h === null ? "—" : `${h.slice(0, 12)}…`);
+  const baselineMatchesCurrent =
+    documents !== null &&
+    documents.baseline.active !== null &&
+    documents.design.exists &&
+    documents.plan.exists &&
+    documents.baseline.active.design_revision.content_sha256 === documents.design.content_sha256 &&
+    documents.baseline.active.plan_revision.content_sha256 === documents.plan.content_sha256;
+
+  const submitPreserve = async (kind: "design" | "plan"): Promise<void> => {
+    if (baselineBusy !== null) return;
+    // 代际：本次动作独占一代；换项目（渲染期归零块）或发起新动作都会 +1，之后本代回包一律丢弃。
+    const gen = ++baselineGenRef.current;
+    setBaselineBusy(kind === "design" ? "preserve-design" : "preserve-plan");
+    setBaselineError(null);
+    setBaselineNotice(null);
+    try {
+      const r = await postPreserveDocument(project.id, kind);
+      if (gen !== baselineGenRef.current) return; // 晚到旧代成功回执：不写到当前（很可能已是别的）项目
+      setBaselineNotice(`${kind === "design" ? "设计书" : "施工图"}已保存为不可变历史（${r.recovery.ref}）。`);
+      setReloadTick((t) => t + 1);
+    } catch (e) {
+      if (gen !== baselineGenRef.current) return; // 晚到旧代错误：同样不写到当前项目
+      setBaselineError((e as Error).message);
+    } finally {
+      // 旧代不得清掉新代（或新项目）的忙状态；换项目时忙状态已由渲染期归零块清掉。
+      if (gen === baselineGenRef.current) setBaselineBusy(null);
+    }
+  };
+
+  const submitActivate = async (): Promise<void> => {
+    if (baselineBusy !== null) return;
+    const kind = approvalKind;
+    const approvedBy = kind === "user_confirmed" ? "user" : approver.trim();
+    const basisText = basis.trim();
+    if (approvedBy === "") {
+      setBaselineError("请填写审定者（谁审定的要如实写）。");
+      return;
+    }
+    if (basisText === "") {
+      setBaselineError("请填写审定依据：没有依据的基线不可激活（§2.9）。");
+      return;
+    }
+    const designSha = documents?.design.content_sha256 ?? "";
+    const planSha = documents?.plan.content_sha256 ?? "";
+    if (documents === null || !documents.design.exists || !documents.plan.exists || designSha === "" || planSha === "") {
+      setBaselineError("设计书与施工图要同时在、且都能取到当前版本（半套图纸不能激活）。");
+      return;
+    }
+    // 代际：本次动作独占一代；换项目（渲染期归零块）或发起新动作都会 +1，之后本代回包一律丢弃。
+    const gen = ++baselineGenRef.current;
+    setBaselineBusy("activate");
+    setBaselineError(null);
+    setBaselineNotice(null);
+    try {
+      const r = await postActivateBaseline(project.id, {
+        approved_by: approvedBy,
+        approval_basis: basisText,
+        approval_kind: kind,
+        expected: { design_content_sha256: designSha, plan_content_sha256: planSha },
+      });
+      if (gen !== baselineGenRef.current) return; // 晚到旧代成功回执：不写到当前（很可能已是别的）项目
+      setBaselineNotice(
+        r.created
+          ? `已激活配套基线 ${r.baseline.baseline_id}（${kind === "user_confirmed" ? "用户确认" : "技术审定"}；只写基线，不写用户 Gate）。`
+          : `该配套版本已经生效（${r.baseline.baseline_id}），未重复新增。`,
+      );
+      setReloadTick((t) => t + 1);
+    } catch (e) {
+      if (gen !== baselineGenRef.current) return; // 晚到旧代错误：同样不写到当前项目
+      setBaselineError((e as Error).message);
+    } finally {
+      // 旧代不得清掉新代（或新项目）的忙状态；换项目时忙状态已由渲染期归零块清掉。
+      if (gen === baselineGenRef.current) setBaselineBusy(null);
+    }
+  };
+
+  const baselineSection = (
+    <section
+      data-baseline-panel
+      className="space-y-3 rounded border border-emerald-700/50 bg-emerald-950/20 p-4"
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="text-sm font-semibold text-emerald-300">现有成套图纸 · 审定与激活</h3>
+        <span className="text-xs text-emerald-200/50">
+          §2.9：已有 DESIGN/PLAN 直接审定激活——不调用模型、不要求产生差异、不经过逆向落稿
+        </span>
+      </div>
+      {documents === null ? (
+        <p data-baseline-loading className="text-xs text-neutral-500">
+          {documentsError === null ? "正在读取两份图纸…" : `读取两份图纸失败：${documentsError}`}
+        </p>
+      ) : (
+        <>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {([
+              ["设计书", documents.design, "design"],
+              ["施工图", documents.plan, "plan"],
+            ] as const).map(([label, d, kind]) => (
+              <div key={kind} data-baseline-source={kind} className="rounded border border-neutral-800 bg-neutral-950/50 p-2 text-xs">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-neutral-200">{label}</span>
+                  <span
+                    data-baseline-source-exists={kind}
+                    data-exists={d.exists ? "1" : "0"}
+                    className={d.exists ? "text-emerald-300" : "text-amber-300"}
+                  >
+                    {d.exists ? "已就位" : "缺失"}
+                  </span>
+                </div>
+                <div className="mt-1 text-neutral-400">
+                  源：<span className="break-all text-neutral-300">{d.source_path ?? "—"}</span>
+                </div>
+                <div className="text-neutral-400">
+                  版本：<span data-baseline-source-version={kind} title={d.content_sha256 ?? ""}>{shortSha(d.content_sha256)}</span>
+                </div>
+                <button
+                  type="button"
+                  data-baseline-preserve={kind}
+                  disabled={!d.exists || baselineBusy !== null}
+                  onClick={() => void submitPreserve(kind)}
+                  className="mt-1 rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-300 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  保存当前修订为不可变历史
+                </button>
+              </div>
+            ))}
+          </div>
+          <div
+            data-baseline-active={documents.baseline.active === null ? "none" : "present"}
+            className="rounded border border-neutral-800 bg-neutral-950/50 p-2 text-xs text-neutral-300"
+          >
+            {documents.baseline.active === null ? (
+              "当前还没有生效基线。"
+            ) : (
+              <>
+                生效基线{" "}
+                <span data-baseline-active-id className="font-mono">
+                  {documents.baseline.active.baseline_id}
+                </span>
+                （审定者 {documents.baseline.active.approved_by} ·{" "}
+                {documents.baseline.active.approval_kind === "user_confirmed" ? "用户确认" : "技术审定"} ·{" "}
+                {documents.baseline.active.active_at}）
+                {documents.design.exists && documents.plan.exists && !baselineMatchesCurrent ? (
+                  <span data-baseline-drift className="text-amber-300"> · 源已在激活后变化，需重新审定激活</span>
+                ) : null}
+              </>
+            )}
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <label className="space-y-1 text-xs text-neutral-400">
+              审定种类
+              <select
+                data-baseline-kind
+                value={approvalKind}
+                onChange={(e) => setApprovalKind(e.target.value as "delegated_technical_review" | "user_confirmed")}
+                className="w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-200 focus:border-emerald-500 focus:outline-none"
+              >
+                <option value="delegated_technical_review">技术审定（用户已委派的设计角色）</option>
+                <option value="user_confirmed">用户确认（我本人）</option>
+              </select>
+            </label>
+            <label className="space-y-1 text-xs text-neutral-400">
+              审定者
+              <input
+                data-baseline-approver
+                value={approvalKind === "user_confirmed" ? "user" : approver}
+                disabled={approvalKind === "user_confirmed"}
+                onChange={(e) => setApprover(e.target.value)}
+                placeholder="如 codex / gpt-6"
+                className="w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-200 placeholder:text-neutral-600 focus:border-emerald-500 focus:outline-none disabled:opacity-60"
+              />
+            </label>
+          </div>
+          <label className="block space-y-1 text-xs text-neutral-400">
+            审定依据（必填）
+            <textarea
+              data-baseline-basis
+              rows={2}
+              value={basis}
+              onChange={(e) => setBasis(e.target.value)}
+              placeholder="技术审定请引用可取回的委派/审定依据（用户原话、委派记录或审定记录）"
+              className="w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-200 placeholder:text-neutral-600 focus:border-emerald-500 focus:outline-none"
+            />
+          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              data-baseline-activate
+              disabled={baselineBusy !== null || !(documents.design.exists && documents.plan.exists)}
+              onClick={() => void submitActivate()}
+              className="rounded bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-neutral-950 hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {baselineBusy === "activate" ? "激活中…" : "审定并激活基线"}
+            </button>
+            <span className="text-xs text-neutral-500">只写配套基线：不写用户 Gate、不自动领取任务</span>
+          </div>
+          {baselineNotice && (
+            <p data-baseline-notice className="text-xs text-emerald-300">
+              {baselineNotice}
+            </p>
+          )}
+          {baselineError && (
+            <p data-baseline-error className="text-xs text-red-400">
+              {baselineError}
+            </p>
+          )}
+        </>
+      )}
+    </section>
+  );
+
   if (loadError) {
     return (
       <div className="mx-auto w-full max-w-3xl p-8">
         <p className="text-sm text-red-400">设计书加载失败：{loadError}</p>
+        <button
+          type="button"
+          data-design-retry
+          onClick={() => setReloadTick((t) => t + 1)}
+          className="mt-2 rounded border border-neutral-700 px-3 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
+        >
+          重试
+        </button>
       </div>
     );
   }
@@ -503,8 +896,8 @@ export function DesignView({ project }: { project: ProjectItem }) {
         <div className="space-y-2">
           <h2 className="text-lg font-semibold">{project.name} · 设计书</h2>
           <p className="text-sm text-neutral-500">
-            该项目还没有设计书。设计书只有两条笔（§3.5）：Flash 聊天里点「落稿」，或 Max 审改。
-            老项目也可以走逆向落稿（§9）：先让 Flash 起草雏形，人确认定版。
+            该项目还没有设计书。设计稿由会话中的人或获授权的设计角色落稿/审改（§3.5，不再绑定固定模型）。
+            老项目也可以走逆向落稿（§9）：先起草雏形，人确认定版。
           </p>
         </div>
         {reverseSection}
@@ -537,10 +930,24 @@ export function DesignView({ project }: { project: ProjectItem }) {
           </span>
         </div>
         <p className="text-xs text-neutral-500">
-          只读（§3.5：只有 Flash 落稿 / Max 审改两条笔）· 事实源：
+          只读（§3.5：设计稿由人或获授权的设计角色落稿/审改）· 事实源：
           <span className="break-all text-neutral-400">{doc.source}</span>
         </p>
+        {refreshError && (
+          <p data-design-refresh-error className="text-xs text-amber-300">
+            自动刷新失败，显示的是上次成功数据{lastSuccessAt === null ? "" : `（最近成功 ${lastSuccessAt}）`}：{refreshError}
+            <button
+              type="button"
+              data-design-refresh-retry
+              onClick={() => setReloadTick((t) => t + 1)}
+              className="ml-2 underline"
+            >
+              重试
+            </button>
+          </p>
+        )}
       </header>
+      {baselineSection}
       {discussSection}
       <article className="text-sm leading-6 text-neutral-200">
         <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
@@ -561,7 +968,8 @@ export function DesignView({ project }: { project: ProjectItem }) {
 function DiscussEntryCard({
   entry,
   implementation,
-  baselineDesignRevision,
+  draft,
+  onDraftChange,
   busy,
   deciding,
   onSubmit,
@@ -570,7 +978,9 @@ function DiscussEntryCard({
   implementation:
     | { task_id: string; execution_label: string | null; acceptance: string; implemented: boolean; note: string }
     | null;
-  baselineDesignRevision: string;
+  /** V09-28：处置输入由父组件按项目分桶持有（后台重取/切项目不丢），本卡受控渲染 */
+  draft: DispositionInput;
+  onDraftChange: (patch: Partial<DispositionInput>) => void;
   busy: boolean;
   deciding: string | null;
   onSubmit: (
@@ -581,9 +991,7 @@ function DiscussEntryCard({
     designRevision: string,
   ) => void;
 }) {
-  const [reason, setReason] = useState("");
-  const [taskId, setTaskId] = useState(implementation?.task_id ?? "");
-  const [designRevision, setDesignRevision] = useState(baselineDesignRevision);
+  const { reason, taskId, designRevision } = draft;
   const status = entry.disposition.status;
   const canSubmit = reason.trim() !== "" && !busy;
 
@@ -635,21 +1043,21 @@ function DiscussEntryCard({
           <input
             data-discuss-reason={entry.index}
             value={reason}
-            onChange={(ev) => setReason(ev.target.value)}
+            onChange={(ev) => onDraftChange({ reason: ev.target.value })}
             placeholder="处置理由（必填）"
             className="min-w-40 flex-1 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-[11px] text-neutral-200 placeholder:text-neutral-600"
           />
           <input
             data-discuss-related-task={entry.index}
             value={taskId}
-            onChange={(ev) => setTaskId(ev.target.value)}
+            onChange={(ev) => onDraftChange({ taskId: ev.target.value })}
             placeholder="关联任务卡号（采纳/替代要填）"
             className="w-44 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-[11px] text-neutral-200 placeholder:text-neutral-600"
           />
           <input
             data-discuss-related-revision={entry.index}
             value={designRevision}
-            onChange={(ev) => setDesignRevision(ev.target.value)}
+            onChange={(ev) => onDraftChange({ designRevision: ev.target.value })}
             placeholder="关联设计修订（可留空）"
             className="w-56 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-[11px] text-neutral-200 placeholder:text-neutral-600"
           />

@@ -43,7 +43,8 @@ import { AuditPathError, RemoteAuditLog, actionOfRequest, credentialKindOf, proj
 import { WriteModeController } from "./remote-write";
 import { remotePageHtml } from "./remote-page";
 import { createWorkHost } from "./workHost";
-import { readServiceDescriptor, WORK_TOKEN_HEADER } from "./work/service";
+import { descriptorPidAlive, readServiceDescriptor, WORK_TOKEN_HEADER } from "./work/service";
+import { descriptorBelongsTo, publishUnderOwnershipLock, removeDescriptorIfDead } from "./work/serviceOwnership";
 import { handleSyncStatusRoute } from "./work/syncHttp";
 import { startSyncDiscovery, stopSyncDiscovery } from "./work/syncDiscovery";
 import { onboardProject } from "./onboard";
@@ -167,7 +168,7 @@ import {
   type ActivateBaselineInput,
   type DocumentKind,
 } from "./work/documents";
-import { isWorkError, type WorkErrorCode } from "./work/types";
+import { isWorkError, WorkError, type WorkErrorCode } from "./work/types";
 // V06-08：施工图定义 + 运行状态（定义与状态分开给，界面不合并成"完成度"）与待议处置记录。
 // C-015 接线：本服务唯一的图纸导入点走受检导入（references.ts），与正式提交路径同一份引用判据
 import { taskDefinitionHash } from "./work/plan";
@@ -214,7 +215,7 @@ import {
 } from "./work/runtimeEntries";
 import {
   acceptanceDimensionOf,
-  checksFromAudit,
+  checksFromFacts,
   collectProjectFacts,
   dependencyRelease,
   objectsFromFacts,
@@ -760,6 +761,38 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       res.end(JSON.stringify({ ok: false, error: { code: "INTERNAL", message } }));
     });
   };
+  // V09-29 边界补修（契约 F3 尾段；ownership-review-remaining.md 第 1 条）：**直挂**的桌面写路由
+  // （`/documents/preserve|activate`、人工验收 `POST /api/projects/:id/acceptance`）不经 workHost 委派，
+  // 必须同样过"本进程是否唯一写宿主"这一关——否则接管失败、或描述符被别处覆盖后的桌面进程仍能经这些
+  // 本地路由直写事件账本/基线，成为第二写者。判据与 work 面同一份：描述符 pid + 本次令牌仍属本进程。
+  const refuseIfNotWriteOwner = (): boolean => {
+    if (descriptorBelongsTo(DATA_DIR, workHost.token)) return false;
+    res.statusCode = 503;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    res.end(
+      JSON.stringify({
+        ok: false,
+        error: {
+          code: "SERVICE_UNAVAILABLE",
+          message:
+            "本进程当前不是唯一写宿主（描述符不属于本进程）：写请求已拒绝，未写入任何字节。" +
+            "请把写请求指向当前写宿主，或稍后重试（DESIGN.md §2.6/§11.3）",
+        },
+      }),
+    );
+    return true;
+  };
+  // V09-29 慢 body 竞态：入口闸（refuseIfNotWriteOwner）挡不住"读 body 期间描述符易主"。直挂写路由经
+  // `withWs` **先读 body、后落盘**，所以必须在落盘前的回调内再查一次。这里抛结构化 WorkError
+  // （由 `wsFail` 映射 503），**不**在回调里直接写响应——否则 withWs 读完 body 又会第二次 res.end。
+  const assertWriteOwnerOrThrow = (): void => {
+    if (descriptorBelongsTo(DATA_DIR, workHost.token)) return;
+    throw new WorkError(
+      "SERVICE_UNAVAILABLE",
+      "本进程当前不是唯一写宿主（描述符已易主）：写请求已拒绝，未写入任何字节。" +
+        "请把写请求指向当前写宿主，或稍后重试（DESIGN.md §2.6/§11.3）",
+    );
+  };
   if (req.method === "POST" && reqPath === "/api/work/command") {
     replyWorkRoutes();
     return;
@@ -787,6 +820,29 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     return;
   }
   if (req.method === "GET" && reqPath === "/api/work/sync/status") {
+    replyWorkRoutes();
+    return;
+  }
+  // V09-29 集成：V09-27 上报域（证据正文存/读，`work/reportingHost.ts`）与 V09-28 正向基线
+  // （`work/baselineHost.ts`）此前只挂在 workHost 委派链上；桌面宿主 `index.ts` 是**逐条列名**转发，
+  // 未登记的精确路径落本文件兜底 404——于是 MCP 在桌面宿主下取不到证据正文写/读口。
+  // 下面四条按同一判据（**方法 + 精确路径**，`reqPath` 已去 query）登记，语义无误导：
+  // reporting 证据正文的存（POST）与读（GET）都经唯一写服务宿主，仍是 token 校验 + 项目根内不可变内容；
+  // baseline preserve/activate 经 `handleBaselineRequest`（documents 同一份判据、同一写者）。
+  // 错方法、多段路径、尾斜杠一律不命中（落 404），不是整段透传；四条同时登记进 `remote-routes.ts`。
+  if (req.method === "POST" && reqPath === "/api/work/reporting/evidence") {
+    replyWorkRoutes();
+    return;
+  }
+  if (req.method === "GET" && reqPath === "/api/work/reporting/evidence") {
+    replyWorkRoutes();
+    return;
+  }
+  if (req.method === "POST" && reqPath === "/api/work/baseline/preserve") {
+    replyWorkRoutes();
+    return;
+  }
+  if (req.method === "POST" && reqPath === "/api/work/baseline/activate") {
     replyWorkRoutes();
     return;
   }
@@ -1156,19 +1212,25 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     return;
   }
   if (req.method === "POST" && sub && sub[2] === "documents" && sub[3] === "preserve") {
+    if (refuseIfNotWriteOwner()) return;
     withWs((body) => {
       const input = body as Record<string, unknown>;
       const kind = String(input.kind ?? "");
       if (kind !== "design" && kind !== "plan") {
         throw new WsError("INVALID_INPUT", `kind 只接受 design/plan（收到 ${JSON.stringify(input.kind)}）`);
       }
+      // V09-29 慢 body 竞态：body 已到、实际保存不可变历史前再查一次写者身份（入口闸只管到 body 读之前）。
+      assertWriteOwnerOrThrow();
       return { ok: true, result: preserveDocumentRevision(decodePathSegment(sub[1]), kind) };
     });
     return;
   }
   if (req.method === "POST" && sub && sub[2] === "documents" && sub[3] === "activate") {
+    if (refuseIfNotWriteOwner()) return;
     withWs((body) => {
       const input = body as Record<string, unknown>;
+      // V09-29 慢 body 竞态：body 已到、实际写 baselines.jsonl 前再查一次写者身份（同上）。
+      assertWriteOwnerOrThrow();
       const expected =
         typeof input.expected === "object" && input.expected !== null
           ? (input.expected as ActivateBaselineInput["expected"])
@@ -1226,7 +1288,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       const pass1 = projectStatuses({
         objects: withAcceptance(objectsFromFacts(id, DATA_DIR, facts)),
         findings: facts.findings,
-        checks: checksFromAudit(facts.audit),
+        checks: checksFromFacts(facts),
         source_revision: facts.revisions,
         binding_segments: facts.binding_segments,
       });
@@ -1245,7 +1307,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       const projection = projectStatuses({
         objects: withAcceptance(objectsFromFacts(id, DATA_DIR, facts, { dependency_releases: releases })),
         findings: facts.findings,
-        checks: checksFromAudit(facts.audit),
+        checks: checksFromFacts(facts),
         source_revision: facts.revisions,
         binding_segments: facts.binding_segments,
       });
@@ -1412,7 +1474,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             })),
             evidence: manifest.map((m) => ({ evidence_id: m.evidence_id, intact: m.intact })),
             // 检查记录 = 自检 / 独立审计两类既有事件（复用 V06-09 的装配，不另造存储）
-            checks: checksFromAudit(facts.audit),
+            checks: checksFromFacts(facts),
             // 「哪些必需检查」= 任务定义里的验收项 + 完成证据要求（同一份口径的单一出处）
             required_checks_by_task: requiredChecksFromDefinitions(facts.definitions),
             // 用户接受单独一段（检查通过不得扩写成已验收）
@@ -1846,7 +1908,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       const pass1 = projectStatuses({
         objects: withAcceptance(objectsFromFacts(id, DATA_DIR, facts)),
         findings: facts.findings,
-        checks: checksFromAudit(facts.audit),
+        checks: checksFromFacts(facts),
         source_revision: facts.revisions,
         binding_segments: facts.binding_segments,
       });
@@ -1866,7 +1928,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       const projection = projectStatuses({
         objects: withAcceptance(objectsFromFacts(id, DATA_DIR, facts, { dependency_releases: releases })),
         findings: facts.findings,
-        checks: checksFromAudit(facts.audit),
+        checks: checksFromFacts(facts),
         source_revision: facts.revisions,
         binding_segments: facts.binding_segments,
       });
@@ -2040,6 +2102,8 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     return;
   }
   if (req.method === "POST" && acceptanceMatch) {
+    // 人工验收写 v2 事件账本（§5.8），与 work 面同一写者红线：不是当前唯一写宿主就不落盘。
+    if (refuseIfNotWriteOwner()) return;
     withWs((body) => {
       const id = decodePathSegment(acceptanceMatch[1]);
       const input = body as Record<string, unknown>;
@@ -3976,6 +4040,14 @@ const workHost = createWorkHost(DATA_DIR, {
   faults: process.env.TATAI_WORK_FAULT_SNAPSHOT === "1" ? { snapshot: "throw" } : undefined,
 });
 
+// V09-29 恢复保护（契约 F3 尾段）：接管握手的有界参数。握手应答很快（daemon 收到即答再收尾），
+// 超时只针对"慢/不可达宿主"；让位后的撤描述符要等 daemon 收尾（含在途扫描），故给足等待上限。
+// 上限内未确认让位、且对端 pid 仍活 → 不覆盖发布（宁可晚一拍，不造第二个写者）。
+const TAKEOVER_HANDSHAKE_TIMEOUT_MS = 4_000;
+const TAKEOVER_HANDSHAKE_ATTEMPTS = 3;
+const TAKEOVER_RELEASE_WAIT_TICKS = 75;
+const TAKEOVER_RELEASE_WAIT_MS = 200;
+
 const server = http.createServer((req, res) => {
   try {
     handleRequest(req, res);
@@ -4059,34 +4131,79 @@ void (async () => {
   // 不是 PORT/HOST 字面量（`PORT=0` 时两者不同）；MCP 进程按描述符找服务，没有描述符就是"未启动"。
   // V07-01（接管握手）：若写入服务正由独立 daemon 承载（agent 无头期被按需拉起），先请它让位——
   // 单写者经描述符交接：daemon 撤描述符后本进程再发布；交接窗口内 MCP 客户端走自愈重试不丢写。
-  // 对端不是 daemon（404/超时）就照常发布覆盖——陈旧描述符/死端口同样被本进程发布取代。
+  // **V09-29 恢复保护（契约 F3 尾段；runtime-observation.md）**：让位**未确认**且描述符所指进程
+  // **仍活**（含权限未知，保守算活）时**绝不覆盖发布**——宁可本进程不发布、如实报原因，也不在
+  // "慢但存活的宿主"（真实安装版 /health 读 15s 超时）旁造第二个写者；探活超时 ≠ 进程已停。
+  // 只有描述符指向的 pid **真死**（ESRCH）才当陈旧描述符清理后自愈发布。
+  let takeoverBlocked: { pid: number; reason: string } | null = null;
   try {
     const existing = readServiceDescriptor(DATA_DIR);
-    if (existing !== null) {
-      const res = await fetch(`http://${existing.host}:${existing.port}/api/work/admin/shutdown`, {
-        method: "POST",
-        headers: { [WORK_TOKEN_HEADER]: existing.token },
-        signal: AbortSignal.timeout(3000),
-      }).catch(() => null);
-      if (res !== null && res.ok) {
-        for (let i = 0; i < 15; i++) {
+    if (existing !== null && existing.pid !== process.pid) {
+      // 有界重试请它让位：慢宿主可能要更久才答；成功即停（daemon 收到 shutdown 会立刻应答再收尾）。
+      let handed = false;
+      let lastReason = "unreachable";
+      for (let attempt = 0; attempt < TAKEOVER_HANDSHAKE_ATTEMPTS && !handed; attempt += 1) {
+        const res = await fetch(`http://${existing.host}:${existing.port}/api/work/admin/shutdown`, {
+          method: "POST",
+          headers: { [WORK_TOKEN_HEADER]: existing.token },
+          signal: AbortSignal.timeout(TAKEOVER_HANDSHAKE_TIMEOUT_MS),
+        }).catch(() => null);
+        if (res !== null && res.ok) handed = true;
+        else lastReason = res === null ? "unreachable" : `http_${res.status}`;
+      }
+      if (handed) {
+        // 等它撤描述符（daemon 收尾含"等在途扫描真正终止"，可能慢于握手应答，故给足上限）。
+        for (let i = 0; i < TAKEOVER_RELEASE_WAIT_TICKS; i += 1) {
           if (readServiceDescriptor(DATA_DIR) === null) break;
-          await new Promise((resolve) => setTimeout(resolve, 200));
+          await new Promise((resolve) => setTimeout(resolve, TAKEOVER_RELEASE_WAIT_MS));
         }
+      }
+      const still = readServiceDescriptor(DATA_DIR);
+      if (still !== null && still.pid !== process.pid) {
+        if (descriptorPidAlive(still)) {
+          // 让位未确认且描述符所指进程**仍活**（含权限未知，保守算活）：**不覆盖**仍活不可达的宿主。
+          takeoverBlocked = { pid: still.pid, reason: handed ? "descriptor_not_released" : lastReason };
+        } else {
+          console.log(
+            `[tatai-server] 既有写入服务描述符指向已退出进程（pid ${still.pid}）——按陈旧描述符清理后自愈发布`,
+          );
+          removeDescriptorIfDead(DATA_DIR);
+        }
+      } else if (handed) {
         console.log("[tatai-server] 已接管写入服务（daemon 让位，描述符交接完成）");
       }
     }
   } catch (e) {
-    console.log(`[tatai-server] 写入服务接管握手未成（${e instanceof Error ? e.message : String(e)}），照常发布`);
+    console.log(`[tatai-server] 写入服务接管握手异常（${e instanceof Error ? e.message : String(e)}）——转为按所有权仲裁发布`);
   }
-  const workBound = server.address();
-  if (workBound && typeof workBound === "object") {
-    workHost.publish(workBound.port, workBound.address);
+  if (takeoverBlocked !== null) {
+    console.error(
+      `[tatai-server] 写入服务描述符指向**仍存活的宿主**（pid ${takeoverBlocked.pid}）但接管未确认（${takeoverBlocked.reason}）——` +
+        "**本进程不发布写入服务描述符**（不覆盖仍活不可达的宿主、不造第二个写者）；写者仍是那个进程。" +
+        "**本进程不再是唯一写宿主：一切有副作用的写请求（work 面 / documents 基线 / 人工验收）一律 503 拒绝、零字节落盘**" +
+        "（不再「照常提供本地写路由」——只发布不写不够，失败宿主仍会当第二写者）；只读读口照常；" +
+        "待该宿主退出或其可接管后再重启本进程完成接管",
+    );
+  } else {
+    const workBound = server.address();
+    if (workBound && typeof workBound === "object") {
+      // V09-29 恢复保护：冷启动/接管发布统一走**有界跨进程锁 + 存活核实**（只允许一个发布者）。
+      const arb = publishUnderOwnershipLock(DATA_DIR, () => workHost.publish(workBound.port, workBound.address));
+      if (!arb.published) {
+        console.error(
+          `[tatai-server] 未取得写入服务发布权（${arb.reason}${arb.lock_error === undefined ? "" : `：${arb.lock_error}`}，` +
+            `既有描述符 pid ${arb.existing?.pid ?? "无"}）——不发布、不启动后台发现；"` +
+            `本进程不是唯一写宿主，写请求同样 503 拒绝`,
+        );
+      } else {
+        // V09-23（DESIGN §2.10）：**在发布/确认描述符之后**才启动后台同步发现——退位候选不先扫；
+        // 桌面与独立 daemon 共用同一生命周期（daemon.ts 同样在 publish 后启动）。
+        // `startSyncDiscovery` 内部会复核描述符 `pid + token`，不是本进程就不启动（两宿主同一门槛），
+        // 运行期也会持续复核——失去所有权即停发现（不继续扫描写账）。
+        startSyncDiscovery({ service: workHost.service, dataDir: DATA_DIR, token: workHost.token });
+      }
+    }
   }
-  // V09-23（DESIGN §2.10）：**在发布/确认描述符之后**才启动后台同步发现——退位候选不先扫；
-  // 桌面与独立 daemon 共用同一生命周期（daemon.ts 同样在 publish 后启动）。
-  // `startSyncDiscovery` 内部会复核描述符 `pid === process.pid`，不是本进程就不启动（两宿主同一门槛）。
-  startSyncDiscovery({ service: workHost.service, dataDir: DATA_DIR });
   console.log(`[tatai-server] listening on http://${HOST}:${PORT} (${HOST === "127.0.0.1" ? "仅本机" : "⚠ 非回环地址"})`);
   console.log(`[tatai-server] data dir: ${resolveDataDir()}`);
   // Q66（2026-09-18 审计）：原子写会在被 kill 时留下 `<文件>.<pid>.<时间戳>.tmp` 残骸，全仓此前没有

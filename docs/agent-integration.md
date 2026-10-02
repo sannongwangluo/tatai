@@ -310,6 +310,17 @@ HTTP 读口：`GET /api/projects/:id/arch/dataflow`（只读，与 `get_arch` �
 结果不明（进程查不清 / 效果待核实）时 `blind_replay_blocked = true`：**不盲重放**；
 要往**同一个可写目录**派新执行，必须先有"停止已确认"，否则换隔离目录（`dispatchGuard`）。
 
+### 5.1 Agent 完整上报的 MCP 入口（V09-27／V09-28，契约 F3/F1，2026-10-02）
+
+- `report_execution`：上表事件链的 Agent 入口。每次带 `project_id` / `task_id` / `run_id` / `attempt_id` / `workspace` / `claim_token` / `change_id`（**只接当前认领持有人**），`op` 取 `start_requested|started|heartbeat|checkpoint|stop_requested|stopped|failed|delivered|effect_*`；`stopped` 必须带 `confirmation`（缺则 `STOP_NOT_CONFIRMED`），**心跳缺失不等于停机**。示例：`report_execution {op:"checkpoint", task_id:"T-1", run_id:"run-T-1-1", attempt_id:"att-T-1-1-…", workspace:".工作台/runs/T-1/1", claim_token:"…", change_id:"change-…", note:"改到一半", artifacts:["src/x.ts"]}`。
+- `record_work_evidence`：证据与审计的 Agent 入口。`op=store` 把证据正文交**唯一写服务宿主**落盘（不可变、内容寻址；`kind="source_manifest"` 时带 `source_manifest` 有限文件清单，服务端现读算哈希）；`op=read` 按 `sha256` 读回；另有 `submission`（成果登记）／`self_check`（作者自检）／`independent_audit`（审计者须≠作者、五视角覆盖）／`fix`／`retest`／`finding`。示例：`record_work_evidence {op:"store", role:"executor", kind:"self_check", summary:"自检输出", content:"…", binding:{revision_kind:"code", revision:"<sha>"}}`。**不暴露人工验收/用户接受风险**，也不接受 `role=user`。
+
+源清单按两步登记：先 `store`（`kind=source_manifest`、`source_manifest:[{path:"src/x.ts"}]`，载体绑定声明 `revision_kind=code`），取回 `evidence.source_manifest.fingerprint` 和 `evidence.sha256`；再登记自检/独审，用该指纹填 `binding.revision`、用该证据地址填检查项 `evidence_sha256`。载体登记时的版本标识只是自报，检查采用服务端现读得出的清单指纹。历史无清单记录保留，但不能据此宣称当前源码已验证。
+
+- `manage_baseline`：正向成套图纸入口。`op=read` 只读两份源与生效基线（零副作用）；`op=preserve` 存不可变历史；`op=activate` 用**已有**图纸做技术审定激活（固定 `delegated_technical_review`，须带两份源 `expected.{design,plan}_content_sha256` 与 `approved_by`/`approval_basis`；零差异、不调模型、不写用户 Gate）。示例：`manage_baseline {op:"activate", role:"designer", approved_by:"gpt-6", approval_basis:"技术审定", expected:{design_content_sha256:"…", plan_content_sha256:"…"}}`。
+
+四件事分开记：**阶段自报**（`report_task_status` 的 v2 `doing`/`blocked`/协调器 `ready`；`done` 不在这里写，走 `submit_task_result`）／**提交**（`submit_task_result`，带证据/认领/版本五查；相同请求重试拿回原回执 `duplicate=true`）／**执行回执**（`report_execution`）／**证据与审计**（`record_work_evidence`）。四类写一律经唯一写入服务转接，MCP 进程不自己追加事件（§2.6）。完整旅程（真 stdio MCP + 真 `index.ts`）见 `scripts/verify-forward-journey.ts`（`pnpm verify:forward-journey`）。
+
 ---
 
 ## 6. 不可启动路径（缺什么就报什么，不替用户选服务）

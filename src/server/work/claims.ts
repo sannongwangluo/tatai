@@ -957,6 +957,36 @@ export interface SubmitResultSuccess {
   next_required_reads: unknown[];
 }
 
+/** 数组字段的宽容读取（幂等内容比对用；非数组按空处理） */
+function strListOf(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+
+/**
+ * 一次"结果提交"的调用方意图是否与已落盘的原提交一致（幂等重试专用）。
+ * 只比**调用方能声明**的字段 + 派生但确定的 run/attempt：忽略服务端产出的 seq/时间戳与
+ * `meaning` 之类常量文案。发布/交付内容任一不同即视为另一次意图（不冒充重放）。
+ */
+function resultIntentMatches(existing: Record<string, unknown>, input: SubmitResultInput): boolean {
+  const normArr = (v: unknown): string[] => strListOf(v);
+  const normNull = (v: unknown): string | null => (typeof v === "string" && v !== "" ? v : null);
+  const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  return (
+    normNull(existing.claim_token) === normNull(input.claim_token) &&
+    normNull(existing.owner_id) === normNull(input.owner_id) &&
+    normNull(existing.owner_role) === input.role &&
+    JSON.stringify(normArr(existing.deliverables)) === JSON.stringify(normArr(input.deliverables)) &&
+    JSON.stringify(normArr(existing.evidence_refs)) === JSON.stringify(normArr(input.evidence_refs)) &&
+    sameJson(existing.verification ?? [], input.verification ?? []) &&
+    sameJson(existing.untested ?? [], input.untested ?? []) &&
+    sameJson(existing.known_issues ?? [], input.known_issues ?? []) &&
+    normNull(existing.diff_ref) === (input.diff_ref ?? null) &&
+    normNull(existing.result_revision) === (input.result_revision ?? null) &&
+    normNull(existing.ownership_basis) === (input.ownership_basis === undefined ? null : normNull(input.ownership_basis)) &&
+    sameJson(existing.runtime_entries ?? null, input.runtime_entries ?? null)
+  );
+}
+
 /**
  * 提交结果（重查五件事后再写）。任何一条查不过就**明确拒绝**并给重新读状态的入口；
  * 查过之后写 `task.result_submitted`（payload 带认领 token 与交付包字段，便于事后审计追溯）。
@@ -974,6 +1004,55 @@ export async function submitTaskResult(
   const state = readTaskStates(workDir).states[taskId] ?? null;
   if (state === null) {
     return failure("INVALID_COMMAND", `任务 ${taskId} 没有运行状态`, projectId, taskId, workDir);
+  }
+
+  // ①′ 幂等重试（V09-27／契约 F3）：响应丢失后**同一份结果请求**重发，必须拿回原提交的回执
+  // （`duplicate: true`），不能因为任务已经提交（版本已推进/状态已变）就先给 VERSION_CONFLICT /
+  // INVALID_COMMAND 把原成功回执丢掉。幂等键与下面将要提交的键**完全同一推导**；命中同一键时：
+  //   · 同内容 → 返回原事件回执（duplicate，无第二次效果）；
+  //   · 异内容 → IDEMPOTENCY_CONFLICT 明确拒绝（不冒充重放）。
+  // **新请求**（不同键）仍走下面的五查（版本/认领/租约/依赖/证据一条都不放宽）。
+  {
+    const retryKey = `${taskId}:task.result_submitted:${input.expected_revision + 1}:${input.change_id}:${input.claim_token}`;
+    const existing = readClaimEvents(workDir).find((e) => e.idempotency_key === retryKey);
+    if (existing !== undefined) {
+      if (existing.type !== "task.result_submitted" || existing.entity_id !== taskEntityId(taskId) || !resultIntentMatches(existing.payload, input)) {
+        return failure(
+          "IDEMPOTENCY_CONFLICT",
+          `提交幂等键 ${retryKey} 已用于另一份内容不同的结果（原事件 ${existing.type} ${existing.event_id}，seq ${existing.seq}）：` +
+            "同键一旦用过就不能换内容重发——要改结果请走协调器 reopen 建新 attempt，或换一次新认领",
+          projectId,
+          taskId,
+          workDir,
+          { current_revision: state.revision },
+        );
+      }
+      const next = deps.readNextAction === undefined ? null : deps.readNextAction(projectId, { role: input.role });
+      return {
+        ok: true,
+        receipt: {
+          ok: true,
+          event_id: existing.event_id,
+          seq: existing.seq,
+          entity_revision: existing.entity_revision,
+          received_at: existing.received_at,
+          duplicate: true,
+          projection: { state: "applied" },
+        },
+        claim_token: input.claim_token,
+        rechecks: {
+          revision: `（幂等重试）原提交已在账本里（seq ${existing.seq}），未重新校验新版本`,
+          dependencies: ["（幂等重试）不重新判依赖"],
+          claim: `（幂等重试）原提交的认领 token 与本次一致`,
+          lease: "（幂等重试）不重新判租约",
+          evidence: `（幂等重试）原提交的 ${strListOf(existing.payload.evidence_refs).length} 条证据引用`,
+          external_evidence_refs: [],
+        },
+        next_action: next?.next_action ?? null,
+        next_reasons: next?.reasons ?? [],
+        next_required_reads: next?.required_reads ?? [],
+      };
+    }
   }
 
   // ① 任务版本
@@ -1061,7 +1140,11 @@ export async function submitTaskResult(
           : {
               // 结果回执绑"状态所绑的那份定义"：回放状态里的定义级批次绑定再算哈希
               // （定义哈希含 change_id，现解析不带；不回放会与导入时哈希对不上——同 align 的回放口径）
-              definition_sha256: taskDefinitionHash({ ...def, change_id: state.definition_change_id }),
+              definition_sha256: taskDefinitionHash({
+                ...def,
+                change_id: state.definition_change_id,
+                requirement_ids: def.requirement_ids ?? state.definition_requirement_ids ?? null,
+              }),
               plan_revision: def.plan_revision ?? "",
             }),
         meaning: "执行者已提交结果；不表示审计通过或人工验收接受（DESIGN.md §5.4）",
@@ -1201,8 +1284,10 @@ export function checkEvidenceRefs(
 //   · **写边界同闸**：`verifyReopenCommand` 同时被本函数与唯一写入服务的 submit 边界调用——
 //     直连 `POST /api/work/command` 手写 `task.reopened` 不能旁路（C017「直连旁路」同类的防线）。
 
-/** 一条 reopen_basis 能不能取回（可取回 = null，否则是原因；逐条如实） */
-function reopenBasisEntryProblem(
+/** 一条 reopen_basis 能不能取回（可取回 = null，否则是原因；逐条如实）。
+ *  V09-27 起同一份判据也用于 `task.status_changed(status="ready")` 的解阻依据（`readiness_basis`），
+ *  故导出：解阻依据必须是可取回的项目根内相对路径 / `event:<id>` / 64 位证据哈希。 */
+export function reopenBasisEntryProblem(
   entry: string,
   events: readonly WorkEvent[],
   ctx: { projectRoot: string | null; workDir: string },
@@ -1512,6 +1597,295 @@ export async function reopenTask(
   } catch (e) {
     if (isWorkError(e) && e.code === "VERSION_CONFLICT") {
       return versionConflictFailure(e, projectId, taskId, workDir, "重开");
+    }
+    throw e;
+  }
+}
+
+// ── V09-27：可达上报链（doing / blocked / 协调器有依据解阻 ready；DESIGN.md §5.4/§6.7，契约 F3）──
+//
+// 为什么与 reopen 同族：阶段上报也是"改任务状态"的写命令，**预检 + 写边界必须同一份判据**
+// （`verifyTaskPhaseCommand` 同时被本模块的 `reportTaskPhase` 与唯一写入服务 `submit` 调用），
+// 直连通用写口手写"上报"命令也不能绕过。硬口径：
+//   · doing   → `task.status_changed(status="executing")`（从已认领进入执行中）
+//   · blocked → `task.blocked`（专用阻塞事件）带 reason
+//   · ready   → `task.status_changed(status="ready")`：**协调器专用** + 可取回依据（解阻）
+//   · done/todo 不在本函数：工具层把 `done` 引导到 `submit_task_result`，**禁止**把完成偷写成通过。
+//   · 上报命令一律带 `payload.report_phase`：写边界只核"显式上报"（迁移回放/释放/夹具的通用写不带它、
+//     逐字不受影响），Agent 上报的那条路径在服务边界被核死。
+
+/** 阶段上报 → 事件类型/状态（唯一映射表；`verifyTaskPhaseCommand` 与 `reportTaskPhase` 共用） */
+export const TASK_PHASE_EVENT = {
+  doing: { type: "task.status_changed", status: "executing" },
+  blocked: { type: "task.blocked", status: "blocked" },
+  ready: { type: "task.status_changed", status: "ready" },
+} as const;
+export type TaskPhaseReport = keyof typeof TASK_PHASE_EVENT;
+
+/** 阶段上报的幂等键（带 request_id 才走幂等短路；键里带任务与阶段，跨任务/跨阶段不串） */
+export function taskPhaseIdempotencyKey(taskId: string, phase: TaskPhaseReport, requestId: string): string {
+  return `${taskId}:task-report:${phase}:req:${requestId}`;
+}
+
+/** null/空串归一（幂等内容比对用；不把空串与缺省当成两份不同内容） */
+function strOrNullOf(v: unknown): string | null {
+  return typeof v === "string" && v.trim() !== "" ? v : null;
+}
+
+/**
+ * 阶段上报命令的核实（纯读判据，**reportTaskPhase 与唯一写入服务边界共用同一份**）。
+ * 逐条拒因进 `failures`（不合并成一句）；不是上报命令时返回 ok（不发表意见）。
+ *
+ * 作用域（关键，避免破坏既有写者）：只对**显式声明 `payload.report_phase`** 的上报命令核实——
+ * 唯一写入服务里手写 task.status_changed/task.blocked 的既有写者（迁移的历史状态回放、
+ * `claims.releaseClaim` 的带 `claim_released` 释放、验证夹具的通用状态写）都不带这个键，
+ * 因此逐字不受影响；而 Agent 上报链（`reportTaskPhase` → report_task_status/report_execution）
+ * 一律带上它，所以**Agent 上报的那条路径**在服务边界被同一份判据核实，直连写口冒充"上报"也绕不过。
+ */
+export function verifyTaskPhaseCommand(
+  events: readonly WorkEvent[],
+  cmd: { entity_id: string; type: string; role: string; actor_id: string; payload: Record<string, unknown> },
+  ctx: { projectRoot: string | null; workDir: string },
+): { ok: boolean; failures: string[]; state: TaskState | null } {
+  const failures: string[] = [];
+  const taskId = cmd.entity_id.startsWith("task:") ? cmd.entity_id.slice("task:".length) : cmd.entity_id;
+  const state = foldTaskStates([...events]).states[taskId] ?? null;
+  if (state === null) {
+    return {
+      ok: false,
+      failures: [`任务 ${taskId} 在当前事件现场里没有运行状态：阶段上报只接已导入定义的任务（未迁移项目 v1 行为不变）`],
+      state: null,
+    };
+  }
+  const p = cmd.payload;
+  // 只核"显式上报"：没有 report_phase 的命令（迁移/释放/夹具的通用写）不发表意见，行为逐字不变
+  const declared = typeof p.report_phase === "string" ? p.report_phase : "";
+  const phase: TaskPhaseReport | null =
+    declared === "doing" || declared === "blocked" || declared === "ready" ? declared : null;
+  if (phase === null) return { ok: true, failures: [], state };
+
+  if (state.cancelled) failures.push(`任务已取消（${state.cancel_reason ?? "无理由"}）：不能上报阶段`);
+
+  if (phase === "ready") {
+    if (cmd.role !== "coordinator") {
+      failures.push(
+        `解阻（status="ready"）是**协调器专用**动作：本次 role=${JSON.stringify(cmd.role)}，必须 coordinator` +
+          "（按原启动条件处理，DESIGN.md §5.4/§6.7）",
+      );
+    }
+    const basis = Array.isArray(p.readiness_basis)
+      ? (p.readiness_basis as unknown[]).filter((b): b is string => typeof b === "string" && b.trim() !== "")
+      : [];
+    if (basis.length === 0) {
+      failures.push(
+        "解阻必须带可取回依据 readiness_basis（≥1 条：项目根内相对路径 / event:<id> / 64 位证据哈希）：" +
+          "随便一句授权的话不构成解阻凭据（DESIGN.md §5.4）",
+      );
+    } else {
+      const problems = basis.map((b) => reopenBasisEntryProblem(b, events, ctx));
+      if (problems.every((x) => x !== null)) {
+        failures.push(
+          `解阻依据一条都取不回（${basis.map((b, i) => `${JSON.stringify(b)}：${problems[i]}`).join("；")}）——依据必须可取回（取不回即拒）`,
+        );
+      }
+    }
+    return { ok: failures.length === 0, failures, state };
+  }
+
+  // doing / blocked（已确认是显式上报）：必须带**当前认领**（持有者才能报自己那张卡的阶段）
+  const claimToken = typeof p.claim_token === "string" && p.claim_token.trim() !== "" ? p.claim_token.trim() : "";
+  const ownerId = typeof p.owner_id === "string" && p.owner_id.trim() !== "" ? p.owner_id.trim() : cmd.actor_id;
+  if (claimToken === "" || state.claim_token === null || state.claim_token !== claimToken) {
+    failures.push(
+      `上报 doing/blocked 必须带**当前认领 token**（现场 ${
+        state.claim_token === null ? "没有有效认领" : `${String(state.claim_token).slice(0, 12)}…`
+      }）：只有持有者能报自己那张卡的阶段（DESIGN.md §2.7/§6.5）`,
+    );
+  }
+  if (state.owner_id !== null && ownerId !== state.owner_id) {
+    failures.push(`持有者是 ${state.owner_id}，不是 ${ownerId}：不能替别人报阶段`);
+  }
+  if (state.status !== "claimed" && state.status !== "executing") {
+    failures.push(`任务当前是「${TASK_STATUS_LABELS[state.status]}」：doing/blocked 只从认领/执行中上报`);
+  }
+  if (phase === "blocked" && (typeof p.reason !== "string" || p.reason.trim() === "")) {
+    failures.push("阻塞上报必须给 reason（人话理由）：没有理由的阻塞不算留痕（DESIGN.md §5.4）");
+  }
+  return { ok: failures.length === 0, failures, state };
+}
+
+export interface TaskPhaseReportInput {
+  project_id: string;
+  task_id: string;
+  change_id: string;
+  phase: TaskPhaseReport;
+  role: string;
+  /** 操作者标识（写进事件 actor_id；doing/blocked 时也是 owner 预期值） */
+  actor_id: string;
+  /** 上报前读到的实体版本（与现场一致才写；project_entry 的 task_revision 用它） */
+  expected_revision: number;
+  /** doing/blocked 必填：本次认领 token */
+  claim_token?: string;
+  /** blocked 必填 / ready 必填：理由 */
+  reason?: string;
+  /** ready（解阻）必填：可取回依据 */
+  readiness_basis?: string[];
+  /** 稳定幂等键：带上后重复上报返回原回执，不产生第二次效果 */
+  request_id?: string;
+  occurred_at?: string;
+  /** 验证钩子：把"现在"固定下来（产品路径不传） */
+  now?: string;
+}
+
+export interface TaskPhaseReportSuccess {
+  phase: TaskPhaseReport;
+  type: string;
+  status: string;
+  /** true = 同一幂等键的重复上报：返回原事件回执，没有第二次效果 */
+  duplicate: boolean;
+  receipt: WorkReceipt;
+}
+
+/**
+ * 上报任务阶段（doing / blocked / ready）：核实全部通过后经唯一写入服务落事件。
+ * 任何一条查不过 ⇒ 明确拒绝 + **零写入**；本函数不产生任何执行事实、不写 Gate。
+ */
+export async function reportTaskPhase(
+  input: TaskPhaseReportInput,
+  submitter: ClaimSubmitter,
+  dataDir?: string,
+): Promise<ClaimOutcome<TaskPhaseReportSuccess>> {
+  const workDir = workDirOf(input.project_id, dataDir);
+  const projectId = input.project_id;
+  const taskId = input.task_id;
+  const events = readClaimEvents(workDir);
+  const ev = TASK_PHASE_EVENT[input.phase];
+  if (ev === undefined) {
+    return failure("INVALID_COMMAND", `未知阶段 ${JSON.stringify(input.phase)}：只接受 doing/blocked/ready`, projectId, taskId, workDir);
+  }
+  const requestId = (input.request_id ?? "").trim();
+
+  // 幂等短路（带了 request_id 才有）：同一幂等键已在本账本 ⇒ 返回原事件回执，不产生第二次效果
+  if (requestId !== "") {
+    const key = taskPhaseIdempotencyKey(taskId, input.phase, requestId);
+    const existing = events.find((e) => e.idempotency_key === key);
+    if (existing !== undefined) {
+      if (existing.type !== ev.type || existing.entity_id !== taskEntityId(taskId)) {
+        return failure(
+          "IDEMPOTENCY_CONFLICT",
+          `上报幂等键 ${key} 已被别的事件占用（${existing.type} ${existing.entity_id} seq ${existing.seq}）：换一个 request_id`,
+          projectId,
+          taskId,
+          workDir,
+        );
+      }
+      const p = existing.payload;
+      const sameIntent =
+        (strOrNullOf(p.reason) ?? null) === (input.reason?.trim() ?? null) &&
+        JSON.stringify(Array.isArray(p.readiness_basis) ? p.readiness_basis : []) ===
+          JSON.stringify((input.readiness_basis ?? []).map((b) => b.trim()).filter((b) => b !== "")) &&
+        (strOrNullOf(p.claim_token) ?? null) === (input.claim_token?.trim() ?? null);
+      if (!sameIntent) {
+        return failure(
+          "IDEMPOTENCY_CONFLICT",
+          `上报幂等键 ${key} 已用于另一份内容不同的上报（原事件 ${existing.event_id}，seq ${existing.seq}）：` +
+            "幂等键一旦用过就不能换内容重发——换一个 request_id 表达新意图",
+          projectId,
+          taskId,
+          workDir,
+        );
+      }
+      return {
+        ok: true,
+        duplicate: true,
+        phase: input.phase,
+        type: existing.type,
+        status: strOrNullOf(p.status) ?? "",
+        receipt: {
+          ok: true,
+          event_id: existing.event_id,
+          seq: existing.seq,
+          entity_revision: existing.entity_revision,
+          received_at: existing.received_at,
+          duplicate: true,
+          projection: { state: "applied" },
+        },
+      };
+    }
+  }
+
+  const state = readTaskStates(workDir).states[taskId] ?? null;
+  if (state === null) {
+    return failure(
+      "INVALID_COMMAND",
+      `任务 ${taskId} 在当前事件现场里没有运行状态：先导入施工定义（task.definition_imported）再上报阶段`,
+      projectId,
+      taskId,
+      workDir,
+    );
+  }
+  if (state.revision !== input.expected_revision) {
+    return failure(
+      "VERSION_CONFLICT",
+      `上报被拒：调用方声明的 expected_revision=${input.expected_revision}，当前实体版本是 ${state.revision}（有人先你一步改了这张卡）`,
+      projectId,
+      taskId,
+      workDir,
+      { current_revision: state.revision },
+    );
+  }
+
+  const payload: Record<string, unknown> = { status: ev.status, report_phase: input.phase };
+  if (input.reason !== undefined && input.reason.trim() !== "") payload.reason = input.reason.trim();
+  if (input.phase === "ready") {
+    payload.readiness_basis = (input.readiness_basis ?? []).map((b) => b.trim()).filter((b) => b !== "");
+  } else {
+    payload.claim_token = (input.claim_token ?? "").trim();
+    payload.owner_id = input.actor_id;
+    payload.owner_role = input.role;
+    payload.run_id = state.run_id;
+    payload.attempt_id = state.attempt_id;
+  }
+
+  const project = getProject(projectId, dataDir);
+  const verification = verifyTaskPhaseCommand(
+    events,
+    { entity_id: taskEntityId(taskId), type: ev.type, role: input.role, actor_id: input.actor_id, payload },
+    { projectRoot: project === undefined ? null : path.resolve(project.path), workDir },
+  );
+  if (!verification.ok) {
+    return failure(
+      "INVALID_COMMAND",
+      `上报被拒（${verification.failures.length} 项查不过）：${verification.failures.join("；")}。本次没有写入任何字节`,
+      projectId,
+      taskId,
+      workDir,
+      { current_revision: state.revision, failures: verification.failures },
+    );
+  }
+
+  try {
+    const receipt = await submitter.submit(
+      taskCommand({
+        project_id: projectId,
+        change_id: input.change_id,
+        task_id: taskId,
+        type: ev.type,
+        actor_id: input.actor_id,
+        role: input.role,
+        expected_revision: input.expected_revision,
+        idempotency_key:
+          requestId !== ""
+            ? taskPhaseIdempotencyKey(taskId, input.phase, requestId)
+            : `${taskId}:${ev.type}:${input.expected_revision + 1}:${input.change_id}`,
+        ...(input.occurred_at === undefined ? {} : { occurred_at: input.occurred_at }),
+        payload,
+      }),
+    );
+    return { ok: true, phase: input.phase, type: ev.type, status: ev.status, duplicate: receipt.duplicate, receipt };
+  } catch (e) {
+    if (isWorkError(e) && e.code === "VERSION_CONFLICT") {
+      return versionConflictFailure(e, projectId, taskId, workDir, "上报");
     }
     throw e;
   }

@@ -37,7 +37,7 @@ import {
 } from "./budget";
 import { foldChanges, changeIdsOf } from "./changes";
 import { assertIntentSourceValid, foldRequirements, requirementIdsOf } from "./requirements";
-import { REVISION_KINDS, type RevisionKind } from "./evidence";
+import { REVISION_KINDS, type EvidenceBlob, type EvidenceInput, type RevisionKind } from "./evidence";
 import {
   gateClaimedPass,
   isVerificationSubject,
@@ -97,6 +97,10 @@ import {
 } from "./sync";
 import "./syncGraph";
 import { runSyncScanForRequest } from "./syncDiscovery";
+// V09-27（DESIGN.md §2.6/§5.4；契约 F3）：上报域宿主操作（不可变证据正文的存/读）与
+// `task.blocked`/`task.status_changed` 上报命令的写边界核实——与 MCP 工具层同一份判据。
+import { handleReportingRequest, isReportingRoute } from "./reportingHost";
+import { verifyTaskPhaseCommand } from "./claims";
 import type { SyncStatusReport } from "../../shared/syncEvidence";
 
 // ── 项目 → work 目录（路径只走注册表；未知项目按 INVALID_COMMAND 拒，不猜路径）──
@@ -461,15 +465,34 @@ export interface WorkServiceOptions {
    * 这条现场只能靠注入制造——`snapshot: "throw"` 让投影步骤抛错，事件本身照常已落盘。
    */
   faults?: { snapshot?: "throw" };
+  /**
+   * V09-29 边界补修（慢 body 竞态）：**实际落盘前再查一次写者身份**的闸。
+   * HTTP 写请求的 body 可能慢到达——请求开始时宿主有效，body 到达前描述符已经易主；只在进入
+   * `handle` 时查一次所有权是 TOCTOU。唯一写宿主（`workHost.ts`）注入描述符判据（pid + 本次令牌），
+   * `submit()`/`repair()` 在**各自实际锁内提交前**调用；离线库测试不传 → 保留"库内可直接写"语义。
+   * 回调不是当前写者时应抛 `WorkError("SERVICE_UNAVAILABLE", …)`（被拒命令零字节落盘）。
+   */
+  assertWriteOwnership?: () => void;
 }
 
 export class WorkService {
   private readonly dataDir: string;
   private readonly faults: WorkServiceOptions["faults"];
+  private readonly assertWriteOwnership?: () => void;
 
   constructor(opts: WorkServiceOptions) {
     this.dataDir = opts.dataDir;
     this.faults = opts.faults;
+    this.assertWriteOwnership = opts.assertWriteOwnership;
+  }
+
+  /**
+   * 落盘前再查一次写者身份（未配置回调 = 不查，离线库路径）。非当前写者时由回调抛
+   * `SERVICE_UNAVAILABLE`。`submit`/`repair` 在**实际锁内**调用它，堵住"慢 body 期间描述符易主"的
+   * TOCTOU：判据（描述符 pid + 令牌）只有一份，收在唯一写宿主注入的回调里。
+   */
+  assertWriteOwner(): void {
+    if (this.assertWriteOwnership) this.assertWriteOwnership();
   }
 
   /**
@@ -517,6 +540,10 @@ export class WorkService {
       cmd.type === "task.claimed" && cmd.payload?.claim_action !== "renew" ? prepareClaimSyncGate({ cmd, dataDir: this.dataDir, workDir }) : null;
 
     return withFileLock(eventsPath(workDir), () => {
+      // V09-29 慢 body 竞态：进锁后、任何读取/写入之前**再查一次所有权**——请求头到达时宿主有效，
+      // body 到达前描述符可能已经易主；只在 handle 入口查一次是 TOCTOU。非当前写者在此抛
+      // SERVICE_UNAVAILABLE，零字节落盘（含幂等重放路径也不会给出"成功"假象）。
+      this.assertWriteOwner();
       const { events, tail } = loadEvents(workDir);
       // 半截尾（上次写到一半被杀）先隔离记录再继续——绝不粘行
       if (tail) recoverTail(workDir);
@@ -752,6 +779,27 @@ export class WorkService {
         assertSyncEvidenceWriteCommand({ events, cmd, dataDir: this.dataDir, workDir, prep: syncEvidencePrep! });
       }
 
+      // ②ⅹ 上报命令的写边界核实（V09-27／契约 F3）：`task.blocked` 与 `task.status_changed`（doing=executing /
+      // blocked / ready 解阻）与 MCP 工具层 `report_task_status` 用**同一份** `verifyTaskPhaseCommand`——
+      // 直连通用写口手写这些命令不能绕过认领/持有者/协调器角色/解阻依据校验。核实不通过一律拒绝且零字节；
+      // 已有写者（迁移的历史状态回放、`claims.releaseClaim` 的带 `claim_released` 释放）不受影响
+      // （判据只对"带认领绑定的上报"与"非释放的解阻"生效，见 verifyTaskPhaseCommand 顶部注释）。
+      if (cmd.type === "task.blocked" || cmd.type === "task.status_changed") {
+        const proj = getProject(cmd.project_id, this.dataDir);
+        const phaseVerify = verifyTaskPhaseCommand(
+          events,
+          { entity_id: cmd.entity_id, type: cmd.type, role: cmd.role, actor_id: cmd.actor_id, payload: cmd.payload ?? {} },
+          { projectRoot: proj === undefined ? null : path.resolve(proj.path), workDir },
+        );
+        if (!phaseVerify.ok) {
+          throw new WorkError(
+            "INVALID_COMMAND",
+            `上报核实不通过，拒绝提交 ${cmd.type}（${cmd.entity_id}）：${phaseVerify.failures.join("；")}。本次命令没有写入任何字节`,
+            { reason: "task_phase_verification_failed", entity_id: cmd.entity_id, type: cmd.type, failures: phaseVerify.failures },
+          );
+        }
+      }
+
       // ③ 追加并持久化（fsync 后才回执）
       const receivedAt = nowIso();
       const event: WorkEvent = {
@@ -850,7 +898,11 @@ export class WorkService {
   /** 重放修复：以事件为事实源重建快照（投影失败的唯一修复入口） */
   repair(projectId: string): WorkSnapshotRead {
     const workDir = resolveWorkDir(projectId, this.dataDir);
-    withFileLock(eventsPath(workDir), () => rebuildSnapshot(workDir, projectId));
+    withFileLock(eventsPath(workDir), () => {
+      // V09-29 慢 body 竞态：重建快照会写 state.json，同样在锁内落盘前再查一次写者身份。
+      this.assertWriteOwner();
+      rebuildSnapshot(workDir, projectId);
+    });
     return this.readSnapshot(projectId);
   }
 
@@ -1024,6 +1076,16 @@ export async function handleWorkRequest(
   }
 
   try {
+    // V09-27（§2.6/§5.4）：上报域宿主操作（不可变证据正文的存/读）——与描述符/唯一写者同源，
+    // 在同一 token 校验之后委派；stdio MCP 拿到的正文由**宿主**落盘，不自己写项目目录。
+    if (isReportingRoute(ctx.pathname)) {
+      return await handleReportingRequest(req, res, {
+        pathname: ctx.pathname,
+        dataDir: ctx.service.info().data_dir,
+        // V09-29 慢 body 竞态：body 到达后、实际落盘前由上报域再查一次写者身份（描述符 pid + 令牌）。
+        assertWriteOwnership: () => ctx.service.assertWriteOwner(),
+      });
+    }
     if (method === "GET" && ctx.pathname === "/api/work/health") {
       sendJson(res, 200, { ok: true, ...ctx.service.info() });
       return true;
@@ -1270,14 +1332,90 @@ export class WorkServiceClient {
   }
 
   /**
+   * V09-27（DESIGN.md §2.6/§5.4）：把**证据正文**交给唯一写服务宿主落盘（内容寻址、不可变、读时复核哈希）。
+   * 与描述符/唯一写者同源；服务不可达先自愈一次，仍不可达抛 SERVICE_UNAVAILABLE——
+   * **绝不**在 stdio 进程本地写项目目录（那会造出第二个写者）。
+   */
+  async saveEvidence(projectId: string, input: EvidenceInput): Promise<EvidenceBlob> {
+    const body = JSON.stringify({ project_id: projectId, ...input });
+    const doPost = async (desc: WorkServiceDescriptor): Promise<Response | null> => {
+      try {
+        return await fetch(`http://${desc.host}:${desc.port}/api/work/reporting/evidence`, {
+          method: "POST",
+          headers: { "content-type": "application/json", [WORK_TOKEN_HEADER]: desc.token },
+          body,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch {
+        return null;
+      }
+    };
+    let desc = readServiceDescriptor(this.dataDir);
+    if (!desc) {
+      desc = await this.ensureWorkService();
+      if (desc === null) throw new WorkError("SERVICE_UNAVAILABLE", "证据正文只能由唯一写服务宿主落盘：服务未启动且按需拉起未果", { data_dir: this.dataDir });
+    }
+    let res = await doPost(desc);
+    if (res === null) {
+      const recovered = await this.ensureWorkService();
+      if (recovered !== null) res = await doPost(recovered);
+      if (res === null) throw new WorkError("SERVICE_UNAVAILABLE", `证据正文写口不可达（${desc.host}:${desc.port}）：fetch failed`, { host: desc.host, port: desc.port });
+    }
+    const payload = (await res.json().catch(() => null)) as
+      | { code?: WorkErrorCode; message?: string; detail?: Record<string, unknown>; evidence?: EvidenceBlob }
+      | null;
+    if (!res.ok) throw new WorkError((payload?.code ?? "SERVICE_UNAVAILABLE") as WorkErrorCode, payload?.message ?? `证据写口返回 HTTP ${res.status}`, payload?.detail ?? {});
+    return payload?.evidence as EvidenceBlob;
+  }
+
+  /** V09-27：从唯一写服务宿主读回证据正文（读时同一份哈希复核；宿主不可达抛 SERVICE_UNAVAILABLE，不本地兜底） */
+  async readEvidenceRemote(projectId: string, sha256: string): Promise<EvidenceBlob> {
+    const doGet = async (desc: WorkServiceDescriptor): Promise<Response | null> => {
+      try {
+        return await fetch(
+          `http://${desc.host}:${desc.port}/api/work/reporting/evidence?project_id=${encodeURIComponent(projectId)}&sha256=${encodeURIComponent(sha256)}`,
+          { headers: { [WORK_TOKEN_HEADER]: desc.token }, signal: AbortSignal.timeout(this.timeoutMs) },
+        );
+      } catch {
+        return null;
+      }
+    };
+    const desc = readServiceDescriptor(this.dataDir);
+    if (!desc) throw new WorkError("SERVICE_UNAVAILABLE", "证据正文只能由唯一写服务宿主读回：服务未启动（没有描述符）", { data_dir: this.dataDir });
+    const res = await doGet(desc);
+    if (res === null) throw new WorkError("SERVICE_UNAVAILABLE", `证据读口不可达（${desc.host}:${desc.port}）：fetch failed`, { host: desc.host, port: desc.port });
+    const payload = (await res.json().catch(() => null)) as
+      | { code?: WorkErrorCode; message?: string; detail?: Record<string, unknown>; evidence?: EvidenceBlob }
+      | null;
+    if (!res.ok) throw new WorkError((payload?.code ?? "SERVICE_UNAVAILABLE") as WorkErrorCode, payload?.message ?? `证据读口返回 HTTP ${res.status}`, payload?.detail ?? {});
+    return payload?.evidence as EvidenceBlob;
+  }
+
+  /**
    * 唯一写入服务自愈（V07-01）：探活 → 清陈旧描述符（pid 已死）→ 按需拉起独立写入服务
    * （detached daemon）→ 等健康。`TATAI_NO_AUTOSTART=1` 关自愈闸（排查用）。绝不本地代写。
+   *
+   * V09-29 边界补修（契约 `docs/forward-progress-contract.md` F3 尾段；DESIGN.md §2.6/§11.3；
+   * ownership-review-remaining.md 第 2、4 条）：探活超时 ≠ 进程已停。
+   *   ① 探活失败但描述符所指 pid **仍活**（含权限未知，保守算活）→ 返回 null，**绝不**再拉起第二个写者；
+   *   ② 描述符**在场但读不出/坏**（`readServiceDescriptor` 把读失败吞成 null，但文件确实在）→ 所有权未知，
+   *      同样返回 null，**不**把它当不存在去 spawn（那会尝试冷启动覆盖不明所有权）；
+   *   ③ 只有描述符指向的 pid **真死**（ESRCH）才清陈旧描述符后自愈拉起。
+   * 现场见 `.工作台/evidence/progress-loop-20261002/runtime-observation.md`。
    */
   async ensureWorkService(): Promise<WorkServiceDescriptor | null> {
     const alive = await this.probe();
     if (alive.available && alive.descriptor !== null) return alive.descriptor;
     const stale = readServiceDescriptor(this.dataDir);
-    if (stale !== null && descriptorPidDead(stale)) removeServiceDescriptor(this.dataDir);
+    if (stale !== null && descriptorPidDead(stale)) {
+      const { removeDescriptorIfDead } = await import("./serviceOwnership");
+      removeDescriptorIfDead(this.dataDir);
+    }
+    // 描述符所指进程仍活（探活只是不可达/超时）→ 不另起写者，写者身份留给仍存活的进程
+    const stillAlive = readServiceDescriptor(this.dataDir);
+    if (stillAlive !== null && stillAlive.pid !== process.pid && descriptorPidAlive(stillAlive)) return null;
+    // 描述符文件在场但解析不出（坏/形状不对/读失败）→ 所有权未知，保守不 spawn（不当它不存在）
+    if (stillAlive === null && fs.existsSync(serviceDescriptorPath(this.dataDir))) return null;
     if (!this.autostart) return null;
     if (!spawnWriteService(this.dataDir)) return null;
     for (let i = 0; i < 25; i++) {

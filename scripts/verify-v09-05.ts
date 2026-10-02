@@ -369,13 +369,13 @@ const m2Src = read(path.join(REPO, "scripts", "verify-m2.ts"));
 // 2026-09-30（V09-23 同步域收口）：`verify-m2.ts` 新增分组常量 `V0923_TOOLS`（同步证据域三接口，
 // 注册表 19 → 22）。本清单是"分组名的唯一来源"，按同一口径补一个分组名——判据未放宽（仍是
 // 各组非空 + 合计恰好 == 注册表 + 逐个成员在注册表内；不动态从注册表生成期望）。
-const m2Groups = ["EXPECTED", "M5_TOOLS", "V0610_TOOLS", "C015_TOOLS", "V0702_TOOLS", "V0704_TOOLS", "V0919_TOOLS", "V0923_TOOLS"];
+const m2Groups = ["EXPECTED", "M5_TOOLS", "V0610_TOOLS", "C015_TOOLS", "V0702_TOOLS", "V0704_TOOLS", "V0919_TOOLS", "V0923_TOOLS", "V0927_TOOLS"];
 const m2Names = m2Groups.flatMap((g) => extractArray(m2Src, g));
 ok(
   m2Groups.every((g) => extractArray(m2Src, g).length > 0) &&
     m2Names.length === toolNames.length &&
     m2Names.every((n) => toolSet.has(n)),
-  `③ verify:m2 的分组点名清单（${m2Names.length} 个：一期 8 + 扩充 2 + V06-10 三件套 + C-015 三件套 + rebind_task + doctor + V09-19 六图读口 + V09-23 同步域三接口）与注册表互等——多 ${m2Names
+  `③ verify:m2 的分组点名清单（${m2Names.length} 个：一期 8 + 扩充 2 + V06-10 三件套 + C-015 三件套 + rebind_task + doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口）与注册表互等——多 ${m2Names
     .filter((n) => !toolSet.has(n))
     .join("/") || "无"}／缺 ${toolNames.filter((n) => !m2Names.includes(n)).join("/") || "无"}`,
 );

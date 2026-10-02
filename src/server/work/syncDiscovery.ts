@@ -2,7 +2,9 @@
 //
 // 硬口径（契约定版 + design-review findings E）：
 //   ① **唯一写服务确认后才扫**：桌面后端（index.ts）与独立 daemon（daemon.ts）都在**发布描述符之后**调用
-//      `startSyncDiscovery`，本模块再**读描述符复核 `pid === process.pid`** 才启动；退位候选/接管窗口不先扫。
+//      `startSyncDiscovery`，本模块再**读描述符复核 `pid === process.pid`（给了令牌还要令牌对）**才启动；
+//      退位候选/接管窗口不先扫。**运行期也持续复核**（V09-29 恢复保护）：描述符一旦易主就停发现，
+//      旧宿主失去描述符不得继续发现扫描写账。
 //   ② **共用同一逻辑与单飞队列**：后台自动扫描与显式 `scan_sync_evidence` 都走 `requestSyncScan`
 //      （单飞 key = 规范 dataDir + projectId，避免多数据目录/隔离夹具串味），真正唯一写口仍是 `WorkService.submit`。
 //   ③ **有界增量、不静默**：项目数上限 `SYNC_MAX_PROJECTS`（达上限报 incomplete 及原因）；收件目录按
@@ -115,6 +117,12 @@ interface DiscoveryRuntime {
   service: SyncSubmitter;
   /** 规范 dataDir */
   dataDir: string;
+  /**
+   * 启动时持有的描述符令牌（V09-29 恢复保护）。非 null 时后台每次扫描/轮询都要复核
+   * `pid + token` 仍是本进程——描述符一旦易主就停发现，**旧宿主失去描述符不得继续扫描写账**。
+   * null = 旧调用方（仅按 pid 复核，保持兼容）。
+   */
+  ownerToken: string | null;
   projects: Map<string, ProjectWatch>;
   registryWatcher: FSWatcher | null;
   registryTimer: NodeJS.Timeout | null;
@@ -237,10 +245,43 @@ function inboxFingerprint(root: string): { fp: string; count: number; overflow: 
   return { fp: `${digest.digest("hex")}#${count}`, count, overflow, error: null };
 }
 
+// ── 所有权复核（V09-29 恢复保护：旧宿主失去描述符即停发现，不再扫描写账） ──
+
+/**
+ * 本宿主是否已失去唯一写服务描述符所有权。
+ *   · 有 `ownerToken`：描述符必须仍是本进程 + 同一令牌；被别的宿主覆盖即失去；
+ *   · 无令牌（旧调用方）：仅按 pid 复核（与 `startSyncDiscovery` 的启动门槛一致）。
+ * 读不出描述符（缺/坏）按**未持有**处理（写者身份由描述符承载，没有它就不是当前写作方）；
+ * 但读盘异常（抛错）按**未失去**处理——不因一次读失败误停后台发现，下一轮再判。
+ */
+function ownershipLost(rt: DiscoveryRuntime): boolean {
+  let desc: ReturnType<typeof readServiceDescriptor>;
+  try {
+    desc = readServiceDescriptor(rt.dataDir);
+  } catch {
+    return false;
+  }
+  if (desc === null) return true;
+  if (desc.pid !== process.pid) return true;
+  if (rt.ownerToken !== null && desc.token !== rt.ownerToken) return true;
+  return false;
+}
+
+/** 失去所有权：停后台发现（关监听/定时器、等在途收尾）后不再新增扫描写入。幂等。 */
+function stopOnLostOwnership(rt: DiscoveryRuntime, why: string): void {
+  if (rt.stopped) return;
+  log(`失去唯一写服务描述符所有权（${why}）——停止后台发现，不再扫描写账（描述符已易主）`);
+  void stopSyncDiscovery().catch((e: unknown) => log(`失去所有权后停止后台发现失败（忽略）：${errText(e)}`));
+}
+
 // ── 扫描调度（每项目一个定时器＝真防抖） ──
 
 function fireScan(rt: DiscoveryRuntime, w: ProjectWatch, why: string): void {
   if (rt.stopped) return;
+  if (ownershipLost(rt)) {
+    stopOnLostOwnership(rt, "扫描前复核");
+    return;
+  }
   const promise = requestSyncScan({
     projectId: w.projectId,
     dataDir: rt.dataDir,
@@ -495,6 +536,10 @@ function pollProjects(rt: DiscoveryRuntime, why: string): number {
 
 function pollSafely(rt: DiscoveryRuntime, why: string): void {
   if (rt.stopped) return;
+  if (ownershipLost(rt)) {
+    stopOnLostOwnership(rt, `轮询复核（${why}）`);
+    return;
+  }
   try {
     pollProjects(rt, why);
   } catch (e) {
@@ -546,24 +591,28 @@ function startRegistryWatch(rt: DiscoveryRuntime): void {
  * **先复核描述符确实属于本进程**才启动；有界首次扫描"既有包"；随后按约定目录增量发现 + 有界轮询兜底。
  * 幂等——已启动时直接返回。
  */
-export function startSyncDiscovery(opts: { service: SyncSubmitter; dataDir: string }): void {
+export function startSyncDiscovery(opts: { service: SyncSubmitter; dataDir: string; token?: string | null }): void {
   if (runtime !== null) return;
   if (process.env.TATAI_SYNC_DISCOVERY === "0") {
     log("后台同步发现被 TATAI_SYNC_DISCOVERY=0 关闭（仅显式 scan_sync_evidence 生效）");
     return;
   }
   const dataDir = path.resolve(opts.dataDir);
-  let descPid: number | null = null;
+  const ownerToken = opts.token ?? null;
+  let desc: ReturnType<typeof readServiceDescriptor>;
   try {
-    descPid = readServiceDescriptor(dataDir)?.pid ?? null;
+    desc = readServiceDescriptor(dataDir);
   } catch (e) {
-    descPid = null;
+    desc = null;
     log(`读写入服务描述符失败（按未持有处理）：${errText(e)}`);
   }
-  if (descPid !== process.pid) {
+  const descPid = desc?.pid ?? null;
+  // 启动门槛：pid 必对；给了令牌还要令牌对（同一份所有权判据，不靠调用方自觉）。
+  const owns = descPid === process.pid && (ownerToken === null || desc?.token === ownerToken);
+  if (!owns) {
     log(
-      `未确认唯一写入服务描述符属于本进程（描述符 pid=${descPid ?? "无"}，本进程 pid=${process.pid}）` +
-        "——后台发现不启动（由真正持有描述符的宿主扫描）",
+      `未确认唯一写入服务描述符属于本进程（描述符 pid=${descPid ?? "无"}${ownerToken === null ? "" : "，令牌不符"}，` +
+        `本进程 pid=${process.pid}）——后台发现不启动（由真正持有描述符的宿主扫描）`,
     );
     return;
   }
@@ -571,6 +620,7 @@ export function startSyncDiscovery(opts: { service: SyncSubmitter; dataDir: stri
   const rt: DiscoveryRuntime = {
     service: opts.service,
     dataDir,
+    ownerToken,
     projects: new Map(),
     registryWatcher: null,
     registryTimer: null,

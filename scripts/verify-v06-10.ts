@@ -49,6 +49,7 @@ import {
 } from "../src/server/work/claims";
 import { activateBaseline, activeBaseline } from "../src/server/work/documents";
 import { putEvidence } from "../src/server/work/evidence";
+import { buildSourceManifest } from "../src/server/work/sourceEvidence";
 import { importTaskDefinitions, type TaskDefinition } from "../src/server/work/plan";
 import { WorkService } from "../src/server/work/service";
 import { readTaskStates, submitDefinitionImports, submitTaskStatus } from "../src/server/work/tasks";
@@ -242,16 +243,23 @@ const defOf = (fx: Fixture, taskId: string): TaskDefinition => {
   return def;
 };
 
-/** 让一张卡走到"验证通过"（真提交结果 + 自检证据，绑定当前 code 修订） */
+/** 让一张卡走到"验证通过"（真提交结果 + 自检证据，绑定**可核对的源清单**） */
 function verifyGreen(fx: Fixture, taskId: string): void {
   const def = defOf(fx, taskId);
+  // V09-29/F4：可用于"已验证"的检查必须绑定**当前可核对来源**。给这张卡登记一份**真实、有界**的源清单
+  // （覆盖夹具项目内一个真实源文件），检查绑到**清单指纹**、证据指向**清单证据地址**——产品默认
+  // （`revisions.code = null`）下"已验证"由现读复核支撑，而不是拿账本自报的 code 修订冒充当前验证。
+  const srcRel = `src/green-${taskId.toLowerCase()}.ts`;
+  write(path.join(fx.root, srcRel), `export const ${taskId.replace(/[^A-Za-z0-9]/g, "_")}_OK = true;\n`);
+  const manifestFp = buildSourceManifest(fx.root, [srcRel]).fingerprint;
   const blob = putEvidence(fx.workDir, {
-    content: `${fx.id}/${taskId} 自检输出：全部验收项通过（V06-10 夹具）\n`,
-    kind: "self_check",
-    summary: `${taskId} 自检输出`,
+    content: "",
+    kind: "source_manifest",
+    summary: `${taskId} 源清单（覆盖 ${srcRel}）`,
     created_by: executor,
     role: "executor",
-    binding: { revision_kind: "code", revision: codeRev },
+    binding: { revision_kind: "code", revision: manifestFp },
+    source_manifest: [srcRel],
   });
   submitSubmission(service, {
     project_id: fx.id,
@@ -285,7 +293,7 @@ function verifyGreen(fx: Fixture, taskId: string): void {
     checked_by: executor,
     checks,
     conclusion: "pass",
-    binding: { revision_kind: "code", revision: codeRev },
+    binding: { revision_kind: "code", revision: manifestFp },
   });
   setStatus(fx, taskId, "result_submitted");
   fx.greenEvidence[taskId] = blob.sha256;

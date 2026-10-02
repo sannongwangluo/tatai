@@ -16,7 +16,7 @@ import { getProject } from "../registry";
 import { projectWorkDir } from "../workstation";
 import { nowIso } from "../time";
 import { WorkError, type WorkCommand, type WorkEvent, type WorkReceipt } from "./types";
-import { loadEvents } from "./eventStore";
+import { eventsPath, loadEvents } from "./eventStore";
 import { putEvidence } from "./evidence";
 import { readSyncDiscoveryIssues } from "./syncRuntimeHealth";
 import {
@@ -28,6 +28,7 @@ import {
 } from "./syncContract";
 import {
   batchIdOfEvidenceFile,
+  businessEventsFingerprint,
   evaluateBatch,
   SYNC_LOCK_REVIEW_MAX_BYTES,
   type BatchEvaluation,
@@ -153,14 +154,78 @@ function isInside(root: string, p: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
+/**
+ * **单次调用内**六图构建的复用键（V09-23 性能补正）。覆盖 canonical builder 的**实际影响源**：
+ * 生效基线身份与设计/施工源修订、有界图输入文件身份（blueprint/modules/supplement/names/
+ * graph-update/reconcile-last/semantic-status）、业务事件投影、以及事件账本文件的当前身份。
+ * 不含墙钟/检查时间；**不跨请求持久**（每次 `evalContext` 重建）。
+ *
+ * 返回 null = 真实图输入身份**核不出来**（探针未注册/抛错/有界图输入读取异常）→ 一律不复用，
+ * 逐次真建（宁可慢也不把旧图贴到新指纹上）。
+ */
+function graphProbeKeyOf(c: ProjectCtx, eventsFp: string): string | null {
+  const sourceProbe = syncGraphSourceProbe();
+  if (sourceProbe === null) return null;
+  let source: ReturnType<typeof sourceProbe>;
+  try {
+    source = sourceProbe(c.projectId, c.dataDir);
+  } catch {
+    return null;
+  }
+  if (source.graph_input_problems.length > 0) return null;
+  let eventsFile: string;
+  try {
+    // 内容身份而非 size/mtime：同长度改写或时间戳被保留也必须失效。
+    eventsFile = crypto.createHash("sha256").update(fs.readFileSync(eventsPath(c.workDir))).digest("hex");
+  } catch {
+    return null;
+  }
+  return stableStringify({
+    project_id: c.projectId,
+    data_dir: c.dataDir,
+    baseline_id: source.baseline_id,
+    baseline_valid: source.baseline_valid,
+    source_ok: source.ok,
+    source_reasons: source.reasons,
+    design_revision: source.design_revision,
+    plan_revision: source.plan_revision,
+    plan_definition_revision: source.plan_definition_revision,
+    graph_inputs: source.graph_inputs,
+    events_fp: eventsFp,
+    events_file: eventsFile,
+  });
+}
+
+/**
+ * 把 canonical builder 探针包成**单次评估内**按真实图输入身份复用的版本。
+ *
+ * 为什么：`readSyncStatus` 要为**每个历史批次**各裁决一次 `graph_full`，而各批用的是**同一份**
+ * 真实图输入——不补正就会把整仓六图重复构建几十次（2026-10-02 诊断：31 次、8–9 秒、超客户端 5 秒预算）。
+ * 复用只发生在「键逐字节相同」时；构建**前后**各核一次输入身份，窗口内变过就不入缓存（下一批自然重算），
+ * 所以每批仍按**各自**基线与契约裁决，历史批次一个不跳。
+ */
+function memoizeGraphProbe(raw: SyncGraphProbe, c: ProjectCtx, events: readonly WorkEvent[]): SyncGraphProbe {
+  const eventsFp = businessEventsFingerprint(events);
+  let cache: { key: string; result: SyncGraphProbeResult } | null = null;
+  return (projectId, dataDir) => {
+    const pre = graphProbeKeyOf(c, eventsFp);
+    if (pre === null) return raw(projectId, dataDir);
+    if (cache !== null && cache.key === pre) return cache.result;
+    const result = raw(projectId, dataDir);
+    if (graphProbeKeyOf(c, eventsFp) === pre) cache = { key: pre, result };
+    return result;
+  };
+}
+
 function evalContext(c: ProjectCtx, events: readonly WorkEvent[], opts: { sourceOnly?: boolean } = {}): EvalContext {
+  const rawGraphProbe = syncGraphProbe();
   const ctx: EvalContext = {
     projectId: c.projectId,
     projectRoot: c.projectRoot,
     workDir: c.workDir,
     dataDir: c.dataDir,
     events,
-    graphProbe: syncGraphProbe(),
+    graphProbe: rawGraphProbe === null ? null : memoizeGraphProbe(rawGraphProbe, c, events),
     graphSourceProbe: syncGraphSourceProbe(),
   };
   if (opts.sourceOnly === true) {
@@ -315,6 +380,13 @@ function emptyReport(projectId: string, configured: boolean, overall: SyncVerdic
 export interface SyncReadOptions {
   /** 显式发现错误（宿主经只读读口给出）；不给＝读本进程汇（宿主自身路径） */
   discoveryIssues?: string[];
+  /**
+   * **宿主不可达**时按 fail-closed 合成的发现错误：只在项目**已配置同步契约**时**顶替**本进程错误汇
+   * 并入（MCP stdio 另一进程的错误汇本就不可信，不能拿它冒充后台健康）；未配置的旧项目**完全忽略**，
+   * 保持 `not_configured`（零影响）。给它是为了让调用方**一次同源构造**报告，不必先探测
+   * configured 再重算一遍（见 `syncHost.hostSyncView`）。
+   */
+  unreachableIssues?: string[];
 }
 
 /** 读口：每次重读必要文件与实际目标，对比登记；历史 passed ≠ 当前 passed。只读、不写账。 */
@@ -358,7 +430,9 @@ export function readSyncStatus(projectId: string, dataDir: string, opts: SyncRea
 
   const configured = fold.batches.size > 0;
   const active = batches.filter((b) => b.active);
-  const healthIssues = opts.discoveryIssues ?? discoveryIssuesFor(dataDir, projectId);
+  const healthIssues =
+    opts.discoveryIssues ??
+    (configured && opts.unreachableIssues !== undefined ? opts.unreachableIssues : discoveryIssuesFor(dataDir, projectId));
   let overall: SyncVerdict;
   if (fold.problems.length > 0) overall = "invalid";
   else if (active.length > 0) overall = worstVerdict(active.map((b) => b.verdict));

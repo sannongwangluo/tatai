@@ -37,6 +37,7 @@ import path from "node:path";
 import { WorkError } from "./types";
 import {
   readFindings,
+  evidenceBlobPath,
   type EvidenceBinding,
   type FindingSeverity,
   type FindingState,
@@ -49,6 +50,8 @@ import {
   recordMethodOf,
   type AcceptanceRecord,
   type AuditRecords,
+  type FixRecord,
+  type IndependentAuditRecord,
   type VerificationSubject,
 } from "./audit";
 import { readTaskStates, type TaskExecutionStatus, type TaskState } from "./tasks";
@@ -68,6 +71,13 @@ import { importTaskDefinitions, parseIntegrationRequirements, type TaskDefinitio
 import { taskDefinitionHash } from "../../shared/planCardHash";
 import { resolveDesignRef, type DesignSectionLike } from "../../shared/designRef";
 import { resultSubmittedSources, type RuntimeEntrySource } from "./runtimeEntries";
+import {
+  projectRootOfWorkDir,
+  readManifestCarrier,
+  verifySourceManifest,
+  type SourceManifestCarrier,
+  type SourceManifestVerdict,
+} from "./sourceEvidence";
 import type { EvidenceFacts } from "../../ui/arch/provenance";
 
 // ── 六态与优先级（§4.2 表 + 其后一段的优先级口径） ──
@@ -189,6 +199,18 @@ export interface EvidenceBasis {
   verifies: VerificationSubject | null;
   /** 独立性口径要公开的盲点（同会话降级 / 先读作者摘要 / 一记录一哈希；空 = 没有要公开的） */
   independence_notes: string[];
+  /**
+   * V09-29（契约 F4）：带源清单的检查的**现读复核结论**（没有清单 = null）。
+   * 只放结论与计数，不放全量文件清单（清单本体在证据正文里，可经 `record_work_evidence read` 取回）。
+   */
+  source_manifest: {
+    status: "valid" | "invalidated" | "unreadable";
+    declared_count: number;
+    changed: string[];
+    missing: string[];
+    unreadable: string[];
+    reason: string;
+  } | null;
 }
 
 export interface StatusProjection {
@@ -251,7 +273,18 @@ export interface SourceRevisions {
    */
   plan_definition?: string | null;
   interface?: string | null;
+  /**
+   * **当前可核对**的代码版本（契约 F4）：只有调用方**显式**给 `opts.code_revision` 才有值；
+   * 产品读口默认 `null`——账本里上次自报的 code 修订不能反过来当"当前代码版本"
+   * （自报值见 `code_declared`，只作展示，不参与"源码是否变了"的复核）。
+   */
   code?: string | null;
+  /**
+   * 账本里**最近一次自报**的代码版本（成果登记 binding 或结果回报 `result_revision`）。
+   * **只作展示**（"执行者自报的版本"）；它不证明当前盘上源码是什么，故**不**参与有效性复核
+   * （契约 F4：保留历史记录 ≠ 继续采信它是当前验证）。
+   */
+  code_declared?: string | null;
 }
 
 export interface RequirementInput {
@@ -299,6 +332,58 @@ export interface CheckInput {
    * 作者自检记录与历史外的其他来源没有这一项。
    */
   audit_independence?: AuditIndependenceFacts | null;
+  /**
+   * 修复后独立复测闭环（显式解除）：本记录声明解除的**失败**独立审计 record_id 列表
+   * （来自独立审计 payload 的 `resolves`；缺省/空 = 不声明解除，行为与旧口径一致）。
+   * 生效条件见 `pickCheckRecords` 的 resolvedFailed 预计算（fail-closed）。
+   */
+  resolves?: string[];
+  /** 本记录复测所依据的 `audit.fix_recorded` record_id 列表（来自 payload 的 `fix_refs`） */
+  fix_refs?: string[];
+  /** 本记录经显式复测闭环解除了哪些失败（record_id，供展示追溯；只是标注，不改历史） */
+  resolution_note?: string[];
+  /**
+   * 已验证修复版本（由 `checksFromAudit` 依账本 `audit.fix_recorded` 事实核出）：
+   * 仅当 `fix_refs` 全部指向存在、带证据、回归命令全 0、且修复者 ≠ 复测者的修复记录时为非空；
+   * 否则 `null`（= 没有可采信的修复事实，不解除任何失败——不得自报"已验证"）。
+   */
+  fix_revision?: string | null;
+  /**
+   * 服务端提交序号（账本产出，payload 伪造不了）：显式解除要求「被解除失败 seq < 复测 seq」。
+   * 只比可自报的 `occurred_at` 不算数（复测不能事后解除发生在它之后的失败）。
+   */
+  ledger_seq?: number;
+  /**
+   * 该独立审计记录**声明**的 findings（`audit.independent_audit_recorded` payload 的
+   * `findings`；由 `checksFromAudit` 透传）。复测闭环按**记录级**保守口径配对：一条失败要被
+   * 解除，它在记录里声明的**每一个** finding 都必须有引用修复覆盖，且失败 findings 必须非空
+   * （历史没记 finding → 无法证明修的就是它 → 保留 failed，不猜）。
+   */
+  record_findings?: string[];
+  /**
+   * 已核验的修复事实（`checksFromAudit` 依账本 `audit.fix_recorded` 核出，非 caller 自报）：
+   * pick 侧按 finding ∈ 被解除失败的 `record_findings`、`fix_revision === binding.revision`、
+   * `失败.seq < fix.seq < 复测.seq` 严格配对；为空 = 没有可采信的修复事实 → 不解除任何失败。
+   */
+  verified_fixes?: VerifiedFixFact[] | null;
+  /**
+   * V09-29（契约 F4）：这条检查的**源清单现读复核结论**（由 `checksWithSourceManifests` 装配）。
+   * 给了就按它判：清单覆盖范围没变 → passed；变了/删了 → stale；取不到内容 → unknown。
+   * 没有这一项 = 这条检查没有可核对的源清单，走既有口径（不认识它的旧调用行为逐字不变）。
+   */
+  source_manifest?: SourceManifestVerdict | null;
+}
+
+/** 一条已核验的修复事实（record 级，由账本折叠 + `checksFromAudit` 核出） */
+export interface VerifiedFixFact {
+  /** `audit.fix_recorded` record_id */
+  record_id: string;
+  /** 修复所针对的 finding（须出现在被解除失败的 `record_findings` 里） */
+  finding_id: string;
+  /** 修复版本（须精确等于复测 `binding.revision`——同一命名空间，不得拿文档版本冒充代码） */
+  fix_revision: string;
+  /** 修复记录的服务端账本序号（须落在 失败.seq < fix.seq < 复测.seq 之间） */
+  seq: number;
 }
 
 /** 独立审计记录的独立性事实（E.3.4：一个都不许含糊成"已独立复核"） */
@@ -705,6 +790,31 @@ export function checkEffectiveness(
       why: `检查「${check.check_id}」说通过但没给证据哈希：没证据的通过不算通过（结果已提交 ≠ 验证通过）`,
       superseded: null,
     };
+  }
+  // V09-29（契约 F4）：带源清单的证据**现读复核**——只看它声明的那些路径。
+  // 这条**先于**"当前代码版本"判断：不再拿账本里上次自报的 code revision 反过来当当前代码版本；
+  // 覆盖的源码变了/删了 → 失效（stale）；取不到内容 → 未知待复核（unknown）；一致 → 沿用结论。
+  // **没被清单覆盖的无关文件变化不让它失效**（清单就是"有限覆盖范围"的本义）。
+  if (check.result === "passed" && check.source_manifest != null) {
+    const v = check.source_manifest;
+    if (v.status === "valid") return { ...base, effective: "passed", why: "", superseded: null };
+    if (v.status === "invalidated") {
+      return {
+        ...base,
+        effective: "stale",
+        why: `检查「${check.check_id}」${v.reason}`,
+        superseded: {
+          check_id: check.check_id,
+          result: "passed",
+          evidence_sha256: check.evidence_sha256,
+          bound_revision: check.binding.revision,
+          revision_kind: check.binding.revision_kind,
+          at: check.at,
+          superseded_by: `source_manifest:${v.current_fingerprint ?? "changed"}`,
+        },
+      };
+    }
+    return { ...base, effective: "unknown", why: `检查「${check.check_id}」${v.reason}`, superseded: null };
   }
   if (now === null) {
     return {
@@ -1205,6 +1315,17 @@ function projectOne(
           : check.record_method ?? null,
       verifies: check.verifies ?? null,
       independence_notes: eff.independence_notes,
+      source_manifest:
+        check.source_manifest == null
+          ? null
+          : {
+              status: check.source_manifest.status,
+              declared_count: check.source_manifest.declared_count,
+              changed: [...check.source_manifest.changed],
+              missing: [...check.source_manifest.missing],
+              unreadable: [...check.source_manifest.unreadable],
+              reason: check.source_manifest.reason,
+            },
     });
     if (eff.effective === "passed") {
       passed++;
@@ -1629,6 +1750,12 @@ export interface ProjectFacts {
    */
   result_runtime_sources: RuntimeEntrySource[];
   /**
+   * V09-29（契约 F4）：`task.result_submitted`（执行者结果回报）折成的**交付包只读摘要**。
+   * 验收页据此直接展示交付物/验证命令/未测/已知问题（`runtime_entries` 只是其中一项），
+   * **不要求 Agent 为了让页面看到再补一条 `audit.submission`**；执行自报与独立审计分开记。
+   */
+  result_submissions: ResultSubmissionSummary[];
+  /**
    * 分段失效复核现场（2026-09-27）：当前图纸原文 + 检查绑定的不可变快照 + 每卡设计依据。
    * 投影层据此按**本对象**分段判 plan/design 证据是否 stale；读不到的部分留空 → 复核回退整份比对。
    * **纯数据**，只进内存，不写盘、不外发（投影响应只挑字段回）。
@@ -1748,7 +1875,12 @@ export function collectProjectFacts(
     // 图纸缺失/读不动：revisions 留 null → 依赖复核的检查会进"无法复核"，不默认通过
   }
   integration = withIntegrationRequirementsInForce(integration, baseline);
-  revisions.code = opts.code_revision ?? latestCodeBindingRevision(audit, events);
+  // 契约 F4：**当前代码版本**不能来自账本里的自报（`latestCodeBindingRevision` 是自报值）。
+  // 产品读口默认 `code = null`（= "当前源码未知，代码检查一律待复核"）；只有调用方显式给
+  // `opts.code_revision`（测试／显式覆盖）才把某个值当"当前代码版本"。自报值另放 `code_declared`，
+  // 只作展示，绝不参与"源码是否变了"的复核。
+  revisions.code = opts.code_revision ?? null;
+  revisions.code_declared = latestCodeBindingRevision(audit, events);
   return {
     work_dir: workDir,
     last_seq: tasksProjection.last_seq,
@@ -1763,6 +1895,8 @@ export function collectProjectFacts(
     // 补修 F3：Agent 结果回报里声明的可体验运行入口（与成果登记同一套形状/校验/状态判定）。
     // 读侧校验就在这里发生：非法登记抛 `EVENT_INVALID`（宁可红，也不静默丢一条入口）。
     result_runtime_sources: resultSubmittedSources(events),
+    // V09-29（契约 F4）：结果回报的交付包（交付物/验证/未测/已知问题）——供验收页只读展示
+    result_submissions: resultSubmissionSummaries(events),
   };
 }
 
@@ -1874,6 +2008,187 @@ function latestCodeBindingRevision(records: AuditRecords, events: readonly WorkE
   if (cands.length === 0) return null;
   cands.sort((a, b) => b.ms - a.ms || b.seq - a.seq);
   return cands[0].revision;
+}
+
+/**
+ * `task.result_submitted`（执行者结果回报）的**交付包只读摘要**（V09-29／契约 F4）。
+ *
+ * 用途：验收页要能看到"执行者自报"的交付物 / 验证命令 / 未测项 / 已知问题——**不是只看
+ * `runtime_entries`**；也不能反过来要求 Agent 为了让页面看得见，再手工补一条 `audit.submission`。
+ * 本函数**只读**地把结果回报里已有的字段原样带出，**不改判任何验证结论**：
+ * 执行自报（这一份）与独立审计 / 用户验收是分开记的（§5.5），谁也不冒充谁。
+ *
+ * 字段以 `submitTaskResult` 实际写进 payload 的为准（`deliverables/evidence_refs/verification/
+ * untested/known_issues/diff_ref/result_revision/runtime_entries`）；`changed_files` 目前不在结果回报
+ * payload 里，若将来写进来就照带（此处按"有就带、没有就空数组"处理，不伪造）。
+ */
+export interface ResultSubmissionSummary {
+  source: "result_submitted";
+  /** 结果回报事件 id（可追溯回账本） */
+  record_ref: string;
+  task_id: string | null;
+  submitted_by: string;
+  at: string;
+  result_revision: string | null;
+  deliverables: string[];
+  changed_files: string[];
+  verification: { command: string; exit_code: number; output_ref: string | null }[];
+  untested: string[];
+  known_issues: string[];
+  evidence_refs: string[];
+  diff_ref: string | null;
+  /** 结果回报的语义（逐字带出；提醒"已提交 ≠ 已验证/已验收"） */
+  meaning: string;
+}
+
+function strArrayOf(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+
+export function resultSubmissionSummaries(events: readonly WorkEvent[]): ResultSubmissionSummary[] {
+  const out: ResultSubmissionSummary[] = [];
+  for (const e of [...events].sort((a, b) => a.seq - b.seq)) {
+    if (e.type !== "task.result_submitted") continue;
+    const p: Record<string, unknown> = e.payload ?? {};
+    const verification: { command: string; exit_code: number; output_ref: string | null }[] = [];
+    if (Array.isArray(p.verification)) {
+      for (const v of p.verification) {
+        if (typeof v !== "object" || v === null) continue;
+        const row = v as { command?: unknown; exit_code?: unknown; output_ref?: unknown };
+        if (typeof row.command !== "string") continue;
+        verification.push({
+          command: row.command,
+          exit_code: typeof row.exit_code === "number" ? row.exit_code : -1,
+          output_ref: typeof row.output_ref === "string" ? row.output_ref : null,
+        });
+      }
+    }
+    const rev = p.result_revision;
+    out.push({
+      source: "result_submitted",
+      record_ref: e.event_id,
+      task_id: e.entity_id.startsWith("task:") ? e.entity_id.slice("task:".length) : null,
+      submitted_by: e.actor_id,
+      at: e.received_at,
+      result_revision: typeof rev === "string" && rev.trim() !== "" ? rev.trim() : null,
+      deliverables: strArrayOf(p.deliverables),
+      changed_files: strArrayOf(p.changed_files),
+      verification,
+      untested: strArrayOf(p.untested),
+      known_issues: strArrayOf(p.known_issues),
+      evidence_refs: strArrayOf(p.evidence_refs),
+      diff_ref: typeof p.diff_ref === "string" && p.diff_ref !== "" ? p.diff_ref : null,
+      meaning: typeof p.meaning === "string" ? p.meaning : "执行者已提交结果；不表示审计通过或人工验收接受（DESIGN.md §5.4）",
+    });
+  }
+  return out;
+}
+
+/**
+ * V09-29（契约 F4）：装配**带源清单现读复核**的检查输入。
+ *
+ * 只对**绑 code 且证据正文里带 `source_manifest`** 的检查现读复核（有限范围：只读清单声明的那些路径）；
+ * 其余检查逐字照旧（不认识清单的历史记录行为不变）。清单载体缺失/坏/不是清单 → 不加这一项
+ * （走既有口径；**不**凭"没有清单"把历史一概判失效——它的采信与否由 `checkEffectiveness` 按
+ * `revisions.code` 现行值决定：产品读口默认 `code=null`，于是**没有可核对来源的 code 检查 = unknown 待复核**）。
+ *
+ * **绑定一致**：清单必须**定义**检查所声称的那个 code 修订（`check.binding.revision === manifest.fingerprint`）；
+ * 对不上就**不拿这份清单给该检查背书**（按未知待复核）——不允许随便附一份无关清单把旧 check 通行。
+ * 现读结论只在本函数**单次投影**内按清单指纹复用，不跨调用缓存（源一变即重算，不跨源保绿）。
+ */
+export function checksWithSourceManifests(
+  records: AuditRecords,
+  ctx: { projectRoot: string; workDir: string },
+): CheckInput[] {
+  const checks = checksFromAudit(records);
+  const carriers = new Map<string, SourceManifestCarrier | null>();
+  const verdicts = new Map<string, SourceManifestVerdict>();
+  const load = (sha: string): SourceManifestCarrier | null => {
+    if (!carriers.has(sha)) {
+      let carrier: SourceManifestCarrier | null = null;
+      try {
+        // sha 必须严格 64hex，否则 evidenceBlobPath 直接拒（拒绝路径穿越）
+        carrier = readManifestCarrier(evidenceBlobPath(ctx.workDir, sha));
+      } catch {
+        carrier = null;
+      }
+      carriers.set(sha, carrier);
+    }
+    return carriers.get(sha) ?? null;
+  };
+  return checks.map((c) => {
+    if (c.binding.revision_kind !== "code" || c.evidence_sha256 === null) return c;
+    const carrier = load(c.evidence_sha256);
+    if (carrier === null) return c;
+    const manifest = carrier.manifest;
+    const unreadable = (declared: number, reason: string): CheckInput => ({
+      ...c,
+      source_manifest: {
+        status: "unreadable",
+        declared_count: declared,
+        changed: [],
+        missing: [],
+        unreadable: [],
+        current_fingerprint: null,
+        reason,
+      },
+    });
+    // 载体完整性：正文被改过/截损（内容地址/bytes/kind 对不上）→ 不采信，按未知待复核
+    if (!carrier.intact) {
+      return unreadable(
+        manifest.files.length,
+        `检查「${c.check_id}」引用的源清单载体完整性核验不过（${carrier.defect ?? "未知"}）：` +
+          "证据不可变、正文必须可取回，不拿被改过/截损的载体给检查背书，按未知待复核",
+      );
+    }
+    // 绑定一致：清单指纹必须 == 检查绑定的 code 修订，否则这份清单与该检查无关 → 未知待复核
+    if (manifest.fingerprint !== c.binding.revision) {
+      return unreadable(
+        manifest.files.length,
+        `检查「${c.check_id}」绑定的 code 修订与证据里源清单的指纹不一致：` +
+          "不拿一份无关清单给它背书，按未知待复核（要么用清单指纹重绑检查，要么换对该检查名副其实的清单）",
+      );
+    }
+    // 载体**自己声明的绑定**必须与检查**同类且成形**（读回却不用 = 随便一份声明着别的来源类的
+    // 清单也能给旧 check 背书）。判据只比 `revision_kind`（不比 revision 字面值）：清单指纹是
+    // **服务端**在 `store` 时才算出并回执的，MCP 调用方在登记那一刻拿不到它，故载体自报 binding 的
+    // revision 天然与"检查绑定的指纹"不同（例如自报的是覆盖源的内容修订）——按字面值强等会把这个
+    // 正常流程一律判未知（实测会打断 `verify-http-source-freshness` 的 ①-4/②-1/③-1）。
+    // 真正防"无关清单背书"的是上面的「清单指纹 == 检查绑定的 code 修订」；这里只拦**来源类不一致**
+    // （如 plan 清单给 code 检查背书）与绑定缺失/空修订。
+    const cb = carrier.binding;
+    if (cb === null || cb.revision.trim() === "" || cb.revision_kind !== c.binding.revision_kind) {
+      const declared = cb === null ? "（无）" : `${cb.revision_kind}:${cb.revision.slice(0, 12)}…`;
+      return unreadable(
+        manifest.files.length,
+        `检查「${c.check_id}」的源清单载体自报绑定（${declared}）与检查绑定` +
+          `（${c.binding.revision_kind}:${c.binding.revision.slice(0, 12)}…）**不是同一来源类**（或缺/空）：` +
+          "不拿来源对不上的清单给检查背书，按未知待复核",
+      );
+    }
+    // 同一份清单只现读复核一次（多个检查引用同一清单时复用结论；作用域 = 本次投影）
+    const key = manifest.fingerprint;
+    let verdict = verdicts.get(key);
+    if (verdict === undefined) {
+      verdict = verifySourceManifest(ctx.projectRoot, manifest);
+      verdicts.set(key, verdict);
+    }
+    return { ...c, source_manifest: verdict };
+  });
+}
+
+/**
+ * **统一入口**：现场事实 → 带源清单现读复核的检查输入（契约 F4）。
+ *
+ * 产品读口（HTTP `/status-projection`、`project_entry`、`get_arch`）与 MCP 消费者**一律用它**，
+ * 不要直接 `checksFromAudit(facts.audit)`——后者会绕过「覆盖源一变即失效 / 无可核对来源即待复核」，
+ * 给旧检查假绿。项目根由 `facts.work_dir` 推出，调用方不必再传。
+ */
+export function checksFromFacts(facts: ProjectFacts): CheckInput[] {
+  return checksWithSourceManifests(facts.audit, {
+    projectRoot: projectRootOfWorkDir(facts.work_dir),
+    workDir: facts.work_dir,
+  });
 }
 
 /** 任务台账里的 module_id 映射（父级/模块归属的唯一现实来源；缺就是缺，不猜） */
@@ -2043,7 +2358,8 @@ export function projectFromFacts(
 ): { facts: ProjectFacts; projection: StatusProjectionSet } {
   const facts = collectProjectFacts(projectId, dataDir, { code_revision: opts.code_revision ?? null });
   const objects = objectsFromFacts(projectId, dataDir, facts, opts);
-  const checks = checksFromAudit(facts.audit);
+  // V09-29（契约 F4）：带源清单现读复核的检查输入（其余照旧）——真实读路径与 `entry.ts` 同口径
+  const checks = checksFromFacts(facts);
   const acceptance = acceptanceDimensionOf(Object.values(facts.audit.acceptances));
   const objectsWithAcceptance = objects.map((o) => ({ ...o, acceptance }));
   const projection = projectStatuses({
@@ -2057,6 +2373,51 @@ export function projectFromFacts(
     binding_segments: facts.binding_segments,
   });
   return { facts, projection };
+}
+
+/** 作者/审计者写法归一（与 `pickIndependenceOf` 同一归一：换写法冒充独立等于不设防） */
+const normActorId = (s: string): string => s.toLowerCase().replace(/[^0-9a-z\p{Script=Han}]+/gu, "");
+
+/**
+ * 「已验证修复事实」核验（修复后独立复测闭环的 ⑤）：本轮复测所依据的 `audit.fix_recorded`
+ * 是否真的存在、可核对、且不是自审。全 fail-closed——任一不满足返回 `null`
+ * （= 没有可采信的修复事实，不解除任何失败；**不得自报"已验证"而没有修复证据**）。
+ *
+ * 判据（record 级）：
+ *   · `fix_refs` 非空，且每一项都能在**账本**里找到对应的修复记录（引用不存在的修复 → 不认）；
+ *   · 修复记录带证据（`evidence_ref` 非空）；
+ *   · 修复记录若给了回归命令，退出码必须全 0（非零的"回归"不采信）；
+ *   · 修复者（写法归一后）≠ 复测审计者——复测者不能是修复者本人（§5.5 修复环）；
+ *   · 修复记录声明了 `finding_id`（说不清修的是哪条 finding → 无法与失败 record 的 findings 配对）；
+ *   · 账本顺序：修复 seq 必须早于复测 seq（`seq` 由服务端产出，payload 伪造不了）；
+ *   · 所有被引用修复记录的 `fix_revision` 一致且非空；不一致/缺失（说不清是哪一版修的）→ 不认。
+ *
+ * 返回 record 级元数据（含 finding_id / fix_revision / seq），供 `pickCheckRecords` 对**每一条
+ * 被解除失败**做严格配对——不只看复测声明的泛化 `fix_refs`。
+ */
+function verifiedFixFactsOf(
+  au: IndependentAuditRecord,
+  fixes: Readonly<Record<string, FixRecord>>,
+): VerifiedFixFact[] | null {
+  if (au.fix_refs.length === 0) return null;
+  const out: VerifiedFixFact[] = [];
+  const revisions = new Set<string>();
+  for (const ref of au.fix_refs) {
+    const fix = fixes[ref];
+    if (fix === undefined) return null;
+    if (fix.evidence_ref === null || fix.evidence_ref.trim() === "") return null;
+    if (fix.regression.some((r) => r.exit_code !== 0)) return null;
+    if (normActorId(fix.fixed_by) === normActorId(au.auditor)) return null;
+    if (typeof fix.seq !== "number" || !(fix.seq < au.seq)) return null;
+    const rev = fix.fix_revision.trim();
+    if (rev === "") return null;
+    const findingId = fix.finding_id.trim();
+    if (findingId === "") return null;
+    revisions.add(rev);
+    out.push({ record_id: fix.record_id, finding_id: findingId, fix_revision: rev, seq: fix.seq });
+  }
+  if (revisions.size !== 1) return null;
+  return out;
 }
 
 /**
@@ -2110,6 +2471,10 @@ export function checksFromAudit(records: AuditRecords): CheckInput[] {
       read_author_summary_first: au.independence.read_author_summary_first,
       one_hash_per_record: oneHashPerRecord,
     };
+    // 修复后独立复测闭环：修复事实由**账本**核（`verifiedFixFactsOf`），记录只带引用；
+    // 顺序核的是账本 seq，不是可自报的 `at`。facts 为空 = 没有任何可采信的修复事实。
+    const fixFacts = verifiedFixFactsOf(au, records.fixes);
+    const fixRevision = fixFacts !== null ? fixFacts[0].fix_revision : null;
     for (const c of au.checks) {
       out.push({
         check_id: c.check_id,
@@ -2134,6 +2499,12 @@ export function checksFromAudit(records: AuditRecords): CheckInput[] {
         record_method: recordMethod,
         verifies: null,
         audit_independence: auditIndependence,
+        resolves: [...au.resolves],
+        fix_refs: [...au.fix_refs],
+        fix_revision: fixRevision,
+        ledger_seq: au.seq,
+        record_findings: [...au.findings],
+        verified_fixes: fixFacts,
       });
     }
     // 审计记录本身也是一条检查（覆盖/结论），供"审计过但没逐项列检查"的场景
@@ -2155,6 +2526,12 @@ export function checksFromAudit(records: AuditRecords): CheckInput[] {
       record_method: recordMethod,
       verifies: null,
       audit_independence: auditIndependence,
+      resolves: [...au.resolves],
+      fix_refs: [...au.fix_refs],
+      fix_revision: fixRevision,
+      ledger_seq: au.seq,
+      record_findings: [...au.findings],
+      verified_fixes: fixFacts,
     });
   }
   return out;
@@ -2190,18 +2567,38 @@ function pickIndependenceOf(c: CheckInput, authorIds?: ReadonlySet<string>): "au
  *      独立「通过」随源漂移失效后，由新的复验结论（哪怕是作者自检）代表当前状态，质量维如实给 mechanical 档；
  *   ③ 都不是当前有效通过时，独立优先、同档取最新（stale/unknown 的理由如实上屏）。
  *  不修这条，一条陈旧的独立「通过」会永远压住其后全部 fresh 复验记录，§5.6 的复验对这类卡永远走不通
- *  （实测：acceptance-backfill 批独立记录绑旧 plan 转 stale 后，20 张卡的 fresh 自检全部上不了屏）。 */
+ *  （实测：acceptance-backfill 批独立记录绑旧 plan 转 stale 后，20 张卡的 fresh 自检全部上不了屏）。
+ *
+ *  **修复后独立复测闭环的收窄（2026-10-02）**：①的「有效独立失败」限定为
+ *  **未被显式复测闭环解除的**独立失败——`resolvedFailed` 命中的失败不再享 `cls=0` 否决位，
+ *  但记录本身仍留在账本/历史里（不抹除、不覆盖）。 */
 function pickRank(
   c: CheckInput,
   authorIds: ReadonlySet<string>,
   revisions: SourceRevisions,
   segments: BindingSegmentFacts | null,
+  resolvedFailed: ReadonlySet<string> | null = null,
 ): { cls: number; indep: "author_self" | "independent"; at: string } {
   const indep = pickIndependenceOf(c, authorIds);
   const eff = checkEffectiveness(c, revisions, authorIds, segments).effective;
-  const cls = indep === "independent" && eff === "failed" ? 0 : eff === "passed" ? 1 : 2;
+  const resolved =
+    resolvedFailed !== null &&
+    c.record_ref !== undefined &&
+    resolvedFailed.has(resolutionKey(c.object_id, c.check_id, c.record_ref));
+  const cls = !resolved && indep === "independent" && eff === "failed" ? 0 : eff === "passed" ? 1 : 2;
   return { cls, indep, at: c.at };
 }
+
+/**
+ * 解除判据的身份键：**object_id + check_id + record_ref** 三者齐备才算同一条检查。
+ *
+ * 为什么必须带 `object_id`：`projectOne` 把 `ownChecks + childChecks` 混在一起挑（父级要看到
+ * 子项检查），`check_id` 于是**不是全局唯一**——两个不同任务用同一个 `check_id`（如都写
+ * `T02.1::evidence`）时，只按 `check_id` 配对会让 A 任务的复测解除 B 任务的失败（共同解除）。
+ * 父/子混合挑选是生产管线的常态，单任务预分组保护不了整条管线，所以键必须在这里带上 object_id。
+ */
+const resolutionKey = (objectId: string, checkId: string, recordRef: string): string =>
+  `${objectId}\u0000${checkId}\u0000${recordRef}`;
 
 export function pickCheckRecords(
   checks: readonly CheckInput[],
@@ -2209,6 +2606,72 @@ export function pickCheckRecords(
   revisions?: SourceRevisions,
   segments: BindingSegmentFacts | null = null,
 ): Map<string, CheckInput> {
+  // 修复后独立复测闭环（fail-closed 预计算）：解除一条「有效独立失败」必须**同时**满足
+  //   ① 同 object_id + 同 check_id（`check_id` 不是全局唯一，见 `resolutionKey`）；
+  //   ② `resolves` 显式点名该失败的 record_ref（引用不存在/引用通过记录 → 不解除）；
+  //   ③ 严格服务端事件序（账本 seq，payload 伪造不了、payload.seq 不参与）：
+  //      **失败.seq < 每个相关修复.seq < 复测.seq**；**不比较可自报的 `occurred_at`**；
+  //   ④ 复测方是「有效独立 + 当前有效通过 + 有证据」（复用 `checkEffectiveness`，无第二套判据）；
+  //   ⑤ 修复事实（record 级，由 `checksFromAudit` 依账本核出，不接受 caller 自报 fix_revision）：
+  //      修复版本须**精确等于**复测 `binding.revision`（同一命名空间；该 binding 已由 ④ 判为当前有效）；
+  //   ⑥ finding 覆盖（记录级保守）：被解除失败的 `record_findings` 必须非空，且**每一个** finding
+  //      都要有引用修复覆盖（`finding_id` 命中，且修复 seq 落在 失败.seq 与 复测.seq 之间）——
+  //      只按复测声明的泛化 `fix_refs` 不算数。
+  // 任一不满足即不解除；无 `resolves` 时行为与旧口径逐字节一致。
+  let resolvedFailed: ReadonlySet<string> | null = null;
+  if (authorIds !== undefined && revisions !== undefined) {
+    const failures = new Map<string, CheckInput>();
+    for (const c of checks) {
+      if (c.record_ref === undefined || c.ledger_seq === undefined) continue;
+      const indep = pickIndependenceOf(c, authorIds);
+      const eff = checkEffectiveness(c, revisions, authorIds, segments).effective;
+      if (indep === "independent" && eff === "failed") {
+        failures.set(resolutionKey(c.object_id, c.check_id, c.record_ref), c);
+      }
+    }
+    if (failures.size > 0) {
+      const resolved = new Set<string>();
+      for (const r of checks) {
+        if (r.record_ref === undefined || r.ledger_seq === undefined) continue;
+        if (r.resolves === undefined || r.resolves.length === 0) continue;
+        // ⑤ 修复事实：record 级核过的修复元数据；没有就一条失败都不解除（不得自报"已验证"）
+        const facts = r.verified_fixes ?? null;
+        if (facts === null || facts.length === 0) continue;
+        // ⑤ 命名空间一致：修复版本必须精确等于复测 binding 的当前修订（不得拿 plan 文档版本冒充代码验证）
+        const rev = r.binding.revision;
+        if (facts.some((f) => f.fix_revision !== rev)) continue;
+        const rindep = pickIndependenceOf(r, authorIds);
+        if (rindep !== "independent") continue;
+        const reff = checkEffectiveness(r, revisions, authorIds, segments).effective;
+        if (reff !== "passed") continue;
+        for (const rid of r.resolves) {
+          const key = resolutionKey(r.object_id, r.check_id, `audit:${rid}`);
+          const failed = failures.get(key);
+          if (failed === undefined) continue;
+          // ③ 账本顺序：失败的 seq 必须严格早于复测的 seq
+          if (!(typeof failed.ledger_seq === "number" && failed.ledger_seq < r.ledger_seq)) continue;
+          // ⑥ 失败 findings 非空（历史没记 finding → 无法证明修的就是它 → 保留 failed，不猜）
+          const failedFindings = failed.record_findings ?? [];
+          if (failedFindings.length === 0) continue;
+          // ②③⑤⑥ 每个失败 finding 都要有「同一失败之后、复测之前、版本一致」的引用修复覆盖
+          const failedSeq = failed.ledger_seq;
+          const passSeq = r.ledger_seq;
+          const covered = failedFindings.every((finding) =>
+            facts.some(
+              (f) =>
+                f.finding_id === finding &&
+                f.fix_revision === rev &&
+                failedSeq < f.seq &&
+                f.seq < passSeq,
+            ),
+          );
+          if (!covered) continue;
+          resolved.add(key);
+        }
+      }
+      resolvedFailed = resolved;
+    }
+  }
   const out = new Map<string, CheckInput>();
   for (const c of checks) {
     const prev = out.get(c.check_id);
@@ -2217,8 +2680,8 @@ export function pickCheckRecords(
       continue;
     }
     if (authorIds !== undefined && revisions !== undefined) {
-      const rc = pickRank(c, authorIds, revisions, segments);
-      const rp = pickRank(prev, authorIds, revisions, segments);
+      const rc = pickRank(c, authorIds, revisions, segments, resolvedFailed);
+      const rp = pickRank(prev, authorIds, revisions, segments, resolvedFailed);
       const win =
         rc.cls < rp.cls ||
         (rc.cls === rp.cls &&
@@ -2237,6 +2700,19 @@ export function pickCheckRecords(
       (prevIndep === cIndep && compareIsoTime(c.at, prev.at) >= 0)
     ) {
       out.set(c.check_id, c);
+    }
+  }
+  // 展示追溯：最终上屏的记录若经显式复测闭环解除了失败，把被解除的 record_id 带出
+  // （克隆标注，历史记录与事件一字不改；按 object_id+check_id+record_ref 三重命中，不跨界点名）。
+  if (resolvedFailed !== null && resolvedFailed.size > 0) {
+    for (const [cid, rec] of out) {
+      if (rec.record_ref === undefined || rec.resolves === undefined || rec.resolves.length === 0) continue;
+      const lifted = rec.resolves.filter((rid) =>
+        resolvedFailed.has(resolutionKey(rec.object_id, cid, `audit:${rid}`)),
+      );
+      if (lifted.length > 0) {
+        out.set(cid, { ...rec, resolution_note: [...new Set(lifted)] });
+      }
     }
   }
   return out;

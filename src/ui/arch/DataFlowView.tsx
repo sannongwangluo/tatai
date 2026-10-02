@@ -18,7 +18,8 @@
 // 目标语义那一层另有一份**来源分层**的数据（实体/关系/端到端数据链/覆盖对账，逐条带出处与验证态），
 // 由服务端按项目派生（`GET /arch/dataflow`，与 `get_arch` 返回体同一份），本文件只负责摆出来、可点开。
 // **不把画布上的静态依赖边说成/显示成数据流**（红线）；目标语义那层另起区域、明确标注它**不是**画布画的边。
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useBoundedReloader, useProjectRefresh } from "../useProjectRefresh";
 import { type ArchViewDecl, type CanvasInfo } from "../arch/ArchCanvas";
 import { BIDIRECTIONAL_DASH, FLOW_EDGE_LEGEND } from "../arch/edgeStyle";
 import { DATA_FLOW_EDGE_RULE, DATA_FLOW_DIRECTION, DEP_EDGE_DIRECTION } from "../../arch/graph-mode";
@@ -109,7 +110,15 @@ function ChainPanel({ chain }: { chain: DataFlowChain }) {
  * 目标语义层：实体／关系／数据链／覆盖对账（**不是**画布上那些静态依赖边）。
  * 数据来自服务端同一份派生（与 `get_arch` 返回体同一份），读不到就如实说读不到。
  */
-export function DataFlowTargetPanel({ model, error }: { model: DataFlowModel | null; error: string | null }) {
+export function DataFlowTargetPanel({
+  model,
+  error,
+  loads,
+}: {
+  model: DataFlowModel | null;
+  error: string | null;
+  loads?: number;
+}) {
   return (
     // **定高**（不是 max-h）：这一层是异步取数的，若高度随"加载中→有数据"变化，画布会在 fitView
     // 之后被挤矮、把边缘节点挤出视口（F4 ④ 的"节点全在视口内"断言正是量这个）。定高 + 内部滚动，
@@ -117,6 +126,8 @@ export function DataFlowTargetPanel({ model, error }: { model: DataFlowModel | n
     <div
       className="mt-1 h-40 space-y-1 overflow-auto border-t border-neutral-800 pt-1"
       data-flow-target-layer
+      data-flow-target-stale={error !== null ? "1" : "0"}
+      {...(loads === undefined ? {} : { "data-flow-target-loads": loads })}
     >
       <p className="text-neutral-400" data-flow-target-semantics>
         {DATA_FLOW_TARGET_SEMANTICS_NOTE}
@@ -124,17 +135,19 @@ export function DataFlowTargetPanel({ model, error }: { model: DataFlowModel | n
       {error !== null && (
         <p className="text-rose-400" data-flow-state="load_failed">
           目标语义层读不到（不是「本项目没有数据流」）：{error}
+          {model === null ? "" : "（下面显示的是上一次成功读到的数据，不是最新事实）"}
         </p>
       )}
-      {error === null && model === null && <p className="text-neutral-500" data-flow-state="loading">正在读数据链与来源分层…</p>}
-      {error === null && model !== null && model.coverage.declared_total === 0 && (
+      {/* V09-26：失败**保留最后成功读数**（不清空、不装成"本项目没有数据流"） */}
+      {model === null && error === null && (
+        <p className="text-neutral-500" data-flow-state="loading">正在读数据链与来源分层…</p>
+      )}
+      {model !== null && model.coverage.declared_total === 0 && (
         <p className="text-amber-400" data-flow-state="no_declaration">
           {model.coverage.note}
         </p>
       )}
-      {error === null && model !== null && model.coverage.declared_total > 0 && (
-        <DataFlowModelView model={model} />
-      )}
+      {model !== null && model.coverage.declared_total > 0 && <DataFlowModelView model={model} />}
     </div>
   );
 }
@@ -256,22 +269,37 @@ export function DataFlowModelView({ model }: { model: DataFlowModel }) {
 function TargetSemanticsPanel({ projectId }: { projectId: string }) {
   const [model, setModel] = useState<DataFlowModel | null>(null);
   const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    let alive = true;
-    setModel(null);
-    setError(null);
-    getArchDataFlow(projectId)
+  const [loads, setLoads] = useState(0);
+  const projectRef = useRef(projectId);
+  projectRef.current = projectId;
+  /** V09-26：换项目才清现场；周期对账失败保留最后一次成功读数 */
+  const loadedForRef = useRef<string | null>(null);
+  const load = useCallback((signal: AbortSignal): Promise<void> => {
+    if (loadedForRef.current !== projectId) {
+      loadedForRef.current = projectId;
+      setModel(null);
+      setError(null);
+    }
+    return getArchDataFlow(projectId, { signal })
       .then((m) => {
-        if (alive) setModel(m);
+        // 换项目/卸载时 signal 被 abort：旧项目晚到回包一律丢弃（§3.1）
+        if (signal.aborted || projectRef.current !== projectId) return;
+        setModel(m);
+        setError(null);
+        setLoads((n) => n + 1);
       })
       .catch((e: unknown) => {
-        if (alive) setError(e instanceof Error ? e.message : String(e));
+        if (signal.aborted || projectRef.current !== projectId) return;
+        setError(e instanceof Error ? e.message : String(e));
       });
-    return () => {
-      alive = false;
-    };
   }, [projectId]);
-  return <DataFlowTargetPanel model={model} error={error} />;
+  // V09-26：目标语义层（证据/覆盖对账只有文件变化时账本序号不动）接统一对账 token
+  const token = useProjectRefresh(projectId);
+  const reload = useBoundedReloader(projectId, load);
+  useEffect(() => {
+    reload();
+  }, [projectId, token, reload]);
+  return <DataFlowTargetPanel model={model} error={error} loads={loads} />;
 }
 
 /** 数据流向图的口径条 + 图例：色=上游流向角色、虚线=互惠依赖、粗细=依赖权重（§4.3 第 3 招） */

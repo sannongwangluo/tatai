@@ -210,6 +210,21 @@ export interface IndependentAuditRecord {
   not_reported_scope: string[];
   method_limits: string[];
   binding: EvidenceBinding | null;
+  /**
+   * 修复后独立复测闭环（显式解除）：本记录复测通过后显式解除的**失败**独立审计 record_id。
+   * 缺省空 = 不解除任何失败（行为与旧口径一致）。仅声明不生效——投影侧另有 fail-closed 判据。
+   */
+  resolves: string[];
+  /**
+   * 修复事实引用：本记录复测所依据的 `audit.fix_recorded` record_id。
+   * 缺省空 = 没有可采信的修复事实 → 即使有 `resolves` 也不解除（不得自报已验证）。
+   */
+  fix_refs: string[];
+  /**
+   * 服务端提交序号（账本产出，payload 伪造不了）。显式解除要求「被解除失败 seq < 复测 seq」——
+   * 只比可自报的 `occurred_at` 不算数（复测不能事后解除在它之后才发生的失败）。
+   */
+  seq: number;
   at: string;
 }
 
@@ -221,6 +236,8 @@ export interface FixRecord {
   role: string;
   evidence_ref: string | null;
   regression: { command: string; exit_code: number; output_ref: string | null }[];
+  /** 服务端提交序号（账本产出）：修复必须早于引用它的复测（投影侧核账本顺序） */
+  seq: number;
   at: string;
 }
 
@@ -618,6 +635,10 @@ export function foldAuditRecords(events: WorkEvent[]): AuditRecords {
           not_reported_scope: strArr(p.not_reported_scope),
           method_limits: strArr(p.method_limits),
           binding: bindingOf(p.binding),
+          // 修复后独立复测闭环：只读折叠（未登记即空数组，旧事件逐字不动）；顺序由账本 seq 核
+          resolves: strArr(p.resolves),
+          fix_refs: strArr(p.fix_refs),
+          seq: e.seq,
           at: e.occurred_at,
         };
         break;
@@ -631,6 +652,7 @@ export function foldAuditRecords(events: WorkEvent[]): AuditRecords {
           role: e.role,
           evidence_ref: strOrNull(p.evidence_ref),
           regression: commandsOf(p.regression),
+          seq: e.seq,
           at: e.occurred_at,
         };
         break;
@@ -845,6 +867,19 @@ export interface IndependentAuditInput extends AuditWriteContext {
   not_reported_scope?: string[];
   method_limits?: string[];
   binding?: EvidenceBinding | null;
+  /**
+   * 修复后独立复测闭环（显式解除）：本记录**修复后复测通过**并显式解除的**失败**独立审计
+   * record_id 列表。**仅声明不生效**——投影侧只认：被引用记录确实存在同 object_id + 同 check_id 的
+   * 「有效独立失败」、账本 seq 早于本记录，且本记录同 object_id + 同 check_id 是
+   * 「有效独立 + 当前有效通过 + 有证据」，且本记录给了可采信的 `fix_refs`。
+   * 无此声明的新 pass 不解除任何失败（行为与旧口径一致）。
+   */
+  resolves?: string[];
+  /**
+   * 修复事实引用：本记录复测所依据的 `audit.fix_recorded` record_id 列表。没有它（或引用核不过）
+   * 就不解除——**不得自报"已验证"而没有修复证据**。声明 `resolves` 就必须同时给 `fix_refs`。
+   */
+  fix_refs?: string[];
 }
 
 /** ③ 独立审计（审计者 ≠ 作者；覆盖矩阵必须五个视角都交代） */
@@ -857,6 +892,23 @@ export function submitIndependentAudit(submitter: WorkSubmitter, input: Independ
     );
   }
   assertCoverageComplete(input.coverage);
+  const resolves = [...new Set(input.resolves ?? [])];
+  const fixRefs = [...new Set(input.fix_refs ?? [])];
+  if ([...resolves, ...fixRefs].some((r) => r.trim() === "")) {
+    throw new WorkError("INVALID_COMMAND", "resolves/fix_refs 里不能有空串（空串会被当成「无」来处理，等于静默丢声明）", {
+      resolves,
+      fix_refs: fixRefs,
+    });
+  }
+  // 明确拒绝：声明解除却不给修复事实 —— 修复后复测闭环必须有可核的修复记录（不得自报已验证）
+  if (resolves.length > 0 && fixRefs.length === 0) {
+    throw new WorkError(
+      "INVALID_COMMAND",
+      "声明 resolves 就必须同时给 fix_refs（`audit.fix_recorded` 记录 id）：" +
+        "没有修复证据的复测不得解除任何失败（DESIGN.md §5.5 修复环；不得自报「已验证」）",
+      { resolves, fix_refs: fixRefs },
+    );
+  }
   return submitAuditEvent(submitter, "audit.independent_audit_recorded", input.record_id, input, {
     task_id: input.task_id ?? null,
     round: input.round ?? 1,
@@ -875,6 +927,8 @@ export function submitIndependentAudit(submitter: WorkSubmitter, input: Independ
     not_reported_scope: input.not_reported_scope ?? [],
     method_limits: input.method_limits ?? [],
     binding: input.binding ?? null,
+    resolves,
+    fix_refs: fixRefs,
   });
 }
 

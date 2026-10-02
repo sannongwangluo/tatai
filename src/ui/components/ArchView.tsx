@@ -20,6 +20,7 @@
 // 会让 `verify-f3/f4/n2` 断言的 `.react-flow__node` 计数、`verify-n3` 的 elementFromPoint 归属
 // 跟着多出一份隐藏节点——那是改既有断言强度，不是本卡该动的。折叠/坐标在本页内的维护照旧。
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
+import { useBoundedReloader, useProjectRefresh } from "../useProjectRefresh";
 import { GRAPH_MODES, type GraphMode } from "../../arch/graph-mode";
 import type { ProjectItem } from "../api";
 import { ArchCanvas, type ArchViewDecl } from "../arch/ArchCanvas";
@@ -81,39 +82,62 @@ export function ArchView({ project }: { project: ProjectItem }) {
   const [onlyInCode, setOnlyInCode] = useState<
     readonly { id: string; name: string; path?: string; category?: string }[]
   >([]);
-  useEffect(() => {
-    let alive = true;
-    Promise.all([
-      getArchBlueprint(project.id),
-      getStatusProjection(project.id),
-      getArchReconcile(project.id).catch(() => ({ exists: false as const })),
+  /** V09-26：状态色/证据这一层自己也会读失败——**失败不许把状态清空成"无状态"（看着像健康）**，
+   *  保留上一次成功读数 + 如实标陈旧；恢复后自行清除。`statusLoads` 是自动重取的可复核计数。 */
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [statusLoads, setStatusLoads] = useState(0);
+  const projectIdRef = useRef(project.id);
+  projectIdRef.current = project.id;
+  const loadedForRef = useRef<string | null>(null);
+  // V09-26：状态投影/来源标注接进统一对账 token——技术详情**状态色与证据**随账本/文档/证据变化更新
+  // （ArchCanvas 的图数据轮询保持原样，不重构）。加载器走**严格有界在途**外壳：同一项目不 abort 在途
+  // 请求（慢响应最终落地显示），换项目/卸载 abort 旧请求并丢弃旧回包。
+  const token = useProjectRefresh(project.id);
+  const load = useCallback((signal: AbortSignal): Promise<void> => {
+    // 这一层只喂技术详情（主视图另有自己的 4s 轮询，不重复取数）：没在技术详情页就不读。
+    if (tab !== "tech") return Promise.resolve();
+    const id = project.id;
+    if (loadedForRef.current !== id) {
+      loadedForRef.current = id;
+      setStatusMap({});
+      setProvenance(null);
+      setOnlyInCode([]);
+      setStatusError(null);
+    }
+    return Promise.all([
+      getArchBlueprint(id, { signal }),
+      getStatusProjection(id, { signal }),
+      getArchReconcile(id, { signal }).catch(() => ({ exists: false as const })),
     ])
       .then(([bp, proj, rec]) => {
-        if (!alive) return;
+        // 换项目/卸载时 signal 被 abort：旧项目晚到回包一律丢弃（§3.1，A→B→A 也不回退）
+        if (signal.aborted || projectIdRef.current !== id) return;
         // V09-08 ③：对账差异清单也给思维导图那一支（技术详情三图口径一致；没有结果就是空表）
         setOnlyInCode(rec.exists ? (rec.result?.only_in_code ?? []) : []);
         // V09-13：来源与证据标注随同一份读口回来（技术详情三图与主视图读同一份）
         setProvenance(bp.provenance ?? null);
         const blueprint = bp.blueprint.exists ? bp.blueprint.blueprint : null;
-        if (blueprint === null) return;
-        const projection: Record<string, import("../../server/work/statusProjection").StatusProjection> = {};
-        for (const o of proj.objects) projection[o.object_id] = o;
-        // V09-08 ①②：配对**只有材料点名了实现落点**的才继承状态色（落点未证实/名字信号一律不继承）
-        const links = declaredLinksFromMatched(rec.exists ? (rec.result?.matched ?? []) : []);
-        const derived = taskDerivedModuleStatus({ blueprint, projection, declared_links: links });
-        if (alive) setStatusMap(moduleStatusKeysOf(derived));
-      })
-      .catch(() => {
-        if (alive) {
-          setStatusMap({});
-          setOnlyInCode([]);
-          setProvenance(null);
+        if (blueprint !== null) {
+          const projection: Record<string, import("../../server/work/statusProjection").StatusProjection> = {};
+          for (const o of proj.objects) projection[o.object_id] = o;
+          // V09-08 ①②：配对**只有材料点名了实现落点**的才继承状态色（落点未证实/名字信号一律不继承）
+          const links = declaredLinksFromMatched(rec.exists ? (rec.result?.matched ?? []) : []);
+          const derived = taskDerivedModuleStatus({ blueprint, projection, declared_links: links });
+          setStatusMap(moduleStatusKeysOf(derived));
         }
+        setStatusError(null);
+        setStatusLoads((n) => n + 1);
+      })
+      .catch((e: unknown) => {
+        if (signal.aborted || projectIdRef.current !== id) return;
+        // 保留上一次成功的 statusMap/provenance/onlyInCode（不清空成"无状态记录"）
+        setStatusError(e instanceof Error ? e.message : String(e));
       });
-    return () => {
-      alive = false;
-    };
-  }, [project.id]);
+  }, [project.id, tab]);
+  const reload = useBoundedReloader(project.id, load);
+  useEffect(() => {
+    reload();
+  }, [project.id, tab, token, reload]);
   // N3：三视图互相定位的唯一状态（一条单向请求 + 单调递增的请求号）
   const [locate, setLocate] = useState<LocateRequest | null>(null);
   const locateNonceRef = useRef(0);
@@ -151,10 +175,16 @@ export function ArchView({ project }: { project: ProjectItem }) {
   const canvasMode: GraphMode = mode === "MIND_MAP" ? "MODULE_BOX" : mode;
   /** V09-11：视图声明按项目取（数据流向图的目标语义层要按项目读）——方框图没有声明，原样返回 undefined */
   const viewDecl: ArchViewDecl | null = VIEW_DECL_FACTORIES[canvasMode]?.(project.id) ?? null;
+  /** V09-26：技术详情**状态色/证据**这一层的自动重取状态（给验证脚本与用户一个可复核的口径） */
+  const statusAttrs = {
+    "data-arch-status-loads": statusLoads,
+    "data-arch-status-stale": statusError === null ? "0" : "1",
+    ...(statusError === null ? {} : { "data-arch-status-error": statusError }),
+  };
 
   if (tab !== "tech") {
     return (
-      <div className="flex min-h-0 flex-1 flex-col" data-arch-tab={tab}>
+      <div className="flex min-h-0 flex-1 flex-col" data-arch-tab={tab} {...statusAttrs}>
         <ViewSwitch tab={tab} onPick={(t) => (t === "tech" ? setTab("tech") : (setProjectView(t), setTab(t)))} />
         <ProjectGraphView
           project={project}
@@ -167,7 +197,7 @@ export function ArchView({ project }: { project: ProjectItem }) {
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col" data-arch-tab="tech">
+    <div className="flex min-h-0 flex-1 flex-col" data-arch-tab="tech" {...statusAttrs}>
       {/* §3.2：三个主视图与技术详情并列可切换；技术详情内部再切它的三种渲染（下一行） */}
       <ViewSwitch
         tab={tab}

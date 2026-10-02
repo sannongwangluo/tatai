@@ -43,6 +43,7 @@ import { TerminalView } from "./components/TerminalView";
 import { VersionReminder } from "./components/VersionReminder";
 import { CrossProjectView } from "./projects/CrossProjectView";
 import { useProjectScope, type ViewKey } from "./projectScope";
+import { useBoundedReloader, useProjectRefresh } from "./useProjectRefresh";
 // 版本号与 package.json 同源（src/shared/version.ts，构建期内联）——页脚别再写死字面量
 import { APP_VERSION } from "../shared/version";
 
@@ -440,21 +441,33 @@ function PendingDecisions({ project, onOpen }: { project: ProjectItem; onOpen: (
   const [error, setError] = useState<string | null>(null);
   const idRef = useRef(project.id);
   idRef.current = project.id;
-  useEffect(() => {
+  /** V09-26：换项目才清现场；周期对账失败保留上一次成功计数（只标读不到，不显示 0 冒充"没事"） */
+  const loadedForRef = useRef<string | null>(null);
+  const load = useCallback((signal: AbortSignal): Promise<void> => {
     const id = project.id;
-    setCount(null);
-    setError(null);
-    getDiscussions(id)
+    if (loadedForRef.current !== id) {
+      loadedForRef.current = id;
+      setCount(null);
+      setError(null);
+    }
+    return getDiscussions(id, { signal })
       .then((d) => {
-        if (idRef.current !== id) return;
+        if (signal.aborted || idRef.current !== id) return;
         setCount(
           d.entries.filter((e) => e.disposition.status === "none" || e.disposition.status === "proposed").length,
         );
+        setError(null);
       })
       .catch((e: Error) => {
-        if (idRef.current === id) setError(e.message);
+        if (!signal.aborted && idRef.current === id) setError(e.message);
       });
   }, [project.id]);
+  // V09-26：待议条目只有 DESIGN/待议源文件变化时账本序号不动，也靠统一周期对账追平
+  const token = useProjectRefresh(project.id);
+  const reload = useBoundedReloader(project.id, load);
+  useEffect(() => {
+    reload();
+  }, [project.id, token, reload]);
   const pending = count !== null && count > 0;
   return (
     <button
@@ -490,18 +503,22 @@ function ProjectStatusBar({ project }: { project: ProjectItem }) {
   const [tick, setTick] = useState(0);
   const idRef = useRef(project.id);
   idRef.current = project.id;
-
-  useEffect(() => {
+  /** V09-26：换项目才清现场；周期对账保留最后成功数据，只标陈旧（连接失败不清空目标/版本） */
+  const loadedForRef = useRef<string | null>(null);
+  const load = useCallback((signal: AbortSignal): Promise<void> => {
     const id = project.id;
-    setStage(null);
-    setCurrentTask(null);
-    setBaselineId(null);
-    setBaselineKnown(false);
-    setError(null);
-    setObservedAt(null);
-    Promise.all([getLive(id), getActiveBaseline(id)])
+    if (loadedForRef.current !== id) {
+      loadedForRef.current = id;
+      setStage(null);
+      setCurrentTask(null);
+      setBaselineId(null);
+      setBaselineKnown(false);
+      setError(null);
+      setObservedAt(null);
+    }
+    return Promise.all([getLive(id, { signal }), getActiveBaseline(id, { signal })])
       .then(([live, base]) => {
-        if (idRef.current !== id) return; // 换项目了：这份回包作废（§3.1）
+        if (signal.aborted || idRef.current !== id) return; // 换项目/卸载：这份回包作废（§3.1）
         setStage(live.stage);
         setCurrentTask(live.current_task === null ? null : `${live.current_task.id}「${live.current_task.title}」`);
         setBaselineId(base.active === null ? null : base.active.baseline_id);
@@ -510,11 +527,17 @@ function ProjectStatusBar({ project }: { project: ProjectItem }) {
         setObservedAt(new Date().toISOString());
       })
       .catch((e: Error) => {
-        if (idRef.current !== id) return;
+        if (signal.aborted || idRef.current !== id) return;
         // 保留最后成功数据，只标连接失败（不许清空成"未知"以外的东西）
         setError(e.message);
       });
-  }, [project.id, tick]);
+  }, [project.id]);
+  // V09-26：顶栏（阶段/当前卡/有效版本）统一走周期对账——基线重激活或当前卡变化也自动追平
+  const token = useProjectRefresh(project.id);
+  const reload = useBoundedReloader(project.id, load);
+  useEffect(() => {
+    reload();
+  }, [project.id, tick, token, reload]);
 
   // 连不上就自动重连（不清空上面的最后成功值）；成功一次即停
   useEffect(() => {
@@ -527,6 +550,7 @@ function ProjectStatusBar({ project }: { project: ProjectItem }) {
     <div
       data-project-status-bar
       data-connection={error === null ? "ok" : "failed"}
+      data-status-stale={error !== null ? "1" : "0"}
       {...(observedAt === null ? {} : { "data-observed-at": observedAt })}
       className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-b border-neutral-800 bg-neutral-900/30 px-3 py-1.5 text-[11px]"
     >
@@ -558,6 +582,15 @@ function ProjectStatusBar({ project }: { project: ProjectItem }) {
         <span title={error} data-status-error className="min-w-0 flex-1 truncate text-red-400">
           {error}
         </span>
+      )}
+      {error !== null && (
+        <button
+          data-status-retry
+          onClick={() => setTick((t) => t + 1)}
+          className="shrink-0 rounded border border-amber-600/50 px-2 py-0.5 text-amber-200 hover:bg-amber-500/20"
+        >
+          重试
+        </button>
       )}
     </div>
   );

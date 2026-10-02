@@ -54,6 +54,8 @@ const RELEASE_EXE = path.join(TAURI_DIR, "target", "release", "tatai.exe");
 // 2026-09-30（V09-23）定向订正：注册表新增同步证据域三接口 register_sync_contract / scan_sync_evidence /
 // read_sync_status（DESIGN §2.10 / docs/sync-evidence-contract.md），说明与清单同步为 **22 个**——
 // 判据一字不动（仍是逐个点名的"恰好"，不放过、不放宽；**不**改成从注册表动态生成期望）。
+// 2026-10-02（V09-27/V09-28）定向订正：注册表新增 report_execution / record_work_evidence /
+// manage_baseline（契约 F3/F1），说明与清单同步为 **25 个**——判据一字不动（仍是逐个点名的"恰好"）。
 const MCP_TOOL_NAMES = [
   "list_projects",
   "select_project",
@@ -84,8 +86,15 @@ const MCP_TOOL_NAMES = [
   "register_sync_contract",
   "scan_sync_evidence",
   "read_sync_status",
+  // 2026-10-02 V09-27（契约 F3）/ V09-28（契约 F1）：执行回执 report_execution、
+  // 证据/审计 record_work_evidence、正向成套图纸入口 manage_baseline——同一点名口径（恰好）。
+  // 语义/反例由 verify:progress-reporting 与 verify:forward-journey（真 stdio 旅程）各自守着，
+  // 本脚本只做身份/集合断言。
+  "report_execution",
+  "record_work_evidence",
+  "manage_baseline",
 ] as const;
-const MCP_TOOL_COUNT = MCP_TOOL_NAMES.length; // 22
+const MCP_TOOL_COUNT = MCP_TOOL_NAMES.length; // 25
 
 const ok = (cond: boolean, label: string) => {
   console.log(`[verify] ${cond ? "PASS" : "FAIL"} ${label}`);
@@ -588,7 +597,7 @@ try {
   const extraTools = toolNames.filter((n) => !(MCP_TOOL_NAMES as readonly string[]).includes(n));
   ok(
     missingTools.length === 0 && extraTools.length === 0,
-    `⑦ 包内工具逐个点名对账（${MCP_TOOL_NAMES.length} 个：一期 8 + get_arch/ask_flash + V06-10 三件套 + C-015 三件套 + V07-02 rebind_task + V07-04 doctor + V09-19 get_project_graphs + V09-23 同步域三接口 register_sync_contract/scan_sync_evidence/read_sync_status）——缺 ${missingTools.join("/") || "无"}，多 ${extraTools.join("/") || "无"}`,
+    `⑦ 包内工具逐个点名对账（${MCP_TOOL_NAMES.length} 个：一期 8 + get_arch/ask_flash + V06-10 三件套 + C-015 三件套 + V07-02 rebind_task + V07-04 doctor + V09-19 get_project_graphs + V09-23 同步域三接口 register_sync_contract/scan_sync_evidence/read_sync_status + V09-27/V09-28 report_execution/record_work_evidence/manage_baseline）——缺 ${missingTools.join("/") || "无"}，多 ${extraTools.join("/") || "无"}`,
   );
   const listed2 = await client.callTool({ name: "list_projects", arguments: {} });
   const projectsText = (listed2.content as { type: string; text?: string }[])[0]?.text ?? "";

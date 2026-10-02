@@ -33,10 +33,10 @@ export function ChangesEntry({ project }: { project: ProjectItem }) {
   const [pageOpen, setPageOpen] = useState(false);
   // 基准毫秒用 ref：N 的清零/对账不需要触发重渲染，全部以"拉到的 changes + baselineMs"现算
   const baselineMsRef = useRef<number>(Date.now());
-  // Q40：防抖计时器 + 在途/待补标记（重拉进行中再来事件只记一笔，回来后再拉一次，不并发也不丢）
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const inflightRef = useRef(false);
-  const pendingRef = useRef(false);
+  /** V09-26（§3.1）：切项目瞬间在途的 `getChanges(旧项目)` 回包不许落到新项目上
+   *  （本组件此前是唯一一处漏了代际守卫的；SSE 重连虽会纠正，但那一瞬的读数是错的）。 */
+  const idRef = useRef(project.id);
+  idRef.current = project.id;
 
   // 切项目：重置计数，拉 changes 对账初始化，开 SSE 实时推送；关子页面
   useEffect(() => {
@@ -46,37 +46,52 @@ export function ChangesEntry({ project }: { project: ProjectItem }) {
     setCountError(null);
     setPageOpen(false);
 
+    // V09-26：在途/待补/定时器**本 effect 私有**——此前它们是与组件同寿的 ref，
+    // 换项目时旧请求的 finally 会把"补拉"错跑到旧项目的 resync 闭包上（B 的补拉只补拉了 A）。
+    // 再用 AbortController + disposed 让换项目/卸载后的旧回包一律作废（§3.1；A→B→A 也不回退）。
+    let disposed = false;
+    let inflight = false;
+    let pending = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const controller = new AbortController();
+
     const resync = () => {
-      if (inflightRef.current) {
-        pendingRef.current = true; // 在途：不并发重拉，回来后再补一次
+      if (disposed) return;
+      if (inflight) {
+        pending = true; // 在途：不并发重拉，回来后再补一次
         return;
       }
-      inflightRef.current = true;
-      getChanges(projectId, 50)
+      inflight = true;
+      getChanges(projectId, 50, { signal: controller.signal })
         .then((changes) => {
+          if (disposed || controller.signal.aborted) return; // 换项目/卸载了：这份回包作废（§3.1）
           setNewCount(countSince(changes, baselineMsRef.current));
           setCountError(null);
         })
         .catch((e: Error) => {
+          if (disposed || controller.signal.aborted) return;
           // Q92：计数失败如实进错误态（如项目目录被删 / changes.jsonl 坏行），不静默吞
           setCountError(e.message);
         })
         .finally(() => {
-          inflightRef.current = false;
-          if (pendingRef.current) {
-            pendingRef.current = false;
+          if (disposed) return;
+          inflight = false;
+          if (pending) {
+            pending = false;
             resync();
           }
         });
     };
     // Q40：事件合并（尾随 300ms）；立即对账的场合（首拉/重连）走 resyncNow
     const scheduleResync = () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-      timerRef.current = setTimeout(resync, RESYNC_DEBOUNCE_MS);
+      if (disposed) return;
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(resync, RESYNC_DEBOUNCE_MS);
     };
     const resyncNow = () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-      timerRef.current = null;
+      if (disposed) return;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
       resync();
     };
     resyncNow();
@@ -90,22 +105,27 @@ export function ChangesEntry({ project }: { project: ProjectItem }) {
       scheduleResync();
     };
     return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-      timerRef.current = null;
+      disposed = true;
+      controller.abort();
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
       es.close();
     };
   }, [project.id]);
 
   // 点击入口 = 查看：开流水子页面，本次查看即已读（N 清零，基准提到当前最新一条）
   const openPage = () => {
-    getChanges(project.id, 1)
+    const pid = project.id;
+    getChanges(pid, 1)
       .then((changes) => {
+        if (idRef.current !== pid) return; // 换项目了：这次查看作废，不把旧项目读数写进新项目（§3.1）
         baselineMsRef.current = changes.length > 0 ? Date.parse(changes[0].ts) : Date.now();
         setNewCount(0);
         setCountError(null);
         setPageOpen(true);
       })
       .catch(() => {
+        if (idRef.current !== pid) return;
         // 对账失败也照开子页面（页面内有自身错误态），只不清零计数
         setPageOpen(true);
       });

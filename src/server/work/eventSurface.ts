@@ -37,40 +37,40 @@ export function toolNameSourceRegistered(): boolean {
 export const EVENT_SURFACE: Readonly<Record<string, string>> = {
   // ── 任务域 ──
   "task.definition_imported": "mcp:import_plan_definitions",
-  "task.status_changed": "internal:migrate(历史状态回放)/claims(交付链随结果推进)/执行端经命令面上报",
+  "task.status_changed": "mcp:report_task_status", // V09-27：Agent 可经 report_task_status(v2) 报 doing/解阻；迁移回放/释放仍内部自写
   "task.claimed": "mcp:claim_task",
   "task.result_submitted": "mcp:submit_task_result",
-  "task.blocked": "internal:执行端经 /api/work/command 上报阻塞（§5.4）",
+  "task.blocked": "mcp:report_task_status", // V09-27：阻塞上报的可达入口（report_task_status(status=blocked)）
   "task.cancelled": "internal:执行端/协调器经命令面取消（§5.4）",
   "task.rebound": "mcp:rebind_task",
   // V09-10（附录 F）：协调器受控重开同卡新 attempt——经 claim_task 的 op=reopen（不新增工具）
   "task.reopened": "mcp:claim_task",
-  // ── 缺陷域（V06-09：审计流服务端自发） ──
-  "finding.opened": "internal:evidence(审计缺陷台账，经命令面)",
-  "finding.reported_again": "internal:evidence(同指纹再次上报去重)",
-  "finding.transition": "internal:evidence(缺陷状态转移)",
-  "finding.fix_submitted": "internal:evidence(修复提交待复测)",
-  "finding.retest_recorded": "internal:evidence(复测记录)",
-  "finding.accepted_risk": "internal:evidence(接受风险，role 必须 user)",
-  // ── 审计/验收域（人工验收只有人能触发） ──
-  "audit.submission_submitted": "internal:audit(交付提交，经命令面)",
-  "audit.self_check_recorded": "internal:audit(作者自检记录)",
-  "audit.independent_audit_recorded": "internal:audit(独立审计记录)",
-  "audit.fix_recorded": "internal:audit(缺陷修复记录)",
-  "audit.retest_recorded": "internal:audit(缺陷复测记录)",
-  "audit.human_acceptance_recorded": "internal:audit(人工验收——用户在 Gate 页面触发，Agent 不代点)",
-  // ── 执行回执域（V06-11：外部执行器回执链） ──
-  "execution.start_requested": "internal:executionReceipts(协调器启动请求)",
-  "execution.started": "internal:executionReceipts(worker 上报启动)",
-  "execution.heartbeat": "internal:executionReceipts(worker 心跳)",
-  "execution.checkpoint": "internal:executionReceipts(worker 检查点)",
-  "execution.stop_requested": "internal:executionReceipts(协调器停止请求)",
-  "execution.stopped": "internal:executionReceipts(worker 停止回执)",
-  "execution.failed": "internal:executionReceipts(worker 失败回执)",
-  "execution.effect_declared": "internal:executionReceipts(外部效果声明)",
-  "execution.effect_confirmed": "internal:executionReceipts(效果确认)",
-  "execution.effect_unverified": "internal:executionReceipts(效果未核实)",
-  "execution.delivered": "internal:executionReceipts(交付回执)",
+  // ── 缺陷域（V06-09：审计流服务端自发；V09-27 起经 record_work_evidence(finding) 可达） ──
+  "finding.opened": "mcp:record_work_evidence",
+  "finding.reported_again": "mcp:record_work_evidence",
+  "finding.transition": "mcp:record_work_evidence",
+  "finding.fix_submitted": "mcp:record_work_evidence",
+  "finding.retest_recorded": "mcp:record_work_evidence",
+  "finding.accepted_risk": "internal:evidence(接受风险，role 必须 user——Agent 工具不暴露)", // 只有用户能触发
+  // ── 审计/验收域（人工验收只有人能触发；其余 V09-27 起经 record_work_evidence 可达） ──
+  "audit.submission_submitted": "mcp:record_work_evidence",
+  "audit.self_check_recorded": "mcp:record_work_evidence",
+  "audit.independent_audit_recorded": "mcp:record_work_evidence",
+  "audit.fix_recorded": "mcp:record_work_evidence",
+  "audit.retest_recorded": "mcp:record_work_evidence",
+  "audit.human_acceptance_recorded": "internal:audit(人工验收——用户在 Gate 页面触发，Agent 不代点)", // 只有用户能触发
+  // ── 执行回执域（V06-11 外部执行器回执链；V09-27 起经 report_execution 可达） ──
+  "execution.start_requested": "mcp:report_execution",
+  "execution.started": "mcp:report_execution",
+  "execution.heartbeat": "mcp:report_execution",
+  "execution.checkpoint": "mcp:report_execution",
+  "execution.stop_requested": "mcp:report_execution",
+  "execution.stopped": "mcp:report_execution",
+  "execution.failed": "mcp:report_execution",
+  "execution.effect_declared": "mcp:report_execution",
+  "execution.effect_confirmed": "mcp:report_execution",
+  "execution.effect_unverified": "mcp:report_execution",
+  "execution.delivered": "mcp:report_execution",
   // ── 需求/变更域（C-015 对象命令） ──
   "requirement.registered": "mcp:manage_requirement",
   "requirement.updated": "mcp:manage_requirement",

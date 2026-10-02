@@ -83,6 +83,10 @@
 | V09-23 | result_submitted（本轮执行产物已提交；终审以原始回执与 Codex 终审为准；未用户验收） | 同步契约登记、正式证据包自动发现、实际目标逐项对账与接续约束；实施依据 DESIGN.md §2.10 和 docs/sync-evidence-contract.md；文件责任 src/server/work/sync*.ts、src/server/work/service.ts、src/server/work/entry.ts、src/server/work/claims.ts、src/server/work/daemon.ts、src/server/index.ts、src/mcp/tools/sync*.ts、src/shared/syncEvidence.ts、scripts/verify-sync-evidence.ts | V09-19、V09-22 | 执行产物与反例证据见 .工作台/verify/sync-evidence-20260930/codex-final-review.md；用户授权来源见本文件文末「同步证据发现与完整性验收」；只表示同步范围对账，不代写业务结果或用户验收 |
 | V09-24 | result_submitted（本轮执行产物已提交；终审以原始回执与 Codex 终审为准；未用户验收） | 主项目工作面同步摘要、逐项缺口详情与同源只读 HTTP 接口；实施依据 DESIGN.md §2.10 和 docs/sync-evidence-contract.md；文件责任 src/ui/components/SyncEvidenceStatus.tsx、src/ui/App.tsx、src/ui/api.ts、scripts/verify-sync-evidence-ui.py | V09-23 | 界面执行产物已提交，替身122/0与实际安装读口15/0分开留证；验收见文末 V09-24 卡定义 |
 | V09-25 | result_submitted（本轮执行产物已提交；终审以原始回执与 Codex 终审为准；未用户验收） | 同步机制集成、示例项目真实证据登记与自动发现、本机安装版同步及终审；实施依据 DESIGN.md §2.10 和 docs/sync-evidence-contract.md；文件责任 scripts/verify-sync-evidence*.ts、DESIGN.md、PLAN.md、PROGRESS.md、README.md、AGENTS.md | V09-23、V09-24 | 集成执行产物已提交；正式登记181、自动核验182、23项通过；最后安装复核见 .工作台/verify/sync-evidence-20260930/integration-final/REPORT.md；保护示例项目前180事件、七份权威设计和原B1交接，不启动B1业务；验收见文末 V09-25 卡定义 |
+| V09-26 | todo | 正向工作面统一自动刷新、陈旧提示、最后上报时间与输入隔离；src/ui/**（DesignView 除外）、scripts/verify-progress-ui.py | 无 | DESIGN §3.9/§3.14；docs/forward-progress-contract.md F2；真实浏览器无手动刷新与异常恢复验证 |
+| V09-27 | todo | Agent 阶段/执行/证据上报入口、可靠重试回执、运行现场接续；src/mcp/tools/**、src/server/work/{claims,service,entry,executionReceipts,audit}.ts | 无 | DESIGN §2.6/§2.7/§5.4/§6.7；契约 F3/F5；真实服务工具链正反例 |
+| V09-28 | todo | 已有成套图纸直接技术审定与激活入口、正向使用指引；src/mcp/tools/manageBaseline.ts、src/server/work/baselineHost.ts、src/server/workHost.ts、src/ui/components/DesignView.tsx | 无 | DESIGN §2.9/§6.7；契约 F1；无需模型/无需逆向/零差异与源冲突正反例 |
+| V09-29 | todo | 当前代码证据有效性反例核验、必要修复及完整正向/返工/恢复独立验收；src/server/work/{evidence,statusProjection}.ts、scripts/verify-forward-loop.ts | V09-26、V09-27、V09-28 | DESIGN §5.6；契约 F4/F5；源码变化失效、完整旅程、构建和独立复核 |
 
 ### 施工与验证约定
 
@@ -2368,6 +2372,8 @@ U3 + S3 ──► L1 LICENSE 逐条核对 ──► L4 仓库打磨 + release ta
 
 **状态**：执行产物已提交并经 Codex 复审返工。主套件98/0、进程边界34/0、后台发现69/0、锁预算33/0与独立8/9/2反例复测通过；登记声明/原始截点22/0。桌面主动扫描接口遗漏与零新增假绿已独立发现，原始失败保留，修复及安装复测按终审记录核实。未记录用户验收。
 
+2026-10-02 性能补正记录：同次同步查询按真实图输入与事件内容身份复用六图构建；历史批次与逐项核验保留，宿主不可达分支单次构造报告。专项27/0，既有主98/0、发现69/0、锁33/0，typecheck与服务端构建通过；真实示例项目32批2072项新旧结果相等，六图31次→1次，查询8448ms→1306ms。运行宿主与已配置MCP包已更新，默认5秒预算下HTTP1677ms、全新MCP接续2537ms且同步passed；未写业务任务/Gate/基线事件。证据：`D:/demo-project/docs/reviews/evidence/2026-10-02-tatai-alignment/fix-request-reuse/FINAL.md`。此记录不改变卡定义或用户验收状态。
+
 **责任角色**：executor
 
 **设计依据**：DESIGN §2.10；docs/sync-evidence-contract.md 全文。
@@ -2450,3 +2456,102 @@ U3 + S3 ──► L1 LICENSE 逐条核对 ──► L4 仓库打磨 + release ta
 - **验证**（真实命令与输出见 PROGRESS 同日行与 `D:/demo-project/.工作台/tatai-alignment/20260930-entry-patch/`）：新增 `scripts/verify-stage-entry.ts`（`pnpm verify:stage-entry`）——35 条反例断言（A-1…A-20 指针面 + B-0…B-8 阻塞面，含真实 stdio MCP 子进程与 `POST /api/work/command` 直连写口），改后 **35/0**；用 `--expect=old --src=<HEAD 快照>/src` 跑**同一批反例** → **35/0**（逐条留档「改前挡不住」的现场，证明修正真的生效）；`pnpm typecheck` 0、`verify:v06-10` 82/0、`verify:v06-11` 96/0、`verify:v09-10` 44/0、`verify:v09-22-mcp` 20/0、`check:event-surface` 0；`build:server` 全 PASS 后同步 `src-tauri/target/release/server` 与安装目录 `%LOCALAPPDATA%/Tatai/server`（逐文件哈希三目录一致＝53 文件），安全重载桌面服务两轮（首轮旧壳 pid 24328 → 壳 37684／后端 22940；收口转义缺口后第二轮 → 壳 40808／后端 22404，8787 释放后再监听；8 个 MCP 宿主进程 pid 全程未变、未被误杀；描述符 token 未打印）。已装产物实测三探针：①真实示例项目账本**只读**副本 + 已装 `write-service.js`/`mcp.js` 真实链路 → `project_entry` 给 `claim_task(T06.1)`、`claim_task(T01b)` 被 `NOT_CLAIMABLE` 拒绝且**副本账本零字节变化**、副本准备卡照常可领；②真实示例项目项目（无指针）= 老项目完全兼容；③隔离夹具带合法指针进 `required_reads`、坏指针 `blocked`；④**对端生成的指针**挂进示例项目账本只读镜像 → 校验通过、`required_reads` 带出总图/AGENTS/B1 交接/Codex B0 终审 4 条、`preferred_task_id=T02.1` 命中真实就绪集合（机器推荐与 B1 首卡口径一致）。
 - **对端探针收口（同日）**：示例项目侧另一执行者的只读探针 `D:/demo-project/.工作台/tatai-alignment/root-stage-review-o7ur1t/` 指出**转义写法的重复键**（`"schema_version"` 与 `"\u0073chema_version"`）能绕过 `重复字段` 检查——已按 JSON 字符串语义解码后再比修掉（新增反例 **A-15b**，改前/改后两模式各自复跑）。**连带**：`scripts/verify-v06-11.ts` 的契约文档前缀钉值（`CONTRACT_PREFIX_BYTES=70992`）因本批在 §8.1／§12 插段而变红——按该脚本自身注释的既定程序**重定基线为当时全文**（82558 字节 / `36d8e74b…`），判据未放宽（前缀仍逐字节钉死、尾部仍只许追加），旧钉值与该处出处写进注释；`verify:v06-11` 复跑回到 **96/0**。
 - **如实保留**：本仓**未 commit**；`DESIGN.md` 未改；未重新激活任何基线；示例项目侧除 `20260930-entry-patch/` 证据目录外**未写**任何文件（`.工作台/work/stage-reads.json` 由另一执行者负责生成；本轮期间示例项目账本的增长 146758→151082 字节全部来自**另一执行者**的授权 apply，时间戳 15:46:13–15:56:15，与本轮重载无关）；诊断 §8 的未决项（OP-05 历史回放放行、`FP` 定义、§6.3 的 `report_task_status` 与 v2 项目不符）**本轮未处理**；写边界的这次新增**只加「阻塞卡」一条**，未把 `claimTask` 全部预查镜像到写口（取消/已交付仍只在 `claimTask` 预查里拒——按「原规则保留」不动）。
+
+## 正向项目推进闭环补齐（2026-10-02，当前新增批次）
+
+来源：用户要求「按照这个详细的再检查一下，总共要补足哪一些，然后安排kimiflash开始施工」，随后明确「逆向落稿……以后再说……把正向的，按照正常流程来做的这些功能全部给它补足」。需求 req-2026-10-02-forward-loop 已正式登记（seq 3097），批次 change-20261002-forward-loop 已开启（seq 3098）。本文新增 V09-26…V09-29 四卡；旧卡定义和历史记录保持。设计契约见 DESIGN §3.9/§6.7 与 docs/forward-progress-contract.md；逆向落稿不施工、不删除。Codex 技术审定本轮契约，Flash 按下列写域施工，最终用户验收另记。
+
+| 需求 ID | 来源 | 分类 | 适用范围 | 确认度 | 承接卡 |
+| --- | --- | --- | --- | --- | --- |
+| req-2026-10-02-forward-loop | 本节用户原话；DESIGN §2.6/§2.9/§3.9/§5.6/§6.7 | 当前有效 | 正向推进闭环 | 明确 | V09-26、V09-27、V09-28、V09-29 |
+
+### V09-26 正向工作面自动同步
+
+**目标**：一次上报后所有关联正向页面自动更新，读失败如实标陈旧，不丢输入或串项目。
+
+**状态**：todo；技术检查与用户验收分列。
+
+**设计依据**：DESIGN §3.9/§3.14；docs/forward-progress-contract.md F2。
+
+**责任角色**：executor
+
+**依赖**：无。**写域说明**：src/ui/**（DesignView.tsx、forwardApi.ts 由 V09-28 管；不改逆向功能）、scripts/verify-progress-ui.py。
+
+**施工**：先以真实浏览器构造施工卡、验收、顶栏停留不更新的红例；实现 useProjectRefresh 数字token接口与页内响应取消/顺序保护；接上 PlanView/AcceptanceView/ProjectOverview/App 的状态和待决/GateTimeline/ArchView状态/DataFlowView语义面板/ChangesEntry；已有图和实况按同源验证，不为重构扩大修改。显示真实更新时间/提交者，错误保留最后成功数据。后台刷新不重置 notes、draft、选择及滚动，切项目输入隔离。
+
+**交付**：不点击刷新时，真服务写事件后对应 DOM 自动变化；文档/Gate/证据只有文件变化也追平；断线后旧值+错误、恢复后追平；延迟旧响应/快速切项目不串；验收/待议输入在后台更新及切项目后保留。原始红绿输出及浏览器截图可复核；无模型调用。
+
+
+**文件责任**：`src/ui/`、`scripts/verify-progress-ui.py`。
+
+- [ ] 本卡交付段列出的全部正反例真实执行，命令/退出码/原始输出可取回。
+- [ ] typecheck 通过；跨卡集成由 V09-29 统一验证，未验项如实保留。
+
+### V09-27 Agent 完整上报、回执与接续
+
+**目标**：Agent 用可发现的正式工具覆盖阶段、检查点、证据、自检、独审和返工，记录可靠且不代签用户。
+
+**状态**：todo。
+
+**设计依据**：DESIGN §2.6/§2.7/§5.4/§5.5/§6.7；docs/forward-progress-contract.md F3/F5。
+
+**责任角色**：executor
+
+**依赖**：无。**写域说明**：src/mcp/tools/reportTaskStatus.ts、reportExecution.ts、recordWorkEvidence.ts、index.ts、src/server/work/{claims,service,entry,executionReceipts,audit,eventSurface}.ts；可新增 reporting*.ts 和证据宿主适配；不改 statusProjection.ts/evidence.ts（V09-29）或 workHost.ts（V09-28）。
+
+**施工**：先真实工具入口红例；v1兼容、v2带版本/认领/幂等/原因的上报；执行回执和证据/审计工具闭键适配既有校验与唯一写服务；同结果重试取原回执且异内容拒；运行现场现成判据进入 current_runs。task.result_submitted 的成果展示如需适配，保留执行自报与独立检查的分别。
+
+**交付**：开工/阻塞/恢复、错误token、错误角色、旧版本、无依据解阻、未知字段、重复请求、服务不可用均真实验证；缺证/非零命令不可判通过；Agent工具不能写人工验收；停止回执与无心跳不混淆；返回占位回执为失败。按受影响路径跑 v06-01/v06-09/v06-10/v06-11/v09-10 回归；工具端到端与函数测试分别记录。
+
+
+**文件责任**：`src/mcp/tools/`、`src/server/work/claims.ts`、`src/server/work/service.ts`、`src/server/work/entry.ts`、`src/server/work/executionReceipts.ts`、`src/server/work/audit.ts`、`src/server/work/eventSurface.ts`、`src/server/work/reportingHost.ts`、`scripts/verify-work-reporting.ts`。
+
+- [ ] 本卡交付段列出的全部正反例真实执行，命令/退出码/原始输出可取回。
+- [ ] typecheck 通过；跨卡集成由 V09-29 统一验证，未验项如实保留。
+
+### V09-28 正向成套图纸入口
+
+**目标**：已有图纸经明确技术审定直接激活、导入和接续，不调用模型或逆向生成。
+
+**状态**：todo。
+
+**设计依据**：DESIGN §2.9/§6.7；docs/forward-progress-contract.md F1/F2。
+
+**责任角色**：executor
+
+**依赖**：无；DesignView 自动刷新消费 V09-26 的 useProjectRefresh 接口。
+
+**写域说明**：src/mcp/tools/manageBaseline.ts、src/server/work/baselineHost.ts、src/server/workHost.ts、src/ui/forwardApi.ts、src/ui/components/DesignView.tsx；scripts/verify-forward-baseline.ts/py。工具 index 注册由 V09-27 统一集成；entry缺基线指令由 V09-27 集成。不改 service.ts；宿主接口用 workHost 委托单独模块。
+
+**施工**：manage_baseline read/preserve/activate 经唯一宿主；复用 documents 判据，MCP激活固定授权技术审定且明确依据/源哈希；页面展示两份来源与当前基线并提供显式激活，不要求产生差异；现有逆向入口保持。DesignView正向部分自动更新并保存待议输入。正向操作顺序文档由 Codex 统一同步。
+
+**交付**：没有模型配置仍可从现有两份图纸建立第一条基线；零差异激活有效、重复不滥增、错误角色/缺依据/源漂移/缺文档拒绝；单纯读不启动服务/模型/写文件；激活不写Gate、不自动领取；应用宿主与写daemon两种场景可用；真实MCP与浏览器各有证据。
+
+
+**文件责任**：`src/mcp/tools/manageBaseline.ts`、`src/server/work/baselineHost.ts`、`src/server/workHost.ts`、`src/ui/forwardApi.ts`、`src/ui/components/DesignView.tsx`、`scripts/verify-forward-baseline.ts`、`scripts/verify-forward-baseline.py`。
+
+- [ ] 本卡交付段列出的全部正反例真实执行，命令/退出码/原始输出可取回。
+- [ ] typecheck 通过；跨卡集成由 V09-29 统一验证，未验项如实保留。
+
+### V09-29 证据新鲜度与完整旅程验收
+
+**目标**：实际代码改动不会继续采信失效验证，且完整正向旅程在真实入口走通。
+
+**状态**：todo。
+
+**设计依据**：DESIGN §5.6/§3.14；docs/forward-progress-contract.md F4/F5。
+
+**责任角色**：executor
+
+**依赖**：V09-26、V09-27、V09-28 集成；来源失效反例可先独立核查。
+
+**写域说明**：src/server/work/evidence.ts、statusProjection.ts、必要的独立 sourceEvidence.ts；scripts/verify-forward-loop.ts、scripts/verify-forward-source.ts；根文档由 Codex 集成。
+
+**施工**：先验证 code 当前修订是否被旧账本替代；只对确证缺口实现有界来源清单/内容核验，严格路径和不可变历史保护。完整旅程经真实工具/HTTP和浏览器，不能以十个孤立库测试代替接线证明。
+
+**交付**：改已绑定源码而不再上报，原检查必须失效/待复核；无关且未覆盖文件变化不无依据全失效；删文件/越界/坏清单如实拒或未知；设计分段旧回归保持。F1–F5每项列证据、角色、版本和限制，完整开工→阻塞→恢复→提交→审计退回→新attempt修复→复测→夹具用户验收→重启/新Agent接续通过。typecheck/build/build:server、非作者复测和Codex终审通过后才作技术交付；真实Gate保持。
+
+**文件责任**：`src/server/work/evidence.ts`、`src/server/work/statusProjection.ts`、`src/server/work/sourceEvidence.ts`、`scripts/verify-forward-loop.ts`、`scripts/verify-forward-source.ts`。
+
+- [ ] 本卡交付段列出的全部正反例真实执行，命令/退出码/原始输出可取回。
+- [ ] typecheck 通过；跨卡集成由 V09-29 统一验证，未验项如实保留。

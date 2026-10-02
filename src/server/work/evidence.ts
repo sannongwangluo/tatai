@@ -27,6 +27,14 @@ import { nowIso } from "../time";
 import { SCHEMA_VERSION, WorkError, type WorkEvent, type WorkReceipt } from "./types";
 import { loadEvents } from "./eventStore";
 import type { WorkSubmitter } from "./tasks";
+import {
+  buildSourceManifest,
+  isSha256Hex,
+  parseSourceManifest,
+  projectRootOfWorkDir,
+  renderSourceManifestText,
+  type SourceManifest,
+} from "./sourceEvidence";
 
 // ── 证据版本绑定（§4.2 / §5.6：设计/接口/代码版本变化触发复核） ──
 
@@ -65,6 +73,8 @@ export const EVIDENCE_KINDS = [
   "acceptance",
   /** 其他如实标注 */
   "other",
+  /** 源文件清单（有限路径集合 + 内容哈希；读侧现读复核，DESIGN §5.6／契约 F4） */
+  "source_manifest",
 ] as const;
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
 
@@ -84,11 +94,24 @@ export interface EvidenceBlob {
   created_at: string;
   /** true = 同内容此前已落库，本次未产生第二份、未改写任何字节 */
   duplicate: boolean;
+  /**
+   * 可选的源文件清单（DESIGN §5.6／契约 F4）：这条证据到底核了哪些源码、当时的内容哈希。
+   * 登记时由服务端现读核实；读侧按它现读复核，源码一变就判失效（不认识清单的旧读侧忽略它）。
+   */
+  source_manifest: SourceManifest | null;
 }
 
 export const evidenceDir = (workDir: string): string => path.join(workDir, EVIDENCE_DIRNAME);
-export const evidenceBlobPath = (workDir: string, sha256: string): string =>
-  path.join(evidenceDir(workDir), `${sha256}.json`);
+/**
+ * 证据文件路径：sha256 必须是**严格 64 位小写十六进制**才允许拼文件名。
+ * 否则 `path.join` 会把 `../x` 之类的串当路径段用——那是路径穿越（契约 F4／复审第 5 项）。
+ */
+export const evidenceBlobPath = (workDir: string, sha256: string): string => {
+  if (!isSha256Hex(sha256)) {
+    throw new WorkError("INVALID_COMMAND", `证据内容地址必须是 64 位小写十六进制 sha256（收到 ${JSON.stringify(sha256)}）`, { sha256 });
+  }
+  return path.join(evidenceDir(workDir), `${sha256}.json`);
+};
 export const evidenceRecoveryRel = (sha256: string): string =>
   [".工作台", "work", EVIDENCE_DIRNAME, `${sha256}.json`].join("/");
 
@@ -108,6 +131,12 @@ export interface EvidenceInput {
   binding: EvidenceBinding;
   source_ref?: string | null;
   occurred_at?: string;
+  /**
+   * 可选的源文件清单（DESIGN §5.6／契约 F4）：有限、项目内的文件集合（字符串数组，
+   * 或 `{path, sha256?}` 数组——给了哈希就要与现读一致）。由服务端**现读当前盘上内容**算哈希、
+   * 拒绝越界/软链/私密目录/超限；返回的清单随证据不可变保存，读侧据此现读复核。
+   */
+  source_manifest?: unknown;
 }
 
 /**
@@ -128,11 +157,33 @@ export function putEvidence(workDir: string, input: EvidenceInput): EvidenceBlob
       field: "binding",
     });
   }
-  const bytes = Buffer.byteLength(input.content, "utf8");
+  // 源文件清单：登记时由**服务端现读**核实（不信任调用方自报的哈希；越界/软链/私密目录/超限一律拒）
+  let manifest: SourceManifest | null = null;
+  if (input.source_manifest !== undefined && input.source_manifest !== null) {
+    if (input.kind !== "source_manifest") {
+      evidenceBad(
+        `带了 source_manifest 的证据 kind 必须是 source_manifest（收到 ${JSON.stringify(input.kind)}）：` +
+          "清单是这一类证据的正文，别混进别的 kind",
+        { field: "kind" },
+      );
+    }
+    manifest = buildSourceManifest(projectRootOfWorkDir(workDir), input.source_manifest);
+  } else if (input.kind === "source_manifest") {
+    evidenceBad("source_manifest 类的证据必须给 source_manifest（有限文件集合 + 内容哈希），否则读侧无从复核", {
+      field: "source_manifest",
+    });
+  }
+  // 没给正文时，用清单本身的可读清单当正文（读回证据就能看到覆盖了哪些文件）
+  const content =
+    typeof input.content === "string" && input.content !== "" ? input.content : manifest === null ? input.content : renderSourceManifestText(manifest);
+  if (content === "") {
+    evidenceBad("证据正文不能为空（要么给 content，要么给 source_manifest）");
+  }
+  const bytes = Buffer.byteLength(content, "utf8");
   if (bytes > MAX_EVIDENCE_BYTES) {
     evidenceBad(`证据正文超过 ${MAX_EVIDENCE_BYTES} 字节上限（本次 ${bytes}）`, { bytes });
   }
-  const sha256 = sha256Hex(input.content);
+  const sha256 = sha256Hex(content);
   const file = evidenceBlobPath(workDir, sha256);
   if (fs.existsSync(file)) {
     const existing = readEvidence(workDir, sha256);
@@ -151,12 +202,13 @@ export function putEvidence(workDir: string, input: EvidenceInput): EvidenceBlob
     source_ref: input.source_ref ?? null,
     created_at: input.occurred_at ?? nowIso(),
     duplicate: false,
+    source_manifest: manifest,
   };
   fs.mkdirSync(evidenceDir(workDir), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(
     tmp,
-    JSON.stringify({ ...record, content_sha256: sha256, content: input.content }, null, 2) + "\n",
+    JSON.stringify({ ...record, content_sha256: sha256, content }, null, 2) + "\n",
     "utf8",
   );
   // rename 之前若已被别处写进同一份内容（内容相同 → 同一路径），直接让位，不覆盖
@@ -204,6 +256,8 @@ export function readEvidence(workDir: string, sha256: string): EvidenceBlob {
     source_ref: typeof raw.source_ref === "string" ? raw.source_ref : null,
     created_at: typeof raw.created_at === "string" ? raw.created_at : "",
     duplicate: false,
+    // 旧证据没有这一字段 → parse 回 null（不认识清单的旧读侧忽略它，行为不变）
+    source_manifest: parseSourceManifest(raw.source_manifest),
   };
 }
 
@@ -217,6 +271,8 @@ export interface EvidenceManifestEntry {
   recovery_path: string;
   /** 读时复核：内容哈希与内容地址一致 */
   intact: boolean;
+  /** 源文件清单概况（没有清单 = null；只给概况，不放全量条目） */
+  source_manifest: { fingerprint: string; files: number } | null;
 }
 
 /** 列举本项目的证据正文（取证/抽查用）：不合法或对不上哈希的如实标 `intact: false`，不隐藏 */
@@ -238,6 +294,7 @@ export function evidenceManifest(workDir: string): EvidenceManifestEntry[] {
         binding: blob.binding ?? null,
         recovery_path: blob.recovery_path,
         intact: true,
+        source_manifest: blob.source_manifest === null ? null : { fingerprint: blob.source_manifest.fingerprint, files: blob.source_manifest.files.length },
       });
     } catch (e) {
       out.push({
@@ -249,6 +306,7 @@ export function evidenceManifest(workDir: string): EvidenceManifestEntry[] {
         binding: null,
         recovery_path: evidenceRecoveryRel(sha),
         intact: false,
+        source_manifest: null,
       });
     }
   }

@@ -14,8 +14,13 @@ import tailwindcss from "@tailwindcss/vite";
 //   ③ 壳内没有 vite 代理，/api 的绝对基址由 src/ui/tauri-env.ts 给（见 src/ui/api.ts 的 apiFetch）。
 const API_PORT = process.env.TATAI_DEV_API_PORT ?? process.env.TATAI_PORT ?? "8787";
 const UI_PORT = 5173;
+// V09-26 验证隔离：node_modules 是对真实 D:/tatai 的 junction，vite 默认依赖预打包缓存会写到共享的
+// node_modules/.vite——并发跑验证脚本会互相/与真实环境打架。测试脚本用 TATAI_VITE_CACHE_DIR 指到
+// 隔离目录；不设时行为逐字不变（默认 node_modules/.vite）。
+const CACHE_DIR = process.env.TATAI_VITE_CACHE_DIR;
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  ...(CACHE_DIR ? { cacheDir: CACHE_DIR } : {}),
   server: {
     // U1：devUrl 写死 5173，端口被占时宁可报错也不要悄悄换端口（换了壳就白屏）
     port: UI_PORT,

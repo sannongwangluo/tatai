@@ -2,8 +2,9 @@
 // V06-08：从主导航挪到辅助入口（主导航只剩 项目图/设计书/施工图/聊天/实况与验收），
 // 并按 §3.1 补上「当前目标 / 有效版本」两个只读派生值——它们分别来自实况快照与生效基线，
 // 不是注册表字段，取不到就如实说"未激活/未知"，不编造。
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getActiveBaseline, getLive, getWorkUsage, type ProjectItem, type ProjectUsage } from "../api";
+import { useBoundedReloader, useProjectRefresh } from "../useProjectRefresh";
 import { BackupPanel } from "./BackupPanel";
 
 /** kind 四值的中文显示名（DESIGN.md §2.3.1），与 ProjectList 同一口径 */
@@ -22,48 +23,61 @@ export function ProjectOverview({ project }: { project: ProjectItem }) {
   const [derivedError, setDerivedError] = useState<string | null>(null);
   const [usage, setUsage] = useState<ProjectUsage | null>(null);
   const [usageError, setUsageError] = useState<string | null>(null);
+  const [derivedAt, setDerivedAt] = useState<string | null>(null);
+  const [reloadTick, setReloadTick] = useState(0);
+  /** V09-26：回包落地前先问"还是不是本项目"（§3.1 旧项目响应不许写进新界面） */
+  const projectIdRef = useRef(project.id);
+  projectIdRef.current = project.id;
 
-  useEffect(() => {
-    let stale = false;
-    setGoal(null);
-    setStage(null);
-    setBaseline(null);
-    setBaselineCount(null);
-    setDerivedError(null);
-    Promise.all([getLive(project.id), getActiveBaseline(project.id)])
+  // V09-26：项目信息（当前目标/有效版本 + 用量）统一进同一份自动对账；**换项目才清现场**，
+  // 周期对账保留最后成功数据（否则后台刷新会把已读到的值闪回"读取中…"）。
+  // C017 用量区同源：服务端只读现算；项目还没激活 v2 基线时端点照常 200（usage=0、上限不限），
+  // 这不是"没数据"，是如实空态。
+  const loadedForRef = useRef<string | null>(null);
+  const load = useCallback((signal: AbortSignal): Promise<void> => {
+    const id = project.id;
+    if (loadedForRef.current !== id) {
+      loadedForRef.current = id;
+      setGoal(null);
+      setStage(null);
+      setBaseline(null);
+      setBaselineCount(null);
+      setDerivedError(null);
+      setDerivedAt(null);
+      setUsage(null);
+      setUsageError(null);
+    }
+    const derived = Promise.all([getLive(id, { signal }), getActiveBaseline(id, { signal })])
       .then(([live, base]) => {
-        if (stale) return;
+        // 换项目/卸载时 signal 被 abort：旧项目晚到回包一律丢弃（§3.1）
+        if (signal.aborted || projectIdRef.current !== id) return;
         setStage(live.stage);
         setGoal(live.current_task === null ? null : `${live.current_task.id}「${live.current_task.title}」`);
         setBaseline(base.active === null ? null : base.active.baseline_id);
         setBaselineCount(base.count);
+        setDerivedError(null);
+        setDerivedAt(new Date().toISOString());
       })
       .catch((e: Error) => {
-        if (!stale) setDerivedError(e.message);
+        if (!signal.aborted && projectIdRef.current === id) setDerivedError(e.message);
       });
-    return () => {
-      stale = true;
-    };
+    const usage = getWorkUsage(id, { signal })
+      .then((u) => {
+        if (signal.aborted || projectIdRef.current !== id) return;
+        setUsage(u);
+        setUsageError(null);
+      })
+      .catch((e: Error) => {
+        if (!signal.aborted && projectIdRef.current === id) setUsageError(e.message);
+      });
+    return Promise.all([derived, usage]).then(() => undefined);
   }, [project.id]);
 
-  // C017 用量区：同项目信息走（§3.1 辅助入口）；服务端只读现算，界面只展示不自行计数。
-  // 项目还没激活 v2 基线（没有事件流）时端点照常 200：usage=0、上限不限、无耗时条目——
-  // 这不是"没数据"，是如实空态。
+  const token = useProjectRefresh(project.id);
+  const reload = useBoundedReloader(project.id, load);
   useEffect(() => {
-    let stale = false;
-    setUsage(null);
-    setUsageError(null);
-    getWorkUsage(project.id)
-      .then((u) => {
-        if (!stale) setUsage(u);
-      })
-      .catch((e: Error) => {
-        if (!stale) setUsageError(e.message);
-      });
-    return () => {
-      stale = true;
-    };
-  }, [project.id]);
+    reload();
+  }, [project.id, token, reloadTick, reload]);
 
   const rows: [string, string][] = [
     ["路径", project.path],
@@ -72,7 +86,30 @@ export function ProjectOverview({ project }: { project: ProjectItem }) {
     ["最近打开", project.last_opened_at],
   ];
   return (
-    <div className="mx-auto w-full max-w-xl space-y-4 p-8" data-project-info>
+    <div
+      className="mx-auto w-full max-w-xl space-y-4 p-8"
+      data-project-info
+      data-project-info-stale={derivedError !== null || usageError !== null ? "1" : "0"}
+    >
+      {/* V09-26：读失败保留最后成功数据，只标陈旧与最近成功时间；恢复后自行清除 */}
+      {(derivedError !== null || usageError !== null) && (
+        <p
+          data-project-info-stale-banner
+          data-project-info-stale-at={derivedAt ?? ""}
+          className="flex flex-wrap items-center gap-2 rounded border border-amber-800/60 bg-amber-950/30 px-3 py-1 text-[11px] text-amber-200"
+        >
+          <span className="min-w-0 flex-1">
+            项目信息读取失败：{derivedError ?? usageError}（显示的是 {derivedAt ?? "上次成功"} 读到的数据，不是最新事实；后台每 5 秒自动重试）
+          </span>
+          <button
+            data-project-info-retry
+            onClick={() => setReloadTick((t) => t + 1)}
+            className="shrink-0 rounded border border-amber-600/50 px-2 py-0.5 text-amber-200 hover:bg-amber-500/20"
+          >
+            重试
+          </button>
+        </p>
+      )}
       <header className="flex items-center gap-2">
         <h2 className="text-lg font-semibold">{project.name}</h2>
         {project.self_managed && (
@@ -96,21 +133,19 @@ export function ProjectOverview({ project }: { project: ProjectItem }) {
         <div className="flex gap-3">
           <dt className="w-20 shrink-0 text-neutral-500">当前目标</dt>
           <dd data-project-goal className="min-w-0 text-neutral-200">
-            {derivedError !== null
-              ? `（读不到：${derivedError}）`
-              : goal ?? stage ?? "（读取中…）"}
+            {goal ?? stage ?? (derivedError !== null ? `（读不到：${derivedError}）` : "（读取中…）")}
           </dd>
         </div>
         <div className="flex gap-3">
           <dt className="w-20 shrink-0 text-neutral-500">有效版本</dt>
           <dd data-project-version className="min-w-0 break-all text-neutral-200">
-            {derivedError !== null
-              ? "（读不到）"
-              : baselineCount === null
-                ? "（读取中…）"
-                : baseline === null
-                  ? "尚未激活任何基线"
-                  : `${baseline}（共 ${baselineCount} 条基线记录）`}
+            {baselineCount === null
+              ? derivedError !== null
+                ? `（读不到：${derivedError}）`
+                : "（读取中…）"
+              : baseline === null
+                ? "尚未激活任何基线"
+                : `${baseline}（共 ${baselineCount} 条基线记录）`}
           </dd>
         </div>
       </dl>
@@ -119,10 +154,10 @@ export function ProjectOverview({ project }: { project: ProjectItem }) {
           耗时只有事件流可核对配对的才给毫秒；Token/金额缺可核对来源，显式标「未计量」。 */}
       <section className="space-y-2 border-t border-neutral-800 pt-3" data-usage-panel>
         <h3 className="text-sm font-semibold text-neutral-300">用量</h3>
-        {usageError !== null ? (
-          <p className="text-xs text-neutral-500">（读不到：{usageError}）</p>
-        ) : usage === null ? (
-          <p className="text-xs text-neutral-500">（读取中…）</p>
+        {usage === null ? (
+          <p className="text-xs text-neutral-500">
+            {usageError !== null ? `（读不到：${usageError}）` : "（读取中…）"}
+          </p>
         ) : (
           <dl className="space-y-2 text-sm">
             <div className="flex gap-3">

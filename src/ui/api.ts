@@ -48,6 +48,15 @@ function apiFetch(input: string, init?: RequestInit): Promise<Response> {
   return fetch(`${apiBase()}${input}`, init);
 }
 
+/** V09-26（契约 F2）：只读读口可接收的中止信号——统一刷新机制在换项目/卸载时 abort 在途请求，
+ *  让"多次快速切换不堆积网络、旧项目晚到回包不落地"可被严格证明；不传则行为逐字不变。 */
+export interface FetchOpts {
+  signal?: AbortSignal;
+}
+function fetchInit(opts?: FetchOpts): RequestInit | undefined {
+  return opts?.signal !== undefined ? { signal: opts.signal } : undefined;
+}
+
 /** Q103（2026-09-18 审计，2026-09-19 试用修订挪到此处共享）：这条失败是不是「根本没连上后端」
  *  （而非后端回了个业务错误）。判据是 fetch 自己抛的网络层 TypeError，各运行时文案不同：
  *  WebView2/Chromium = `Failed to fetch`、Node/undici = `fetch failed`、WebKit = `Load failed`；
@@ -72,8 +81,8 @@ export async function getProjectsSummary(): Promise<ProjectsSummaryPayload> {
 import type { LiveSnapshot } from "../server/live";
 
 /** V1：GET /api/projects/:id/live —— 当前阶段/干活 agent/任务计数/Gate 当前步/动作流 */
-export async function getLive(id: string): Promise<LiveSnapshot> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/live`);
+export async function getLive(id: string, opts?: FetchOpts): Promise<LiveSnapshot> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/live`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; live: LiveSnapshot } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.live;
@@ -119,9 +128,10 @@ export async function unwatchProjectApi(
 }
 
 /** H2：GET /api/projects/:id/changes?limit=N —— 读变更流水（时间倒序，最新在前） */
-export async function getChanges(id: string, limit?: number): Promise<ChangeLine[]> {
+export async function getChanges(id: string, limit?: number, opts?: FetchOpts): Promise<ChangeLine[]> {
   const res = await apiFetch(
     `/api/projects/${encodeURIComponent(id)}/changes${limit !== undefined ? `?limit=${limit}` : ""}`,
+    fetchInit(opts),
   );
   const body = (await res.json()) as { ok: true; changes: ChangeLine[] } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
@@ -480,8 +490,9 @@ import type { ProvenanceModel } from "./arch/provenance";
 /** A5：GET /api/projects/:id/arch/reconcile —— 最近一次对账结果；exists:false = 未跑过（200 空态） */
 export async function getArchReconcile(
   id: string,
+  opts?: FetchOpts,
 ): Promise<{ exists: boolean; result?: ReconcileResult }> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/arch/reconcile`);
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/arch/reconcile`, fetchInit(opts));
   const body = (await res.json()) as
     | { ok: true; reconcile: { exists: boolean; result?: ReconcileResult } }
     | WsFail;
@@ -495,8 +506,8 @@ export async function getArchReconcile(
  * `target_semantics`（目标＝输入源→处理→存储→输出/外部系统的实际路径）**同时在场且互相区分**；
  * 另带实体表、关系表、至少一条端到端数据链与覆盖对账（缺路径显式报缺）。只读接口。
  */
-export async function getArchDataFlow(id: string): Promise<DataFlowModel> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/arch/dataflow`);
+export async function getArchDataFlow(id: string, opts?: FetchOpts): Promise<DataFlowModel> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/arch/dataflow`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; data_flow: DataFlowModel } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.data_flow;
@@ -522,16 +533,16 @@ interface WsFail {
 }
 
 /** G2：GET /api/projects/:id/progress —— 读 progress.json（缺文件后端自动初始化，幂等） */
-export async function getProgress(id: string): Promise<Progress> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/progress`);
+export async function getProgress(id: string, opts?: FetchOpts): Promise<Progress> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/progress`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; progress: Progress } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.progress;
 }
 
 /** G2：GET /api/projects/:id/gate.jsonl —— gate 流水原文（ndjson），前端逐行解析 */
-export async function getGateLines(id: string): Promise<GateLine[]> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/gate.jsonl`);
+export async function getGateLines(id: string, opts?: FetchOpts): Promise<GateLine[]> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/gate.jsonl`, fetchInit(opts));
   if (!res.ok) {
     const body = (await res.json()) as WsFail;
     throw new Error(`[${body.error.code}] ${body.error.message}`);
@@ -786,8 +797,8 @@ export interface ArchBlueprintPayload {
 }
 
 /** V06-06：GET /api/projects/:id/arch/blueprint —— 读已发布的规划图 + 派生回执 + 合成视图 */
-export async function getArchBlueprint(id: string): Promise<ArchBlueprintPayload> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/arch/blueprint`);
+export async function getArchBlueprint(id: string, opts?: FetchOpts): Promise<ArchBlueprintPayload> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/arch/blueprint`, fetchInit(opts));
   const body = (await res.json()) as ({ ok: true } & ArchBlueprintPayload) | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return { blueprint: body.blueprint, draft: body.draft, plan_code: body.plan_code, view: body.view, semantic: body.semantic ?? null, update: body.update ?? null, provenance: body.provenance ?? null };
@@ -805,8 +816,8 @@ export interface StatusProjectionPayload {
 }
 
 /** V06-06：GET /api/projects/:id/status-projection —— 状态与原因的唯一来源（界面不自己判状态） */
-export async function getStatusProjection(id: string): Promise<StatusProjectionPayload> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/status-projection`);
+export async function getStatusProjection(id: string, opts?: FetchOpts): Promise<StatusProjectionPayload> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/status-projection`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; projection: StatusProjectionPayload } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.projection;
@@ -818,8 +829,8 @@ import type { ProjectUsage } from "../server/work/usage";
 export type { ProjectUsage };
 
 /** C017：GET /api/projects/:id/work/usage —— 只读现算（界面只展示，不自行计数/配对/计量） */
-export async function getWorkUsage(id: string): Promise<ProjectUsage> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/work/usage`);
+export async function getWorkUsage(id: string, opts?: FetchOpts): Promise<ProjectUsage> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/work/usage`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; usage: ProjectUsage } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.usage;
@@ -828,8 +839,8 @@ export async function getWorkUsage(id: string): Promise<ProjectUsage> {
 // ── D1：设计书只读（DESIGN.md §3.5：只读展示，界面上没有任何可编辑入口，后端也无写接口）──
 
 /** D1：GET /api/projects/:id/design —— 读设计书全文；exists:false = 该项目还没有设计书（正常空态） */
-export async function getDesign(id: string): Promise<DesignDoc> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/design`);
+export async function getDesign(id: string, opts?: FetchOpts): Promise<DesignDoc> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/design`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; design: DesignDoc } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.design;
@@ -838,8 +849,8 @@ export async function getDesign(id: string): Promise<DesignDoc> {
 // ── D2：待议记录（DESIGN.md §3.5 提疑权：只能追加，没有任何修改/删除接口或 UI）──
 
 /** D2：GET /api/projects/:id/discuss —— 读待议记录全文（塔台 = DESIGN.md 附录 B 抽取）；exists:false = 还没有待议 */
-export async function getDiscuss(id: string): Promise<DiscussDoc> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/discuss`);
+export async function getDiscuss(id: string, opts?: FetchOpts): Promise<DiscussDoc> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/discuss`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; discuss: DiscussDoc } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.discuss;
@@ -857,13 +868,13 @@ export async function postDiscuss(id: string, content: string): Promise<DiscussA
   return body.result;
 }
 
-// ── B3：逆向落稿（DESIGN.md §9：老项目补设计书——草稿不是 design.md，定版只能由人/Max 触发）──
+// ── B3：逆向落稿（DESIGN.md §9：老项目补设计书——草稿不是 design.md，定版只能由人/获授权的设计角色触发）──
 
 import type { ReverseDraftDoc, DraftDesignResult, FinalizeResult } from "../server/reverseDraft";
 
 /** B3：GET /api/projects/:id/design/draft —— 读逆向草稿；exists:false = 还没有草稿（正常空态） */
-export async function getReverseDraft(id: string): Promise<ReverseDraftDoc> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/design/draft`);
+export async function getReverseDraft(id: string, opts?: FetchOpts): Promise<ReverseDraftDoc> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/design/draft`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; draft: ReverseDraftDoc } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.draft;
@@ -873,8 +884,8 @@ export async function getReverseDraft(id: string): Promise<ReverseDraftDoc> {
  * V06-07 双文档链：GET /api/projects/:id/design/draft（同一路径的第二份）
  * —— 读**剩余施工草稿** `.工作台/plan.draft.md`；与设计草稿一次拿齐，互不混淆。
  */
-export async function getReversePlanDraft(id: string): Promise<ReverseDraftDoc> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/design/draft`);
+export async function getReversePlanDraft(id: string, opts?: FetchOpts): Promise<ReverseDraftDoc> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/design/draft`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; plan_draft: ReverseDraftDoc } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.plan_draft ?? { exists: false };
@@ -892,7 +903,7 @@ export async function postReverseDraft(id: string): Promise<DraftDesignResult> {
   return body.result;
 }
 
-/** B3：POST /api/projects/:id/design/finalize —— 定版（只能由人/Max 触发）：草稿转正 + Gate 按确认步设置 + 对账钩子 */
+/** B3：POST /api/projects/:id/design/finalize —— 定版（由用户或用户已委派的设计角色触发）：草稿转正 + Gate 按确认步设置 + 对账钩子 */
 export async function postDesignFinalize(
   id: string,
   input: { gate_step: string; note?: string },
@@ -1178,8 +1189,8 @@ export type PlanPayload =
     };
 
 /** V06-08：GET /api/projects/:id/plan —— 施工定义 + 运行状态 + 对齐 + 原文定位片段 */
-export async function getPlan(id: string): Promise<PlanPayload> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/plan`);
+export async function getPlan(id: string, opts?: FetchOpts): Promise<PlanPayload> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/plan`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; plan: PlanPayload } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.plan;
@@ -1206,8 +1217,8 @@ export interface DiscussionsPayload {
 }
 
 /** V06-08：GET /api/projects/:id/discussions —— 待议条目 + 处置派生态 + 处置记录 */
-export async function getDiscussions(id: string): Promise<DiscussionsPayload> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/discussions`);
+export async function getDiscussions(id: string, opts?: FetchOpts): Promise<DiscussionsPayload> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/discussions`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; discussions: DiscussionsPayload } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.discussions;
@@ -1336,8 +1347,8 @@ export interface AcceptancePayload {
 }
 
 /** V06-08：GET /api/projects/:id/acceptance —— 待验收区 + 有效场景证据 + 可读场景 */
-export async function getAcceptance(id: string): Promise<AcceptancePayload> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/acceptance`);
+export async function getAcceptance(id: string, opts?: FetchOpts): Promise<AcceptancePayload> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/acceptance`, fetchInit(opts));
   const body = (await res.json()) as { ok: true; acceptance: AcceptancePayload } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.acceptance;
@@ -1369,8 +1380,9 @@ export async function postAcceptance(
 /** V06-08：GET /api/projects/:id/documents —— 只取生效基线（顶部状态条的「有效版本」，§3.1） */
 export async function getActiveBaseline(
   id: string,
+  opts?: FetchOpts,
 ): Promise<{ active: ProjectBaseline | null; count: number; corrupt: number }> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/documents`);
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/documents`, fetchInit(opts));
   const body = (await res.json()) as
     | { ok: true; documents: { baseline: { active: ProjectBaseline | null; count: number; corrupt: number } } }
     | WsFail;

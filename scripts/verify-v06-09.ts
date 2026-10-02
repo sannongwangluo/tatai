@@ -78,6 +78,7 @@ import {
   impactScope,
   moduleStatusFromProjections,
   NO_COMPLETION_PERCENT,
+  projectFromFacts,
   projectStatuses,
   v1ModuleStatusOf,
   writeCompatProgressProjection,
@@ -1528,8 +1529,11 @@ async function main(): Promise<void> {
 
   info("── ③ 八个预置场景（逐个断言状态与原因）");
   // 真实事实 → 投影（两趟：先算依赖释放，再让依赖线带上释放结论）
-  // 不显式喂代码版本：让它按"最近一次结果提交绑定的 code 修订"自己推（与只读入口同一口径）
-  const facts = collectProjectFacts(MAIN, dataDir);
+  // V09-29/F4：**产品默认** `revisions.code = null`——不拿账本自报的 code 修订当"当前代码版本"，
+  // 于是无源清单的 code 检查一律 unknown，"父级全绿/四色派生"就无从成立。本节验证的是**投影规则本身**，
+  // 故用契约明确允许的**显式测试覆盖** `opts.code_revision`（= 夹具自己绑的 codeRev1，检查绑定与之一致）——
+  // 这不是恢复旧自报：产品读口（HTTP/entry）仍默认 null、无源清单的 code 检查仍待复核，见 ④-3。
+  const facts = collectProjectFacts(MAIN, dataDir, { code_revision: codeRev1 });
   const baseChecks = checksFromAudit(facts.audit);
   const pass1Objects = objectsFromFacts(MAIN, dataDir, facts);
   const pass1 = projectStatuses({ objects: pass1Objects, findings: facts.findings, checks: baseChecks, source_revision: facts.revisions });
@@ -1913,14 +1917,27 @@ async function main(): Promise<void> {
   const projRes = await api(`/api/projects/${MAIN}/status-projection`);
   const auditRes = await api(`/api/projects/${MAIN}/audit`);
   const notFoundRes = await api(`/api/projects/v0609-nope/status-projection`);
+  // V09-29/F4：HTTP 读口是**产品默认**（`code=null`）——本地也按同一口径现算一份，逐对象比"同判"。
+  // 不再断言"T-4 绿"：无源清单的 code 检查在产品默认下=待复核，是 F4 的**预期**行为（不是路由坏了）；
+  // 而 ③ 的"投影规则"类断言仍用显式覆盖走绿——两者分开，不靠恢复旧自报。
+  const localDefault = projectFromFacts(MAIN, dataDir).projection;
+  const httpObjects: any[] = Array.isArray(projRes.body.projection?.objects) ? projRes.body.projection.objects : [];
   ok(
     projRes.status === 200 &&
       projRes.body.ok === true &&
       Array.isArray(projRes.body.projection.objects) &&
-      projRes.body.projection.objects.some((o: any) => o.object_id === "T-4" && o.display_status === "verified") &&
-      projRes.body.projection.objects.some((o: any) => o.object_id === "T-3" && o.display_status === "blocked") &&
-      projRes.body.projection.objects.some((o: any) => o.object_id === "T-1" && o.display_status === "pending_verification"),
-    `④-3 GET /status-projection 可达且与本地投影一致（HTTP ${projRes.status}，对象 ${projRes.body.projection?.objects?.length} 个：T-4 绿 / T-3 红 / T-1 接受限制不染绿）`,
+      httpObjects.some((o) => o.object_id === "T-3" && o.display_status === "blocked") &&
+      httpObjects.some((o) => o.object_id === "T-1" && o.display_status === "pending_verification") &&
+      httpObjects.every((o) => {
+        const local = localDefault.by_id[o.object_id];
+        return local === undefined || local.display_status === o.display_status;
+      }),
+    `④-3 GET /status-projection 可达且与本地产品默认投影同判（HTTP ${projRes.status}，对象 ${httpObjects.length} 个：逐对象同判；T-3 红 / T-1 接受限制不染绿）`,
+  );
+  ok(
+    httpObjects.some((o) => o.object_id === "T-4" && o.display_status !== "verified") &&
+      localDefault.by_id["T-4"]?.display_status !== "verified",
+    `④-3 无源清单的 code 检查在 HTTP 侧 = 待复核（F4：不拿账本自报的 code 修订冒充当前验证；T-4=${httpObjects.find((o) => o.object_id === "T-4")?.display_status}）`,
   );
   ok(
     projRes.body.projection.summary.basis.includes("不用节点数") &&

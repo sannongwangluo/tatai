@@ -10,7 +10,7 @@
 //     自己在验收记录里登记过的 http(s) 场景（其余一律纯文本，绝不跑任意协议、绝不执行外部命令）。
 //   · 「最终体验接受仍由用户本人记录」（§3.14/§5.8）→ 接受/退回按钮是本页唯一的写动作，
 //     写入的是**用户**身份的 v2 人工验收事件；界面文案不把"执行者已提交"说成"已验收"。
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   getAcceptance,
   postAcceptance,
@@ -19,6 +19,8 @@ import {
   type ProjectItem,
   type RuntimeEntryView,
 } from "../api";
+import { useProjectScope } from "../projectScope";
+import { useBoundedReloader, useProjectRefresh } from "../useProjectRefresh";
 import { openResultEntry } from "../result-entry";
 import { GateTimeline } from "./GateTimeline";
 
@@ -42,33 +44,50 @@ type Decision = "accept" | "reject" | "accept_known_limit";
 export function AcceptanceView({ project }: { project: ProjectItem }) {
   const [data, setData] = useState<AcceptancePayload | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [lastSuccessAt, setLastSuccessAt] = useState<string | null>(null);
   const [reloadTick, setReloadTick] = useState(0);
   const [busyTask, setBusyTask] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [notes, setNotes] = useState<Record<string, string>>({});
-  const [showStage, setShowStage] = useState(false);
   // 受控打开的回执（拒绝打开时说明原因；**不**在打开失败时假装打开成功）
   const [openNotice, setOpenNotice] = useState<Record<string, string>>({});
   const projectIdRef = useRef(project.id);
   projectIdRef.current = project.id;
-  const notesRef = useRef(notes);
-  notesRef.current = notes;
+  // V09-26：验收输入（每卡说明）与"展开阶段摘要"按项目隔离保存（切项目不串、后台刷新不丢，§3.1/§3.14）
+  const { scope, setBucket } = useProjectScope(project.id);
+  const noteOf = (taskId: string): string => scope.selections[`acceptance:note:${taskId}`] ?? "";
+  const showStage = scope.selections["acceptance:showStage"] === "1";
 
-  useEffect(() => {
+  /** V09-26：换项目才清现场；周期对账保留最后成功数据与输入 */
+  const loadedForRef = useRef<string | null>(null);
+  const load = useCallback((signal: AbortSignal): Promise<void> => {
     const id = project.id;
-    setData(null);
-    setLoadError(null);
-    setActionError(null);
-    getAcceptance(id)
+    if (loadedForRef.current !== id) {
+      loadedForRef.current = id;
+      setData(null);
+      setLoadError(null);
+      setActionError(null);
+      setLastSuccessAt(null);
+    }
+    return getAcceptance(id, { signal })
       .then((d) => {
-        if (projectIdRef.current !== id) return;
+        // 换项目/卸载时 signal 被 abort：旧项目（含 A→B→A 的晚到旧 A）回包一律丢弃（§3.1）
+        if (signal.aborted || projectIdRef.current !== id) return;
         setData(d);
+        setLoadError(null);
+        setLastSuccessAt(new Date().toISOString());
       })
       .catch((e: Error) => {
-        if (projectIdRef.current !== id) return;
-        setLoadError(e.message);
+        if (signal.aborted || projectIdRef.current !== id) return;
+        setLoadError(e.message); // 保留最后成功数据与输入
       });
-  }, [project.id, reloadTick]);
+  }, [project.id]);
+
+  // V09-26：统一自动对账（证据/验收记录只有文件变化时账本序号不动，也靠周期对账追平）
+  const token = useProjectRefresh(project.id);
+  const reload = useBoundedReloader(project.id, load);
+  useEffect(() => {
+    reload();
+  }, [project.id, token, reloadTick, reload]);
 
   // 待验收优先：默认把"待验收"的排前面（列表顺序是派生的，不是另一个状态源）
   const ordered = useMemo(() => {
@@ -89,7 +108,7 @@ export function AcceptanceView({ project }: { project: ProjectItem }) {
         task_id: task.task_id,
         scenario_refs: scenarioRefs,
         evidence_refs: evidenceRefs,
-        note: (notesRef.current[task.task_id] ?? "").trim() === "" ? null : notesRef.current[task.task_id].trim(),
+        note: noteOf(task.task_id).trim() === "" ? null : noteOf(task.task_id).trim(),
       });
       setReloadTick((t) => t + 1);
     } catch (e) {
@@ -113,7 +132,7 @@ export function AcceptanceView({ project }: { project: ProjectItem }) {
     }));
   };
 
-  if (loadError !== null) {
+  if (loadError !== null && data === null) {
     return (
       <div className="w-full p-8" data-acceptance-view data-acceptance-load-error>
         <p className="text-sm text-red-400">验收区加载失败：{loadError}</p>
@@ -136,7 +155,30 @@ export function AcceptanceView({ project }: { project: ProjectItem }) {
   }
 
   return (
-    <div className="w-full space-y-4 p-4" data-acceptance-view>
+    <div
+      className="w-full space-y-4 p-4"
+      data-acceptance-view
+      data-acceptance-stale={loadError !== null ? "1" : "0"}
+    >
+      {/* V09-26：读失败保留最后成功数据与用户输入，只标陈旧与最近成功时间；恢复后自行清除 */}
+      {loadError !== null && (
+        <p
+          data-acceptance-stale-banner
+          data-acceptance-stale-at={lastSuccessAt ?? ""}
+          className="flex flex-wrap items-center gap-2 rounded border border-amber-800/60 bg-amber-950/30 px-3 py-1 text-[11px] text-amber-200"
+        >
+          <span className="min-w-0 flex-1">
+            验收区读取失败：{loadError}（显示的是 {lastSuccessAt ?? "上次成功"} 读到的数据，不是最新事实；后台每 5 秒自动重试）
+          </span>
+          <button
+            data-acceptance-retry
+            onClick={() => setReloadTick((t) => t + 1)}
+            className="shrink-0 rounded border border-amber-600/50 px-2 py-0.5 text-amber-200 hover:bg-amber-500/20"
+          >
+            重试
+          </button>
+        </p>
+      )}
       <header className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-400">
         <h2 className="text-sm font-semibold text-neutral-100">待验收区</h2>
         <span data-acceptance-counts>
@@ -148,7 +190,7 @@ export function AcceptanceView({ project }: { project: ProjectItem }) {
         <span className="text-neutral-500">{data.basis}</span>
         <button
           data-acceptance-stage-toggle
-          onClick={() => setShowStage((v) => !v)}
+          onClick={() => setBucket("selections", "acceptance:showStage", showStage ? "0" : "1")}
           className="rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-300 hover:bg-neutral-800"
         >
           {showStage ? "收起阶段摘要" : "展开阶段摘要（用户 Gate）"}
@@ -314,6 +356,14 @@ export function AcceptanceView({ project }: { project: ProjectItem }) {
               )}
             </div>
 
+            {/* V09-26（F4 可见性）：成果提交者/时间用返回体现成字段，不读旧 activity 口径去猜漏报 */}
+            {t.submission !== null && (
+              <p data-acceptance-submission className="mt-1 text-[11px] text-neutral-500">
+                成果提交：<span data-acceptance-submitted-by>{t.submission.submitted_by}</span> ·{" "}
+                <span data-acceptance-submitted-at>{t.submission.at}</span> · 记录 {t.submission.record_id}
+              </p>
+            )}
+
             {/* 真实状态原因 + 缺项：未知不显成功（这里是"为什么还不是通过"的可读原因） */}
             {t.reasons.length > 0 && (
               <ul data-acceptance-reasons className="mt-1 space-y-0.5 text-[11px] text-neutral-300">
@@ -450,8 +500,8 @@ export function AcceptanceView({ project }: { project: ProjectItem }) {
             <div className="mt-2 flex flex-wrap items-center gap-2">
               <input
                 data-acceptance-note={t.task_id}
-                value={notes[t.task_id] ?? ""}
-                onChange={(e) => setNotes((n) => ({ ...n, [t.task_id]: e.target.value }))}
+                value={noteOf(t.task_id)}
+                onChange={(e) => setBucket("selections", `acceptance:note:${t.task_id}`, e.target.value)}
                 placeholder="验收说明／退回原因（可留空，但退回建议写清）"
                 className="min-w-40 flex-1 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-[11px] text-neutral-200 placeholder:text-neutral-600"
               />
