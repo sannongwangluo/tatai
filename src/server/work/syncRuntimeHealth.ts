@@ -76,3 +76,58 @@ export function readSyncDiscoveryIssues(dataDir: string, projectId: string | nul
 export function clearSyncDiscoveryIssues(dataDir: string): void {
   store.delete(path.resolve(dataDir));
 }
+
+// ── 派发/回包**健康对账**（V09-31/37 复审 A；契约 U1） ──
+
+/**
+ * 健康在作业运行期间变过：客户端拿到的是"回包前刚出现的新错误 + 旧 passed 报告"这种**不能信任**的组合。
+ * 调用方应回**明确不可用**（503），而不是把新错误拼到旧结论上冒充通过。
+ */
+export class HealthUnstable extends Error {
+  readonly code = "HEALTH_UNSTABLE";
+  readonly issues: string[];
+  constructor(issues: string[]) {
+    super(
+      "宿主后台健康在只读作业运行期间持续变化：本次结论无法与当前后台发现错误对齐——" +
+        "按明确不可用返回（有界重算后仍不稳定），不用旧结论顶替（DESIGN.md §6.8；契约 U1）",
+    );
+    this.issues = issues;
+  }
+}
+
+function sameIssues(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sa = [...a].sort();
+  const sb = [...b].sort();
+  for (let i = 0; i < sa.length; i++) if (sa[i] !== sb[i]) return false;
+  return true;
+}
+
+/**
+ * 跑一个**依赖宿主后台发现错误**的只读作业，并在回包前做**有界健康对账**。
+ *
+ * 为什么必须这样（复审 A 的实证缺陷）：worker_threads 有**独立模块内存**，`syncRuntimeHealth` 的
+ * 汇**不共享**——worker 里读到的是空汇（等于把宿主故障当"后台无故障"）。所以：
+ *   · 派发时由宿主主线程读出真实错误，随作业参数**显式带入** worker；
+ *   · worker 回包后**再读一次**宿主汇：与派发时不一致（作业运行期间后台健康变了）→ 有界重算；
+ *   · 连续 `maxAttempts` 轮都还在变（持续抖动）→ 抛 `HealthUnstable`（调用方回 503 明确不可用），
+ *     **绝不**把回包前刚出现的新错误拼到旧 passed 报告上冒充通过。
+ *
+ * 返回的 `issues` 恒等于**产生 `value` 那一轮**的宿主汇——信封里的健康与报告同源同版。
+ */
+export async function runWithHostHealth<T>(
+  readIssues: () => string[],
+  run: (issues: string[]) => Promise<T>,
+  opts: { maxAttempts?: number } = {},
+): Promise<{ value: T; issues: string[] }> {
+  const max = opts.maxAttempts ?? 3;
+  let last: string[] = [];
+  for (let attempt = 1; attempt <= max; attempt++) {
+    const dispatchIssues = readIssues();
+    const value = await run(dispatchIssues);
+    const after = readIssues();
+    if (sameIssues(dispatchIssues, after)) return { value, issues: after };
+    last = after;
+  }
+  throw new HealthUnstable(last);
+}

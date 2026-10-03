@@ -11,6 +11,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { LiveSnapshot } from "../../server/live";
 import { getLive, projectEventsUrl, type ProjectItem } from "../api";
+import { invalidateSharedReads } from "../sharedRead";
+import { useBoundedReloader } from "../useProjectRefresh";
+
+/** SSE 事件合并窗口（毫秒）：文件监听一批改动可能连推多行，窗口内只重取一次（有界，不每事件一请求）。
+ *  与 ChangesEntry 的尾随口径一致；已知变化先作废读取代际，重取不并入变化前发出的在途 GET。 */
+const RESYNC_DEBOUNCE_MS = 300;
 
 /** 秒 → 显示用 mm:ss / hh:mm:ss（"N 秒前"那种粗粒度就够） */
 function ago(ms: number): string {
@@ -46,12 +52,14 @@ export function LiveView({ project }: { project: ProjectItem }) {
 
   /** 拉快照（唯一入口）：SSE 事件、断线重连、5s 轮询、错误横幅的「重试」全走它。
    *  Q139：失败时**只置 loadError、不动作**——快照留在界面上，但下面按"数据源没回话"显示，
-   *  不删旧数据、也不把它当成"项目没动静"的证据。 */
-  const resync = useCallback(() => {
+   *  不删旧数据、也不把它当成"项目没动静"的证据。
+   *  V09-36/U4 复审：走 useBoundedReloader——同项目在途期间再触发只记一笔、回来后再补一次（不并发堆积、
+   *  慢响应也不会被每轮对账反复丢弃）；换项目/卸载作废旧代并中止在途，旧回包不写进新界面（A→B→A）。 */
+  const load = useCallback((signal: AbortSignal): Promise<void> => {
     const id = projectIdRef.current;
-    getLive(id)
+    return getLive(id, { signal })
       .then((live) => {
-        if (projectIdRef.current !== id) return; // 换项目了：这份回包作废
+        if (signal.aborted || projectIdRef.current !== id) return; // 换项目/卸载了：这份回包作废
         setSnap(live);
         setLoadError(null);
         // §3.1：自动重连/重试**不清空最后成功数据**，并且要显示**观测时间**——
@@ -60,10 +68,11 @@ export function LiveView({ project }: { project: ProjectItem }) {
         setThresholdSec((cur) => cur ?? Math.round(live.stall_threshold_ms / 1000));
       })
       .catch((e: Error) => {
-        if (projectIdRef.current !== id) return;
+        if (signal.aborted || projectIdRef.current !== id) return;
         setLoadError(e.message);
       });
   }, []);
+  const resync = useBoundedReloader(project.id, load);
 
   // 拉快照 + SSE 实时刷新 + 5s 轮询对账
   useEffect(() => {
@@ -75,17 +84,51 @@ export function LiveView({ project }: { project: ProjectItem }) {
     setObservedAt(null);
     resync();
 
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    // 一批事件合并成一次重取（有界，不每事件一请求）；已知变化先作废读取代际，
+    // 重取不并入变化前发出的在途 GET（同项目在途读共享的"已知失效"接线）。
+    const scheduleResync = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        resync();
+      }, RESYNC_DEBOUNCE_MS);
+    };
+    const resyncNow = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      resync();
+    };
+
     const es = new EventSource(projectEventsUrl(projectId));
-    es.onopen = resync; // 断线重连后重新对账，断连期间的事件不丢
+    es.onopen = () => {
+      // 已知失效：断线重连后重新对账，断连期间的事件不丢；不并入重连前发出的在途 GET
+      invalidateSharedReads();
+      resyncNow();
+    };
     es.onmessage = (ev) => {
       const data = JSON.parse(ev.data as string) as { hello?: boolean };
       if (data.hello) return;
-      resync(); // 文件变更真推送：立即重新合成，动作流无刷新上屏
+      // 文件变更真推送：已知变化先作废读取代际（不并入变化前在途），合并窗口后重新合成上屏
+      invalidateSharedReads();
+      scheduleResync();
     };
-    const poll = setInterval(resync, 5000); // Gate/任务变化走轻轮询对账（口径见 live.ts）
+    // Gate/任务变化走轻轮询对账（口径见 live.ts）；隐藏页不对账（契约 F2），回前台立即补拉
+    const poll = setInterval(() => {
+      if (document.visibilityState === "visible") resync();
+    }, 5000);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        invalidateSharedReads();
+        resyncNow();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
+      if (timer !== null) clearTimeout(timer);
       es.close();
       clearInterval(poll);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [project.id, resync]);
 

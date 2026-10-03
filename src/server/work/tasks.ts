@@ -424,10 +424,13 @@ export function foldTaskStates(events: WorkEvent[]): TaskProjection {
   return { states, last_seq, ignored_entities: [...ignored].sort() };
 }
 
-/** 从磁盘事件文件读并折叠出任务状态（读路径；中段损坏会抛，不吞） */
-export function readTaskStates(workDir: string): TaskProjection {
-  const { events } = loadEvents(workDir);
-  return foldTaskStates(events);
+/**
+ * 从磁盘事件文件读并折叠出任务状态（读路径；中段损坏会抛，不吞）。
+ * `events` 给定时直接折叠这份**同一 workDir 的**现读快照，不再读盘——来源一致性由调用方保证
+ * （见 `statusProjection.EventsSnapshot`／`eventsOfSnapshot`）；缺省仍现读，行为不变。
+ */
+export function readTaskStates(workDir: string, events?: WorkEvent[]): TaskProjection {
+  return foldTaskStates(events ?? loadEvents(workDir).events);
 }
 
 /** 写侧门禁拒因（`service.submit` 的 detail.reason；与 `claims.claimTask` 同一判据） */

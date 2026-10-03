@@ -1829,9 +1829,13 @@ export function foldExecutions(events: readonly WorkEvent[]): ExecutionRecord[] 
   );
 }
 
-/** 盘上事件里的执行记录（只读；残缺尾行按 V06-01 口径隔离记录，不粘行） */
-export function readExecutions(workDir: string): ExecutionRecord[] {
-  return foldExecutions(loadEvents(workDir).events);
+/**
+ * 盘上事件里的执行记录（只读；残缺尾行按 V06-01 口径隔离记录，不粘行）。
+ * `events` 给定时直接折叠这份**同一 workDir 的**现读快照，不再读盘——来源一致性由调用方保证
+ * （见 `statusProjection.EventsSnapshot`／`eventsOfSnapshot`，V09-30）；缺省仍现读，行为不变。
+ */
+export function readExecutions(workDir: string, events?: WorkEvent[]): ExecutionRecord[] {
+  return foldExecutions(events === undefined ? loadEvents(workDir).events : events);
 }
 
 export function readExecution(workDir: string, executionId: string): ExecutionRecord | null {

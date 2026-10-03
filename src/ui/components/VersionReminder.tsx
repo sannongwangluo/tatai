@@ -34,6 +34,8 @@
 //       所以新一批一定重新露面。
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getGitStatus, projectEventsUrl, type GitStatusPayload, type ProjectItem } from "../api";
+import { invalidateSharedReads } from "../sharedRead";
+import { useBoundedReloader } from "../useProjectRefresh";
 
 /** SSE 事件合并窗口（毫秒）：文件监听一批改动可能连推多行，窗口内只重探一次 */
 const RESYNC_DEBOUNCE_MS = 500;
@@ -122,11 +124,14 @@ export function VersionReminder({ project }: { project: ProjectItem }) {
   const fingerprintKey = `${STORAGE_PREFIX}batch.${project.id}`;
   const snoozeKey = `${STORAGE_PREFIX}snoozed.${project.id}`;
 
-  const load = useCallback(() => {
+  const load = useCallback((signal: AbortSignal): Promise<void> => {
     const id = project.id;
-    return getGitStatus(id)
+    // getGitStatus 自 2026-10-03 起收 `FetchOpts.signal`（与 getLive/getChanges 同一条口径）：
+    // 这里把它透传下去，换项目/卸载时由 useBoundedReloader abort 在途网络（**真正中止**，
+    // 不是只过滤旧回包）；下面 `signal.aborted` 仍作落地前判据（§3.1 旧项目的响应不许写进新界面）。
+    return getGitStatus(id, { signal })
       .then((p) => {
-        if (projectIdRef.current !== id) return; // §3.1：旧项目的响应不许写进新项目的界面
+        if (signal.aborted || projectIdRef.current !== id) return; // §3.1：旧项目的响应不许写进新项目的界面
         setPayload(p);
         setLoadError(null);
         const fp = p.reminder.change_fingerprint;
@@ -163,11 +168,13 @@ export function VersionReminder({ project }: { project: ProjectItem }) {
         setBatchNew(true);
       })
       .catch((e: Error) => {
-        if (projectIdRef.current !== id) return;
+        if (signal.aborted || projectIdRef.current !== id) return;
         setLoadError(e.message);
         setPayload(null);
       });
   }, [project.id, fingerprintKey]);
+  /** V09-36/U4 复审：有界在途——同项目在途期间再触发只记一笔、回来后再补一次（SSE 连推不每事件一请求）。 */
+  const reload = useBoundedReloader(project.id, load);
 
   // 切项目：重置现场，拉一次，并订阅项目事件（成果提交 → 变更流水/证据变化 → SSE）
   useEffect(() => {
@@ -180,21 +187,39 @@ export function VersionReminder({ project }: { project: ProjectItem }) {
     setBatchNew(false);
     setSnoozed(readJson<string[]>(snoozeKey, []));
 
-    void load();
+    reload();
 
     let timer: ReturnType<typeof setTimeout> | null = null;
+    const schedule = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        reload();
+      }, RESYNC_DEBOUNCE_MS);
+    };
+    let firstOpen = true;
     const es = new EventSource(projectEventsUrl(project.id));
+    es.onopen = () => {
+      // 已知失效：重连后重新探测（断连期间可能有成果提交）；不并入重连前发出的在途 GET。
+      // 首次连接由上面那次 reload() 覆盖，不重复拉。
+      invalidateSharedReads();
+      if (firstOpen) {
+        firstOpen = false;
+        return;
+      }
+      schedule();
+    };
     es.onmessage = (ev) => {
       const data = JSON.parse(ev.data as string) as { hello?: boolean };
       if (data.hello) return; // 握手不算事件（打开项目那一次已单独拉过）
-      if (timer !== null) clearTimeout(timer);
-      timer = setTimeout(() => void load(), RESYNC_DEBOUNCE_MS);
+      invalidateSharedReads(); // 已知变化：不并入变化前发出的在途 GET
+      schedule();
     };
     return () => {
       if (timer !== null) clearTimeout(timer);
       es.close();
     };
-  }, [project.id, load, snoozeKey]);
+  }, [project.id, reload, snoozeKey]);
 
   const reminder = payload?.reminder ?? null;
   const fingerprint = reminder?.change_fingerprint ?? null;
@@ -225,7 +250,7 @@ export function VersionReminder({ project }: { project: ProjectItem }) {
 
   const onRefresh = () => {
     setReloadTick((n) => n + 1);
-    void load();
+    void reload();
   };
 
   const onCopy = () => {

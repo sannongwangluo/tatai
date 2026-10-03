@@ -14,6 +14,7 @@
 // 到点收工，缺口由 stats.budget_exhausted 标出（不许当成"这就是全部"）。
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { getProject } from "../server/registry";
 import { WsError } from "../server/workstation";
 import {
@@ -76,6 +77,11 @@ export interface ExpandResult {
   children_offset?: number;
   children_returned?: number;
   children_has_more?: boolean;
+  /** V09-35（契约 U3）：传了 `childrenSource` 的分页调用才带——直接子级**身份清单指纹**
+   *  （排序后的 `kind\0name` 的 sha256，完整 64 位）。它只证明"分页窗口的成员集合未变"，
+   *  **不**证明子级内容未变（内容证明要靠实际内容核验，mtime/size/seq 都不算，DESIGN §6.8／契约 U1）。
+   *  同一指纹下逐页取回无漏无重；指纹变了⇒分页来源版本失效，调用方须从 0 重取（不跨版本拼页）。 */
+  children_fingerprint?: string;
   stats: {
     /** 子树内文件总数（截断时只算保留的那部分：被截断的枝不遍历，§4.3 第 2 招） */
     subtree_files: number;
@@ -96,6 +102,23 @@ export interface ExpandResult {
 
 const toRel = (root: string, abs: string) =>
   path.relative(root, abs).split(path.sep).join("/");
+
+/** Windows 上盘符/大小写不敏感：包含判断按平台归一，避免同路径大小写差异造成误判 */
+const sameOrInside = (root: string, target: string): boolean => {
+  const r = process.platform === "win32" ? root.toLowerCase() : root;
+  const t = process.platform === "win32" ? target.toLowerCase() : target;
+  return t === r || t.startsWith(r.endsWith(path.sep) ? r : r + path.sep);
+};
+
+/**
+ * V09-35（契约 U3）：直接子级**身份清单指纹**——分页的「来源版本」。
+ * 只吃 `kind`（dir/file）+ 名字，排序后 sha256（完整 64 位）。分页窗口只由"有哪些子级、
+ * 是目录还是文件"决定；子级内容变化不动窗口（故**不**声称内容未变）。增/删/改名/换类型 → 指纹变。
+ */
+export function directChildrenFingerprint(entries: readonly { name: string; kind: "dir" | "file" }[]): string {
+  const lines = entries.map((e) => `${e.kind}\u0000${e.name}`).sort();
+  return crypto.createHash("sha256").update(lines.join("\n"), "utf8").digest("hex");
+}
 
 /** 变动点集合缓存：(文件路径, mtime, size) 未变即同一份内容——changes.jsonl 是追加流水，
  *  只有"又追加了"才会变 size/mtime。A4 每展开一个节点都要这份集合，万行级全量重读纯属重复 IO。 */
@@ -157,17 +180,21 @@ function recentChangedPaths(root: string): Set<string> {
  *   聚合节点，而是把排序后全量直接子级按 `[childrenOffset, childrenOffset+childrenLimit)` 开窗，
  *   全是真实子级；返回体额外带 children_total/offset/returned/has_more 四字段。不传（undefined）＝
  *   缺省调用，行为与概览默认逐字节相同（不含这四字段）。
+ * @param opts.childrenSource V09-35（契约 U3）：仅分页模式下生效——额外带 `children_fingerprint`
+ *   （直接子级身份清单指纹＝分页来源版本）。缺省不传＝HTTP/旧调用输出逐字节不变。
  */
 export function expandDirectory(
   root: string,
   modulePath: string,
-  opts: { childrenLimit?: number; childrenOffset?: number } = {},
+  opts: { childrenLimit?: number; childrenOffset?: number; childrenSource?: boolean } = {},
 ): ExpandResult {
   const t0 = Date.now();
   const deadline = t0 + WALK_LIMITS.maxMs;
   const abs = path.resolve(root);
   if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
-    throw new WsError("INVALID_INPUT", `目录不存在或不是目录: ${abs}`);
+    // L2 复审修正：错误文案不得外发本机绝对根路径（MCP 回执侧没有 HTTP 的 withoutLocalPaths 脱敏）。
+    // 只给项目相对信息：调用方能据此知道"项目根不可用"，同时不泄漏磁盘布局。
+    throw new WsError("INVALID_INPUT", `目录不存在或不是目录（项目根路径不可用；module_path=${modulePath === "" ? "." : modulePath}）`);
   }
   // 模块路径合法性：posix 相对路径，不许跳出项目根，不许含忽略段。
   // 反斜杠先按分隔符归一：下面的 dirAbs 走 path.join（Windows 上是 win32 语义），会把段内的
@@ -187,6 +214,23 @@ export function expandDirectory(
   const dirAbs = norm === "." ? abs : path.join(abs, ...norm.split("/"));
   if (!fs.existsSync(dirAbs) || !fs.statSync(dirAbs).isDirectory()) {
     throw new WsError("INVALID_INPUT", `模块路径不是目录: ${modulePath}`);
+  }
+  // V09-35（契约 U3）中间联接点防逃逸：上面的词法校验只挡 `..`／绝对路径，挡不住
+  // `src/link/...` 里 `link` 是指向项目根外的 junction／目录软链——join 出来的 dirAbs 词法上仍在根内。
+  // 故对**根**与**目标目录**都取 realpath 后判包含；解析后落在根外一律拒（fail-closed，不泄漏根外清单）。
+  try {
+    const realRoot = fs.realpathSync(abs);
+    const realDir = fs.realpathSync(dirAbs);
+    if (!sameOrInside(realRoot, realDir)) {
+      throw new WsError(
+        "INVALID_INPUT",
+        `模块路径经联接点/软链解析后落在项目根外: ${modulePath}（realpath 逃逸，拒绝展开）`,
+      );
+    }
+  } catch (e) {
+    if (e instanceof WsError) throw e;
+    // realpath 失败＝路径存在性/权限异常：不按"未逃逸"放行
+    throw new WsError("INVALID_INPUT", `模块路径无法解析真实路径（fail-closed 拒绝）: ${modulePath}`);
   }
 
   // ── 直接子级扫描：子目录 → 子模块节点，直属文件 → 文件节点（忽略口径同 A1）──
@@ -392,6 +436,14 @@ export function expandDirectory(
           children_has_more: windowStart + keptEntries.length < allChildren.length,
         }
       : {}),
+    // V09-35：仅当显式要求 childrenSource 时带分页来源版本（HTTP/旧调用不带 → 输出逐字节不变）
+    ...(offsetMode && opts.childrenSource === true
+      ? {
+          children_fingerprint: directChildrenFingerprint(
+            allChildren.map((e) => ({ name: e.name, kind: e.isDirectory() ? ("dir" as const) : ("file" as const) })),
+          ),
+        }
+      : {}),
     stats: {
       subtree_files: norm === "." ? directFiles.length : subtreeFiles.length,
       parsed_files: parsedFiles,
@@ -410,7 +462,7 @@ export function expandProject(
   projectId: string,
   modulePath: string,
   dataDir?: string,
-  opts?: { childrenLimit?: number; childrenOffset?: number },
+  opts?: { childrenLimit?: number; childrenOffset?: number; childrenSource?: boolean },
 ): ExpandResult {
   const project = getProject(projectId, dataDir);
   if (!project) {

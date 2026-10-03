@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "doc": "project-notes",
+  "notes": [
+    {
+      "id": "notes:example-module",
+      "responsibility": "示例：说明这个模块负责什么（Agent 编写的待审说明，不是设计/事件/验收事实）",
+      "paths": ["src/example.ts"],
+      "interfaces": ["export function example(): void"],
+      "constraints": ["只读；不改事实源"],
+      "relations": [
+        { "to": "notes:another-module", "kind": "depends_on", "note": "示例：关系声明（没有独立证据时只标 Agent 声明）" }
+      ],
+      "sources": [
+        { "path": "src/example.ts", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" }
+      ],
+      "task_ids": ["V00-00"],
+      "tests": ["scripts/verify-example.ts"],
+      "evidence_refs": ["event:00000000-0000-0000-0000-000000000000"],
+      "declared_by": "agent"
+    }
+  ]
+}

@@ -15,11 +15,14 @@ import { manageRequirementTool, manageChangeTool, importPlanDefinitionsTool } fr
 import { rebindTaskTool } from "./rebindTask";
 import { doctorTool } from "./doctor";
 import { readDesignTool } from "./readDesign";
+import { readPlanTool } from "./readPlan";
+import { expandModuleTool } from "./expandModule";
 import { readProgressTool } from "./readProgress";
 import { reportTaskStatusTool } from "./reportTaskStatus";
 import { reportExecutionTool } from "./reportExecution";
 import { recordWorkEvidenceTool } from "./recordWorkEvidence";
 import { manageBaselineTool } from "./manageBaseline";
+import { projectIndexTool } from "./projectIndex";
 import { selectProjectTool } from "./selectProject";
 import { updateProgressTool } from "./updateProgress";
 import { SYNC_EVIDENCE_TOOLS } from "./syncEvidence";
@@ -31,6 +34,13 @@ export const TOOLS: readonly McpTool[] = [
   listProjectsTool,
   selectProjectTool,
   readDesignTool,
+  // V09-32/V09-33（DESIGN.md §6.8；契约 U3）：施工图**按卡／索引／章节／行范围**原读取材，复用
+  // documents.ts 的分段机制；定义存在与执行台账分开（未入账卡仍可读）；续读绑完整 sha 与项目/文档，
+  // 旧短前缀游标明确失效重取。只读：不存在 write_plan。
+  readPlanTool,
+  // V09-35（DESIGN.md §6.8；契约 U3）：深层结构 MCP 下钻，复用 expandProject（与 HTTP 同一派生）；
+  // 稳定分页 + 来源版本、预算/忽略/静态依赖如实声明、中间联接点防逃逸。只读：不写图/账本、不调模型。
+  expandModuleTool,
   readProgressTool,
   reportTaskStatusTool,
   updateProgressTool,
@@ -70,6 +80,9 @@ export const TOOLS: readonly McpTool[] = [
   // V09-28（DESIGN.md §2.9/§6.7；契约 F1）：正向成套图纸入口（read/preserve/activate 经唯一宿主）。
   // 由 V09-27 统一在本注册表集成（基线工人产出该文件，不在别处另注册）。
   manageBaselineTool,
+  // V09-39（DESIGN.md §6.8；契约 U5/U5.1）：持久项目说明索引——read/impact/coverage 只读（本地读、不拉 writer），
+  // upsert/remove 经唯一宿主（完整文件 hash CAS＋锁内核对＋原子写）。Agent 声明默认待审；未声明≠无影响。
+  projectIndexTool,
 ];
 
 export function findTool(name: string): McpTool | undefined {

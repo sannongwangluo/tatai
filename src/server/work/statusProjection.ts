@@ -55,9 +55,9 @@ import {
   type VerificationSubject,
 } from "./audit";
 import { readTaskStates, type TaskExecutionStatus, type TaskState } from "./tasks";
-import { loadEvents } from "./eventStore";
+import { readLedger } from "./ledgerRead";
 import { latestByTime, parseIsoMs, compareIsoTime } from "../time";
-import type { WorkEvent } from "./types";
+import type { LedgerContentFingerprint, WorkEvent } from "./types";
 import { projectWorkDir } from "../workstation";
 import { tasksFileOf } from "./migrate";
 import {
@@ -1824,17 +1824,60 @@ const noIntegrationRequirements = (reason: string | null, issues: string[] = [])
   by_object: {},
 });
 
+/**
+ * 一次事件账本读取的快照（同一调用链内共享用；事件账本 = 唯一事实源，见 DESIGN.md §2.6）。
+ *
+ * 存在的理由**只是**「同一次调用里少读几遍同一份账本」，不是全局/跨请求缓存：
+ * 快照每次现读、只活在这一次调用栈里，下一次调用立刻能看见新事件。
+ *
+ * 为什么必须带 `work_dir`：快照是**某个项目某个截点**的读数，跨 workDir／跨项目／跨截点复用
+ * 就是把别人的账本当成自己的（`eventsOfSnapshot` 只认来源一致的那一份，不一致就回退现读）。
+ * 空数组是**合法快照**（"这个 workDir 现在没有事件"），不得当作"没传"再读一遍。
+ *
+ * V09-38 复审：读口改为 `readLedger`（有界内容核验解析缓存），并把本次现读的**可验证内容身份**
+ * （`content`：文件字节 / 已证实行边界 / 该段 sha256）随快照带下去——同一条调用链里任务的认领、
+ * 执行、审计与投影都从**同一份已核验读数**派生，而不是各自再读一遍盘。
+ */
+export interface EventsSnapshot {
+  /** 快照来源的事件目录（`projectWorkDir` 的结果）；与调用点的 workDir 不一致即不复用 */
+  work_dir: string;
+  events: WorkEvent[];
+  /** 本次现读的账本内容身份（可验证；旧调用点手造快照可省略，省略即无内容证明） */
+  content?: LedgerContentFingerprint;
+}
+
+/** 现读一份当前账本快照（读不出来照常抛，由调用方决定怎么如实表达） */
+export function eventsSnapshotOf(projectId: string, dataDir: string): EventsSnapshot {
+  const work_dir = projectWorkDir(projectId, dataDir);
+  const read = readLedger(work_dir);
+  return { work_dir, events: read.events, content: read.content };
+}
+
+/**
+ * 取快照里的事件：**只有来源 workDir 与本次一致**才复用，否则回退现读（既有调用点的现读行为不变）。
+ * `snapshot` 为 undefined/null 也现读；`{work_dir, events: []}` 是合法快照，直接返回 `[]`，不 fallthrough。
+ */
+export function eventsOfSnapshot(
+  snapshot: EventsSnapshot | undefined | null,
+  workDir: string,
+): WorkEvent[] {
+  if (snapshot !== undefined && snapshot !== null && snapshot.work_dir === workDir) {
+    return snapshot.events;
+  }
+  return readLedger(workDir).events;
+}
+
 /** 读现场事实（事件 + 图纸定义 + 生效基线）；读不出来如实标 `unreadable`，不假装是空状态 */
 export function collectProjectFacts(
   projectId: string,
   dataDir: string,
-  opts: { code_revision?: string | null } = {},
+  opts: { code_revision?: string | null; events?: EventsSnapshot } = {},
 ): ProjectFacts {
   const workDir = projectWorkDir(projectId, dataDir);
-  const { events } = loadEvents(workDir);
-  const findings = readFindings(workDir);
+  const events = eventsOfSnapshot(opts.events, workDir);
+  const findings = readFindings(workDir, events);
   const audit = foldAuditRecords(events);
-  const tasksProjection = readTaskStates(workDir);
+  const tasksProjection = readTaskStates(workDir, events);
   let definitions: TaskDefinition[] = [];
   const revisions: SourceRevisions = {};
   let baseline: ProjectFacts["baseline"] = null;

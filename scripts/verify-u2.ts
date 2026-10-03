@@ -56,10 +56,17 @@ const RELEASE_EXE = path.join(TAURI_DIR, "target", "release", "tatai.exe");
 // 判据一字不动（仍是逐个点名的"恰好"，不放过、不放宽；**不**改成从注册表动态生成期望）。
 // 2026-10-02（V09-27/V09-28）定向订正：注册表新增 report_execution / record_work_evidence /
 // manage_baseline（契约 F3/F1），说明与清单同步为 **25 个**——判据一字不动（仍是逐个点名的"恰好"）。
+// 2026-10-03（统一优化 V09-32/V09-33/V09-35/V09-39）定向订正：注册表新增 read_plan / expand_module /
+// project_index（DESIGN §6.8，契约 U3/U5），说明与清单同步为 **28 个**——判据一字不动
+// （仍是逐个点名的"恰好"，不放过、不放宽；**不**改成从注册表动态生成期望；语义由各自 verify 守）。
 const MCP_TOOL_NAMES = [
   "list_projects",
   "select_project",
   "read_design",
+  // 2026-10-03（V09-32/V09-33/V09-35，DESIGN §6.8／契约 U3）：施工图按卡/索引/章节/行范围原读取材 read_plan、
+  // 深层结构下钻 expand_module——只读，登记为**命名工具**（语义由 verify:v09-32/33/35 守）。
+  "read_plan",
+  "expand_module",
   "read_progress",
   "report_task_status",
   "update_progress",
@@ -93,8 +100,11 @@ const MCP_TOOL_NAMES = [
   "report_execution",
   "record_work_evidence",
   "manage_baseline",
+  // 2026-10-03 V09-39（DESIGN §6.8／契约 U5/U5.1）：持久项目说明索引 project_index——
+  // read/impact/coverage 只读本地，upsert/remove 经唯一宿主；语义由 verify:unified-index 守。
+  "project_index",
 ] as const;
-const MCP_TOOL_COUNT = MCP_TOOL_NAMES.length; // 25
+const MCP_TOOL_COUNT = MCP_TOOL_NAMES.length; // 28
 
 const ok = (cond: boolean, label: string) => {
   console.log(`[verify] ${cond ? "PASS" : "FAIL"} ${label}`);
@@ -597,7 +607,7 @@ try {
   const extraTools = toolNames.filter((n) => !(MCP_TOOL_NAMES as readonly string[]).includes(n));
   ok(
     missingTools.length === 0 && extraTools.length === 0,
-    `⑦ 包内工具逐个点名对账（${MCP_TOOL_NAMES.length} 个：一期 8 + get_arch/ask_flash + V06-10 三件套 + C-015 三件套 + V07-02 rebind_task + V07-04 doctor + V09-19 get_project_graphs + V09-23 同步域三接口 register_sync_contract/scan_sync_evidence/read_sync_status + V09-27/V09-28 report_execution/record_work_evidence/manage_baseline）——缺 ${missingTools.join("/") || "无"}，多 ${extraTools.join("/") || "无"}`,
+    `⑦ 包内工具逐个点名对账（${MCP_TOOL_NAMES.length} 个：一期 8 + get_arch/ask_flash + V06-10 三件套 + C-015 三件套 + V07-02 rebind_task + V07-04 doctor + V09-19 get_project_graphs + V09-23 同步域三接口 register_sync_contract/scan_sync_evidence/read_sync_status + V09-27/V09-28 report_execution/record_work_evidence/manage_baseline + V09-32/33/35 read_plan/expand_module + V09-39 project_index）——缺 ${missingTools.join("/") || "无"}，多 ${extraTools.join("/") || "无"}`,
   );
   const listed2 = await client.callTool({ name: "list_projects", arguments: {} });
   const projectsText = (listed2.content as { type: string; text?: string }[])[0]?.text ?? "";

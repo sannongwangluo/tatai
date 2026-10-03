@@ -20,6 +20,8 @@ import http from "node:http";
 import { resolveDataDir } from "../registry";
 import { createWorkHost } from "../workHost";
 import { startSyncDiscovery, stopSyncDiscovery } from "./syncDiscovery";
+// V09-37：独立写入服务宿主退出时也只收回**自己起的**只读 worker 线程（不碰外部 Agent/其它进程）。
+import { stopReadWorkers } from "./readWorkerPool";
 import { WorkServiceClient, WORK_TOKEN_HEADER } from "./service";
 import { descriptorBelongsTo, publishUnderOwnershipLock, readOwnership } from "./serviceOwnership";
 
@@ -103,6 +105,12 @@ async function main(): Promise<void> {
         await stopSyncDiscovery();
       } catch {
         // 停止失败不挡退出（描述符照撤，客户端自愈）
+      }
+      // V09-37：收回本进程起的只读 worker 线程（只 terminate 自己拥有的；不碰外部进程）。
+      try {
+        await stopReadWorkers();
+      } catch {
+        // 收不回也不挡退出——进程结束由 OS 回收线程
       }
       try {
         workHost.unpublish();

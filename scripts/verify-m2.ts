@@ -10,8 +10,9 @@
 //      note 留痕（2026-09-19 主人拍板）：首报带 note 落盘、再报不传 note 保留旧值、再报传新 note 覆盖
 //   ⑤ update_progress 改模块四色状态，progress.json 里 gate.current_step 未被动
 //   ⑥ select_project 的 project_id / path 两种入参各调一次
-//   ⑦ listTools 恰好 25 个（一期 8 + §6.4 两件 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 +
-//      V07-04 doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口逐个点名）；V06-10
+//   ⑦ listTools 恰好 28 个（一期 8 + §6.4 两件 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 +
+//      V07-04 doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口 +
+//      V09-32/33/35 read_plan/expand_module + V09-39 project_index 逐个点名）；V06-10
 //      三件套的入参 schema 点到点 + 各真调一次（没有 v2 事实的窗口期：入口给只读结论，两个写口明确拒绝）；
 //      C-015 三件套（manage_requirement/manage_change/import_plan_definitions）的 schema 点到点与
 //      负例真链路在 verify-requirements.ts ⑧-5（96 条守着）、写口服务侧校验在 verify-c015-service.ts，
@@ -124,6 +125,13 @@ async function main(): Promise<void> {
   // （不从注册表动态生成期望）。其行为语义由 verify:progress-reporting（handler+真宿主）与
   // verify:forward-journey（真 stdio MCP + 真 index.ts 完整旅程）各自守；本脚本只做身份/集合断言。
   const V0927_TOOLS = ["report_execution", "record_work_evidence", "manage_baseline"];
+  // 2026-10-03（统一优化 V09-32/33/35，DESIGN §6.8／契约 U3）：施工图按卡/索引/章节/行范围原读取材
+  // read_plan、深层结构下钻 expand_module，注册表 25 → 27。同一个口径（**逐个点名登记**、数量判据仍是"恰好"，
+  // 不从注册表动态生成期望）。语义由 verify:v09-32/v09-33/v09-35 各自守；本脚本只做身份/集合断言。
+  const V0932_TOOLS = ["read_plan", "expand_module"];
+  // 2026-10-03（统一优化 V09-39，DESIGN §6.8／契约 U5/U5.1）：持久项目说明索引 project_index，注册表 27 → 28。
+  // 同一个口径（**逐个点名登记**、数量判据仍是"恰好"）。语义由 verify:unified-index 守；本脚本只做身份/集合断言。
+  const V0939_TOOLS = ["project_index"];
   ok(
     EXPECTED.every((n) => names.includes(n)) &&
       M5_TOOLS.every((n) => names.includes(n)) &&
@@ -134,6 +142,8 @@ async function main(): Promise<void> {
       V0919_TOOLS.every((n) => names.includes(n)) &&
       V0923_TOOLS.every((n) => names.includes(n)) &&
       V0927_TOOLS.every((n) => names.includes(n)) &&
+      V0932_TOOLS.every((n) => names.includes(n)) &&
+      V0939_TOOLS.every((n) => names.includes(n)) &&
       names.length ===
         EXPECTED.length +
           M5_TOOLS.length +
@@ -143,8 +153,10 @@ async function main(): Promise<void> {
           V0704_TOOLS.length +
           V0919_TOOLS.length +
           V0923_TOOLS.length +
-          V0927_TOOLS.length,
-    `listTools 恰含一期 8 个 + 扩充 2 个 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 + V07-04 doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口（实际 ${names.length} 个）`,
+          V0927_TOOLS.length +
+          V0932_TOOLS.length +
+          V0939_TOOLS.length,
+    `listTools 恰含一期 8 个 + 扩充 2 个 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 + V07-04 doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口 + V09-32/33/35 两件 + V09-39 project_index（实际 ${names.length} 个）`,
   );
   ok(!names.includes("write_design"), "权限证伪②：listTools 不存在 write_design");
   ok(
@@ -323,14 +335,21 @@ async function main(): Promise<void> {
   };
   const entryTool = tools.tools.find((t) => t.name === "project_entry");
   const entrySchema = schemaOf("project_entry");
+  const entryProps = entrySchema.properties ?? {};
+  // 定向更新（V09-34，2026-10-03）：入参 schema 由 §6.7 的既有五字段 + 一个**可选 boolean** `preconditions`
+  //   变为恰好六字段。判据未放宽——仍是"恰好这几个键、多一个少一个都红"：
+  //     旧期望 ["client_capabilities","known_revision","project_id","resume_hint","role"]｜依据：§6.7 五字段
+  //     新期望 上述五项 + "preconditions"（type=boolean，默认 false 时**不改变**默认 entry 的既有业务字段）
+  //   `required` 不变（仍只 project_id/role），`additionalProperties:false` 仍由实现侧守住。
   ok(
     entrySchema.required?.length === 2 &&
       entrySchema.required[0] === "project_id" &&
       entrySchema.required[1] === "role" &&
-      Object.keys(entrySchema.properties ?? {}).sort().join(",") ===
-        ["client_capabilities", "known_revision", "project_id", "resume_hint", "role"].join(",") &&
+      Object.keys(entryProps).sort().join(",") ===
+        ["client_capabilities", "known_revision", "preconditions", "project_id", "resume_hint", "role"].join(",") &&
+      (entryProps.preconditions as { type?: string } | undefined)?.type === "boolean" &&
       (entryTool?.description ?? "").includes("只读"),
-    "V06-10 project_entry 入参 schema 点到点：恰好 §6.7 五字段、必填 project_id/role、描述写明只读",
+    "V06-10 project_entry 入参 schema 点到点：原 §6.7 五字段 + V09-34 可选 boolean preconditions（恰 6）、required 仍仅 project_id/role、描述写明只读",
   );
   const claimSchema = schemaOf("claim_task");
   const opEnum = ((claimSchema.properties?.op ?? {}) as { enum?: string[] }).enum ?? [];

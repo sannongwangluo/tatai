@@ -15,6 +15,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeLine } from "../../server/watcher";
 import { getChanges, projectEventsUrl, type ProjectItem } from "../api";
+import { invalidateSharedReads } from "../sharedRead";
 import { ChangesPage } from "./ChangesPage";
 
 /** Q40：SSE 事件合并窗口（毫秒）——窗口内连续到达的变更只重拉一次 */
@@ -62,6 +63,10 @@ export function ChangesEntry({ project }: { project: ProjectItem }) {
         return;
       }
       inflight = true;
+      // V09-36/U4 复审：本组件的对账都是**已知失效**（首拉/重连/真变更/查看）触发——先作废读取代际，
+      // 这次重拉不并入变化前发出的在途 GET（同项目在途读共享的"已知失效"接线）。
+      // 有界性沿用本组件的既有口径：300ms 尾随防抖 + 在途去重 + pending 补拉一次。
+      invalidateSharedReads();
       getChanges(projectId, 50, { signal: controller.signal })
         .then((changes) => {
           if (disposed || controller.signal.aborted) return; // 换项目/卸载了：这份回包作废（§3.1）

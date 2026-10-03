@@ -194,11 +194,29 @@ export interface SyncBatchReport {
   title: string;
   /** 是否仍为现行批次（被 supersede 的旧批次 = false，只作历史，不再阻断） */
   active: boolean;
+  /**
+   * 本行是不是**历史批次**（active=false，已被 supersede）。历史批次不再做本次实时核验：
+   * `verdict`/`items` 来自**账本里最后一次有效核验回执**（`verified_at` 那一刻的结论），
+   * 只作历史，不计入范围与差项、不再阻断；**不得**把历史通过当成当前有效。
+   */
+  /**
+   * 本行结论是不是**来自账本回执、而不是本次实时核验**。默认口径下 `historical ⟺ active=false`
+   * （已被 supersede 的历史批次）：`verdict`/`items` 来自**账本里最后一次有效核验回执**
+   * （`verified_at` 那一刻的结论），只作历史，不计入范围与差项、不再阻断；
+   * **不得**把历史通过当成当前有效。显式历史复查（`readSyncStatus` 的 `liveHistorical`）为 `false`
+   * ——那次确实做了实时求值（行仍按 `active` 归入历史组）。
+   */
+  historical: boolean;
   blocks_entry: boolean;
   verdict: SyncVerdict;
   contract_sha256: string;
   /** 证据包路径（项目根内相对路径；没有证据为 null） */
   evidence_path: string | null;
+  /**
+   * **历史回执**的核验时间（ISO）；null = 账本无有效回执（明确未核验，不冒充通过）。
+   * 本次实时核验的行恒为 null（现行批次的核对时间看报告级 `checked_at`）。
+   */
+  verified_at: string | null;
   items: SyncItemReport[];
 }
 

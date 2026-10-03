@@ -214,11 +214,16 @@ def item(iid, label, required, verdict, expected, actual, reasons=None, artifact
     }
 
 
-def batch(bid, title, verdict, items, evidence_path=None, active=True, blocks_entry=True):
+def batch(bid, title, verdict, items, evidence_path=None, active=True, blocks_entry=True,
+          historical=None, verified_at=None):
+    # `historical` 默认跟随 `active`（2026-10-03 增量核验后的默认口径：历史批次结论来自账本回执）；
+    # 显式传 historical=False + active=False 可造「本次显式实时复查」那一档。
+    if historical is None:
+        historical = not active
     return {
-        "batch_id": bid, "title": title, "active": active, "blocks_entry": blocks_entry,
-        "verdict": verdict, "contract_sha256": "a" * 64, "evidence_path": evidence_path,
-        "items": items,
+        "batch_id": bid, "title": title, "active": active, "historical": historical,
+        "blocks_entry": blocks_entry, "verdict": verdict, "contract_sha256": "a" * 64,
+        "evidence_path": evidence_path, "verified_at": verified_at, "items": items,
     }
 
 
@@ -340,7 +345,8 @@ STUB_UNCONFIGURED_INCOMPLETE = report(FIX_A, False, "incomplete", [
     ], evidence_path=EV),
 ], collection={"complete": False, "reasons": ["达到扫描上限，未取齐"]})
 
-# ── active 与已 superseded 历史：范围/差项按现行批次，历史仍详情可查 ──
+# ── active 与已 superseded 历史：范围/差项按现行批次，历史按**账本回执**展示（不再实时求值）──
+HIST_VERIFIED_AT = "2026-09-30T17:00:00+08:00"
 STUB_ACTIVE_AND_HISTORY = report(FIX_A, True, "failed", [
     batch("batch-2", "2026-09-30 现行批次", "failed", [
         item("a-1", "现行必需一", True, "passed", {"path": "DESIGN.md"}, {"path": "DESIGN.md"},
@@ -348,10 +354,15 @@ STUB_ACTIVE_AND_HISTORY = report(FIX_A, True, "failed", [
         item("a-2", "现行必需二（缺）", True, "missing", {"path": "PLAN.md"}, None, ["证据包未列出该项"]),
         item("a-3", "现行可选", False, "passed", {"k": 1}, {"k": 1}),
     ], evidence_path=EV, active=True),
+    # 有回执的历史批次：结论与核验时间都来自账本，逐项 actual 为 null、reasons 注明「历史回执」
     batch("batch-1", "2026-09-30 历史批次（已被取代）", "passed", [
-        item("h-1", "历史必需一", True, "passed", {"path": "DESIGN.md"}, {"path": "DESIGN.md"}),
-        item("h-2", "历史必需二（缺）", True, "missing", {"path": "PLAN.md"}, None, ["历史缺"]),
-    ], evidence_path=EV, active=False),
+        item("h-1", "历史必需一", True, "passed", None, None, ["历史回执（%s）：不是本次实时核验" % HIST_VERIFIED_AT]),
+        item("h-2", "历史必需二（缺）", True, "missing", None, None, ["历史回执（%s）：不是本次实时核验" % HIST_VERIFIED_AT]),
+    ], evidence_path=EV, active=False, historical=True, verified_at=HIST_VERIFIED_AT),
+    # 无回执的历史批次：明确「未核验」
+    batch("batch-0", "2026-09-30 历史批次（无回执）", "missing", [
+        item("z-1", "历史必需（未核验）", True, "missing", None, None, ["被取代的历史批次：账本无有效核验回执——明确未核验"]),
+    ], evidence_path=None, active=False, historical=True, verified_at=None),
 ])
 
 
@@ -862,7 +873,7 @@ def run_browser(vite_port, backend):
         page.wait_for_timeout(1800)
         ok(wait_label(page, "发现缺项", timeout=10), "现行批次含缺项 ⇒ 「发现缺项」（label=%r）" % (label(page),))
         ok(sync_attr(page, "data-sync-batches-active") == "1"
-           and sync_attr(page, "data-sync-batches-history") == "1",
+           and sync_attr(page, "data-sync-batches-history") == "2",
            "批次范围分现行/历史（active=%r, history=%r）"
            % (sync_attr(page, "data-sync-batches-active"), sync_attr(page, "data-sync-batches-history")))
         ok(sync_attr(page, "data-sync-items") == "3" and sync_attr(page, "data-sync-items-required") == "2"
@@ -870,11 +881,13 @@ def run_browser(vite_port, backend):
            "主条必需缺数按**现行批次**（items=%r, required=%r, missing=%r），不计入历史"
            % (sync_attr(page, "data-sync-items"), sync_attr(page, "data-sync-items-required"),
               sync_attr(page, "data-sync-items-missing")))
-        ok(sync_attr(page, "data-sync-history-items") == "2",
-           "历史项数单列（history-items=%r）" % (sync_attr(page, "data-sync-history-items"),))
+        ok(sync_attr(page, "data-sync-history-items") == "3"
+           and sync_attr(page, "data-sync-history-verified") == "1",
+           "历史项数单列且区分「有回执/未核验」（history-items=%r, verified=%r）"
+           % (sync_attr(page, "data-sync-history-items"), sync_attr(page, "data-sync-history-verified")))
         page.locator("[data-sync-detail-toggle]").first.click()
         page.wait_for_timeout(400)
-        ok(page.locator("[data-sync-item]").count() == 5,
+        ok(page.locator("[data-sync-item]").count() == 6,
            "历史项仍在详情里可查（共 %d 项）" % page.locator("[data-sync-item]").count())
         cur = page.locator("[data-sync-batch='batch-2']")
         hist = page.locator("[data-sync-batch='batch-1']")
@@ -885,7 +898,19 @@ def run_browser(vite_port, backend):
             hist.locator("summary").first.click()
             page.wait_for_timeout(300)
             ok(hist.first.get_attribute("open") is not None, "历史批次可点开查看（历史仍详情可查）")
-        ok("已被取代" in page.locator("[data-sync-detail-body]").inner_text(), "历史批次标注「已被取代」")
+        detail_text = page.locator("[data-sync-detail-body]").inner_text()
+        ok("已被取代" in detail_text, "历史批次标注「已被取代」")
+        ok(hist.first.get_attribute("data-sync-batch-historical") == "1"
+           and hist.first.get_attribute("data-sync-batch-verified-at") == HIST_VERIFIED_AT,
+           "有回执的历史批次带 historical=1 与核验时间（%r / %r）"
+           % (hist.first.get_attribute("data-sync-batch-historical"),
+              hist.first.get_attribute("data-sync-batch-verified-at")))
+        ok("历史回执" in detail_text and HIST_VERIFIED_AT in detail_text,
+           "详情明确写出「历史回执」与核验时间（不是本次实时核验）")
+        hist0 = page.locator("[data-sync-batch='batch-0']")
+        ok(hist0.count() == 1 and hist0.first.get_attribute("data-sync-batch-verified-at") == "",
+           "无回执历史批次 verified_at 为空（明确未核验，不冒充通过）")
+        ok("未核验" in detail_text, "无回执历史在详情里明确「未核验」")
         page.locator("[data-sync-detail-close]").first.click()
         page.wait_for_timeout(200)
 

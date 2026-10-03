@@ -51,6 +51,8 @@ const WORK_HTTP_STATUS: Record<WorkErrorCode, number> = {
   PROJECTION_FAILED: 500,
   TAIL_QUARANTINED: 500,
   MIDDLE_CORRUPT: 500,
+  // 读取期间账本一直在变：可重试的瞬时态（V09-38 复审登记；与 service.ts 的 HTTP_STATUS 同值）
+  LEDGER_UNSTABLE: 503,
   EVENT_INVALID: 500,
   EVIDENCE_INVALID: 400,
 };

@@ -47,6 +47,10 @@ import { descriptorPidAlive, readServiceDescriptor, WORK_TOKEN_HEADER } from "./
 import { descriptorBelongsTo, publishUnderOwnershipLock, removeDescriptorIfDead } from "./work/serviceOwnership";
 import { handleSyncStatusRoute } from "./work/syncHttp";
 import { startSyncDiscovery, stopSyncDiscovery } from "./work/syncDiscovery";
+// V09-37：桌面宿主退出时也只收回**自己起的**只读 worker 线程（不碰外部 Agent/其它进程）。
+import { stopReadWorkers } from "./work/readWorkerPool";
+import { runReadJob, ReadWorkersUnavailable, ReadQueueFull, ReadJobTimeout, ReadJobFailed, describeReadJobError } from "./work/readWorkerPool";
+import { computeArchBlueprintRead, computeArchRenderRead } from "./work/archReadWorker";
 import { onboardProject } from "./onboard";
 import { requestScanCancel, scanProjectAsync } from "./scanner";
 import { sweepAllTmpResidue } from "./tmpSweep";
@@ -546,7 +550,9 @@ function wsErrorStatus(code: string): number {
  */
 function workErrorStatus(code: WorkErrorCode): number {
   if (code === "VERSION_CONFLICT" || code === "IDEMPOTENCY_CONFLICT") return 409;
-  if (code === "SERVICE_UNAVAILABLE") return 503;
+  // V09-31/37 复审 M1：读取期间账本一直在变（LEDGER_UNSTABLE）是**可重试的瞬时态** → 503（与
+  // `work/service.ts` 的 HTTP_STATUS / `projectIndexHost.ts` 同值）；旧映射漏了它会落到 400，语义错。
+  if (code === "SERVICE_UNAVAILABLE" || code === "LEDGER_UNSTABLE") return 503;
   if (code === "PROJECTION_FAILED" || code === "MIDDLE_CORRUPT" || code === "EVENT_INVALID") {
     return 500;
   }
@@ -823,6 +829,12 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     replyWorkRoutes();
     return;
   }
+  // V09-31（DESIGN §6.8）：唯一宿主**只读入口**（一次返回入口 + 六图摘要，同一份现读快照贯通）——
+  // 桌面宿主同样逐条列名转发（未登记的精确路径会落本文件兜底 404），判据同上：方法 + 精确路径。
+  if (req.method === "GET" && reqPath === "/api/work/entry") {
+    replyWorkRoutes();
+    return;
+  }
   // V09-29 集成：V09-27 上报域（证据正文存/读，`work/reportingHost.ts`）与 V09-28 正向基线
   // （`work/baselineHost.ts`）此前只挂在 workHost 委派链上；桌面宿主 `index.ts` 是**逐条列名**转发，
   // 未登记的精确路径落本文件兜底 404——于是 MCP 在桌面宿主下取不到证据正文写/读口。
@@ -843,6 +855,17 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     return;
   }
   if (req.method === "POST" && reqPath === "/api/work/baseline/activate") {
+    replyWorkRoutes();
+    return;
+  }
+  // V09-39（契约 U5/U5.1）：持久项目说明索引的唯一宿主写面（upsert/remove）也必须在桌面宿主转发
+  // ——否则 MCP `project_index` 写落进本文件兜底 404（daemon 全路径进 workHost，桌面宿主逐条列名）。
+  // 判据同上：**方法 + 精确路径**；两条同时登记进 `remote-routes.ts` 的路由清单（防漂移对账）。
+  if (req.method === "POST" && reqPath === "/api/work/project-index/upsert") {
+    replyWorkRoutes();
+    return;
+  }
+  if (req.method === "POST" && reqPath === "/api/work/project-index/remove") {
     replyWorkRoutes();
     return;
   }
@@ -911,6 +934,52 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         }
       })
       .catch((e: Error) => wsFail(new WsError("INVALID_INPUT", e.message)));
+  };
+
+  // V09-31/37 复审 E：UI 重的**只读** arch 派生（blueprint/provenance/view、render 图合成）优先在只读
+  // worker 线程里跑——主线程事件循环不再被这些派生占住（健康读/轻状态读不受影响）。
+  // worker **基础设施**不可用（起不来/队列满/超时）→ 如实记日志并退化为进程内派生（UI 不因 worker 故障白屏）；
+  // 作业自身失败 → 按原错误口径（WsError）映射，不掩盖。输出红线（`withoutLocalPaths`/`guard.remote`）不变。
+  // 复审根因二：worker 基础设施不可用（起不来/队列满/超时）**不再**回退主线程长算——那会把主线程又占住、
+  // 过载更堵。改为明确可重试错误（503 + 结构化 code）。只有显式 oracle 开关 `TATAI_ARCH_READ_LOCAL=1`
+  // 才允许进程内派生（测试/oracle 用）。
+  const archReadLocalOracle = (process.env.TATAI_ARCH_READ_LOCAL ?? "") === "1";
+  const archReadViaWorker = async <T>(
+    kind: "arch_blueprint" | "arch_render",
+    args: Record<string, unknown>,
+    local: () => T,
+  ): Promise<T> => {
+    try {
+      return (await runReadJob(kind, args)) as T;
+    } catch (e) {
+      if (archReadLocalOracle && (e instanceof ReadWorkersUnavailable || e instanceof ReadQueueFull || e instanceof ReadJobTimeout)) {
+        console.warn(`[tatai-server] arch 读路径显式本地 oracle（TATAI_ARCH_READ_LOCAL=1）：${(e as Error).message}`);
+        return local();
+      }
+      // 结构化 code/detail 原样带出（不压成通用错误）；基础设施不可用/必要输入持续变化 → 503 可重试。
+      const d = describeReadJobError(e);
+      throw Object.assign(new Error(d.message), { code: d.code, detail: d.detail, httpStatus: d.httpStatus });
+    }
+  };
+  /** arch 只读路由的错误应答：带 `httpStatus` 的结构化错误按该状态回（503 可重试），其余走 wsFail。 */
+  const failArchRead = (e: unknown): void => {
+    const err = e as { code?: unknown; detail?: unknown; httpStatus?: unknown } | null;
+    if (typeof err?.httpStatus === "number" && typeof err?.code === "string") {
+      if (res.headersSent) {
+        res.end();
+        return;
+      }
+      res.statusCode = err.httpStatus;
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: { code: err.code, message: (e as Error)?.message ?? String(e), detail: err.detail ?? {} },
+        }),
+      );
+      return;
+    }
+    wsFail(e);
   };
 
   // ── 三期 S2：远程只读入口（PLAN.md S2 卡；路由清单与拒绝口径见 src/server/remote-routes.ts）──
@@ -3015,24 +3084,14 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       .split("?")[1]
       ?.split("&")
       .some((kv) => kv === "full=1");
-    try {
-      res.end(
-        JSON.stringify(
-          withoutLocalPaths(
-            {
-              ok: true,
-              render: renderGraph(
-                decodePathSegment(archRenderMatch[1]),
-                full ? { limits: RENDER_FULL_LIMITS } : undefined,
-              ),
-            },
-            guard.remote,
-          ),
-        ),
-      );
-    } catch (e) {
-      wsFail(e);
-    }
+    const id = decodePathSegment(archRenderMatch[1]);
+    // V09-31/37 复审 E：图合成（UI 重、只读）同上——优先只读 worker，worker 不可用退化为进程内。
+    void archReadViaWorker("arch_render", { projectId: id, full }, () => computeArchRenderRead(id, full))
+      .then((raw) => {
+        if (res.headersSent) return;
+        res.end(JSON.stringify(withoutLocalPaths(raw, guard.remote)));
+      })
+      .catch(failArchRead);
     return;
   }
 
@@ -3115,64 +3174,19 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
   //   `semantic:true` 才调模型做语义整理（缺省零模型，§4.4：任务/验证变化只重算状态）。
   //   补修包 E：`semantic:true` 是**显式重试/高级入口**（正常产品链路由"基线激活自动链"与
   //   "更新图"动作走，不由它兜底）；它这轮的结果会落进分段缓存，随后的自动链因此命中缓存、不重复调用。
-  /** §3.2 草稿图预览（只读、零写盘、零模型）：已有已发布图时不给草稿，避免两份图混看 */
-  const draftPreview = (projectId: string, hasPublished: boolean): Record<string, unknown> => {
-    if (hasPublished) {
-      return { exists: false, note: "已有已发布的规划图：读口只给有效图，不另给草稿（§3.2 不把草稿混进正在施工的有效图）" };
-    }
-    let draft: ReturnType<typeof draftBlueprintOf> = null;
-    try {
-      draft = draftBlueprintOf(projectId);
-    } catch (e) {
-      return { exists: false, reason: `草稿派生失败：${(e as Error).message}` };
-    }
-    if (draft === null) {
-      return { exists: false, reason: "可派生的规划对象为空（设计书/施工图里没有可映射的章节、模块或任务）" };
-    }
-    return {
-      exists: true,
-      label: "draft_unaudited",
-      note: "草稿图（未审定、未激活基线）：只用于预览「图纸会派生成什么」，不能当施工依据（DESIGN.md §3.2）",
-      reason: draft.reason,
-      baseline_id: draft.blueprint.baseline_id,
-      generated_at: draft.blueprint.generated_at,
-      validation: draft.validation,
-      blueprint: draft.blueprint,
-    };
-  };
+  // §3.2 草稿图预览已移到 `work/archReadWorker.ts`（`draftPreviewOf`）——主宿主与只读 worker 共用同一份。
   const archBlueprintMatch = req.url?.match(/^\/api\/projects\/([^/]+)\/arch\/blueprint$/);
   if (req.method === "GET" && archBlueprintMatch) {
-    try {
-      const id = decodePathSegment(archBlueprintMatch[1]);
-      const bp = readBlueprint(id);
-      res.end(
-        JSON.stringify(
-          withoutLocalPaths(
-            {
-              ok: true,
-              blueprint:
-                bp === null
-                  ? { exists: false }
-                  : { exists: true, blueprint: bp, receipt: readBlueprintReceipt(id) },
-              draft: draftPreview(id, bp !== null),
-              plan_code: planVsCode(id),
-              view: viewGraphWithPlan(id),
-              // 补修包 E：这张图这一版的**语义整理状态**（哪次跑的、基于哪版分段来源、模型可不可用、
-              // 覆盖了什么缺了什么）——只读、零副作用、只含哈希与说明
-              semantic: semanticStateOf(id),
-              // V09-12：图更新状态（§3.3 末段）——只读；没有记录 = null（读侧不把 null 当成"正在更新"）
-              update: graphUpdateOf(id, DATA_DIR),
-              // V09-13：每个节点/关系的**来源与证据状态**＋交付阻断读数（判据唯一实现在
-              // `src/ui/arch/provenance.ts`；界面与 MCP 读口读的是同一份派生，不各算一套）
-              provenance: archProvenanceModelOf(id, { dataDir: DATA_DIR }),
-            },
-            guard.remote,
-          ),
-        ),
-      );
-    } catch (e) {
-      wsFail(e);
-    }
+    // V09-31/37 复审 E + 复审根因二：blueprint/provenance/view 派生（UI 重、只读）走**只读 worker**；
+    // worker 不可用不再偷偷回退主线程长算，改为明确可重试 503（`failArchRead`）。输出仍走同一份
+    // `withoutLocalPaths`/`guard.remote` 红线。
+    const id = decodePathSegment(archBlueprintMatch[1]);
+    void archReadViaWorker("arch_blueprint", { projectId: id }, () => computeArchBlueprintRead(id))
+      .then((raw) => {
+        if (res.headersSent) return;
+        res.end(JSON.stringify(withoutLocalPaths(raw, guard.remote)));
+      })
+      .catch(failArchRead);
     return;
   }
   if (req.method === "POST" && archBlueprintMatch) {
@@ -4325,6 +4339,11 @@ async function shutdownCleanup(): Promise<void> {
     await stopSyncDiscovery(); // V09-23：先停后台同步发现（关监听/定时器），再收其它 watcher
   } catch (e) {
     console.error(`[tatai-server] 退出收尾：停止同步发现失败（已忽略，继续退出）：${(e as Error).message}`);
+  }
+  try {
+    await stopReadWorkers(); // V09-37：收回本宿主起的只读 worker 线程（只 terminate 自己拥有的）
+  } catch (e) {
+    console.error(`[tatai-server] 退出收尾：收回只读 worker 失败（已忽略，继续退出）：${(e as Error).message}`);
   }
   try {
     stopAllGraphRefresh(); // V09-07：先摘发现链（退订 + 清防抖），再收 watcher 本体

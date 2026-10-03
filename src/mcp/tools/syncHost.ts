@@ -11,7 +11,7 @@
 //   · HTTP 读口与 MCP 比较时 `checked_at` 允许差异，其余判据同源（同一份 `readSyncStatus` 语义）。
 import { readSyncStatus } from "../../server/work/sync";
 import "../../server/work/syncGraph"; // 组合根：确保 graph_full 探针已注册（本模块可能被独立引）
-import type { WorkServiceClient } from "../../server/work/service";
+import { fetchHostEntryResult, type WorkServiceClient } from "../../server/work/service";
 import type { SyncStatusReport } from "../../shared/syncEvidence";
 
 export interface HostSyncView {
@@ -47,4 +47,51 @@ export async function hostSyncView(projectId: string, dataDir: string, work?: Wo
     return { report, discovery_issues: [], host_reachable: false, unreachable_reason: reason };
   }
   return { report, discovery_issues: [issue], host_reachable: false, unreachable_reason: reason };
+}
+
+export interface HostEntryViewResult {
+  /** 宿主只读入口的返回（`{ok, entry, graph_summary, versions, source, contract}`）；不可达/明确报错为 null */
+  view: import("../../server/work/readJobs").EntryView | null;
+  host_reachable: boolean;
+  unreachable_reason: string | null;
+  /**
+   * 宿主**明确报错**（不是"不可达"）：SOURCE_CHANGED / LEDGER_UNSTABLE / HEALTH_UNSTABLE / READ_QUEUE_FULL /
+   * READ_WORKERS_UNAVAILABLE… 调用方必须**原样上抛**，不得悄悄回退本地路径绕过（复审根因一）。
+   */
+  error: { code: string; message: string; detail: Record<string, unknown>; httpStatus: number } | null;
+}
+
+/**
+ * V09-31：取唯一宿主**只读入口**（`GET /api/work/entry`）——一次返回入口 + 六图摘要，宿主用同一份现读快照
+ * 贯通入口/图/同步。纯只读（只用已有描述符，不 ensure/拉起写者）；宿主**不可达**、或端点缺失 → `view=null` +
+ * `host_reachable=false`（调用方按既有 fail-closed 语义回退本地路径）；宿主**明确报错** → `error` 非空，
+ * 调用方原样上抛，**不**回退（不把「源在变/队列满」当「拿不到宿主同版事实」悄悄绕过）。
+ */
+export async function hostEntryView(
+  projectId: string,
+  dataDir: string,
+  input: { role: string; known_revision?: string | null; resume_hint?: string | null; client_capabilities?: unknown },
+  opts: { preconditions?: boolean } = {},
+): Promise<HostEntryViewResult> {
+  const r = await fetchHostEntryResult(
+    dataDir,
+    {
+      project_id: projectId,
+      role: input.role,
+      known_revision: input.known_revision,
+      resume_hint: input.resume_hint,
+      client_capabilities: input.client_capabilities,
+    },
+    opts,
+  );
+  if (r.kind === "ok") return { view: r.view, host_reachable: true, unreachable_reason: null, error: null };
+  if (r.kind === "error") {
+    return { view: null, host_reachable: true, unreachable_reason: null, error: { code: r.code, message: r.message, detail: r.detail, httpStatus: r.httpStatus } };
+  }
+  return {
+    view: null,
+    host_reachable: false,
+    unreachable_reason: `唯一宿主只读入口不可达或响应不完整（${r.reason}）`,
+    error: null,
+  };
 }

@@ -405,10 +405,13 @@ export function foldRequirements(events: WorkEvent[]): RequirementProjection {
   return { requirements, last_seq, ignored_entities: [...ignored].sort() };
 }
 
-/** 从磁盘事件文件读并折叠需求对象（读路径；中段损坏会抛，不吞） */
-export function readRequirements(workDir: string): RequirementProjection {
-  const { events } = loadEvents(workDir);
-  return foldRequirements(events);
+/**
+ * 从磁盘事件文件读并折叠需求对象（读路径；中段损坏会抛，不吞）。
+ * `events` 给定时直接折叠这份**同一 workDir 的**现读快照，不再读盘（来源一致性由调用方保证，
+ * 见 `statusProjection.EventsSnapshot`）；缺省仍现读，行为不变。
+ */
+export function readRequirements(workDir: string, events?: WorkEvent[]): RequirementProjection {
+  return foldRequirements(events ?? loadEvents(workDir).events);
 }
 
 /** 需求 id 升序（供跨对象引用校验点名用） */

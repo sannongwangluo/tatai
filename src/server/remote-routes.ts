@@ -151,6 +151,17 @@ export const REMOTE_ROUTES: readonly RemoteRoute[] = [
     anchors: ['if (req.method === "GET" && reqPath === "/api/work/sync/status") {'],
     query: "?project_id=:id",
   },
+  {
+    id: "work-entry",
+    method: "GET",
+    path: "/api/work/entry",
+    kind: "read",
+    note:
+      "唯一宿主**只读**接续入口（V09-31/37）：一次返回入口 + 六图摘要，同一份现读快照贯通入口/图/同步；" +
+      "CPU 重派生在有界 worker 线程（不占主线程）；仍要描述符令牌：无/错令牌 401 SERVICE_UNAVAILABLE",
+    anchors: ['if (req.method === "GET" && reqPath === "/api/work/entry") {'],
+    query: "?project_id=:id&role=executor",
+  },
   // ── V09-29 集成：V09-27 上报域（证据正文存/读）与 V09-28 正向基线（preserve/activate）──
   // 桌面宿主 `index.ts` 对 work 面**逐条列名**转发，未登记的精确路径会落本文件兜底 404；
   // 这四条与上面六条同款（方法 + 精确路径），用于让 MCP 在桌面宿主下也能拿到证据正文写/读口与基线路由
@@ -204,6 +215,30 @@ export const REMOTE_ROUTES: readonly RemoteRoute[] = [
       approval_basis: "只读模式探针",
       approval_kind: "delegated_technical_review",
     },
+  },
+  // ── V09-39（契约 U5/U5.1）：持久项目说明索引的唯一宿主写面（写两条；读 read/impact/coverage 本地纯读不走此处）──
+  {
+    id: "work-project-index-upsert",
+    method: "POST",
+    path: "/api/work/project-index/upsert",
+    kind: "write",
+    note:
+      "项目说明索引（docs/project-notes.json）的显式增量 upsert：经唯一宿主 `work/projectIndexHost.ts`，" +
+      "用完整文档版本做 CAS、锁内核对所有权与来源后原子写；只维护指定条目，不重写其它条目语义；" +
+      "只读模式下由远程红线先拒（kind:write），另要描述符令牌",
+    anchors: ['if (req.method === "POST" && reqPath === "/api/work/project-index/upsert") {'],
+    body: { project_id: "tatai", entries: [{ id: "example", duty: "说明", sources: [] }] },
+  },
+  {
+    id: "work-project-index-remove",
+    method: "POST",
+    path: "/api/work/project-index/remove",
+    kind: "write",
+    note:
+      "项目说明索引的显式删除（删说明条目，**不**删源文件或业务证据）：同一份唯一宿主面与写者判据，" +
+      "只读模式下由远程红线先拒，另要描述符令牌",
+    anchors: ['if (req.method === "POST" && reqPath === "/api/work/project-index/remove") {'],
+    body: { project_id: "tatai", ids: ["example"] },
   },
 
   // ── 补修 A（V06-14）：注册表恢复入口（显式触发；只读模式下必须被拒）──

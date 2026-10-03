@@ -23,15 +23,23 @@ import { projectWorkDir } from "../workstation";
 import { readServiceDescriptor } from "./service";
 import "./syncGraph"; // 组合根：注册 graph_full 六图探针
 import { clearSyncDiscoveryIssues, reportSyncDiscoveryIssue } from "./syncRuntimeHealth";
+import { batchIdOfEvidenceFile } from "./syncChecks";
 import {
   SYNC_EVIDENCE_FILE_SUFFIX,
   SYNC_INBOX_REL,
   SYNC_MAX_PROJECTS,
+  commitSyncScan,
+  historicalBatchIds,
   projectHasSyncContract,
   scanSyncProject,
   type SyncScanOutcome,
+  type SyncScanPlan,
   type SyncSubmitter,
 } from "./sync";
+// V09-31/37 目标二：后台 sync scanner 的**只读计划**在独立扫描池的 worker 里跑；写仍在唯一主宿主。
+import { runScanJob, runReadJob, ReadWorkersUnavailable, ReadQueueFull, ReadJobTimeout } from "./readWorkerPool";
+import { runWithHostHealth } from "./syncRuntimeHealth";
+import { readProjectDiscoveryIssues } from "./sync";
 
 export interface SyncScanRequest {
   projectId: string;
@@ -41,32 +49,155 @@ export interface SyncScanRequest {
   role?: string;
 }
 
-/** 单飞槽 key＝**规范 dataDir** + 项目 id（同一进程内跑多数据目录/隔离夹具时不互相串） */
+/** 单飞槽：key＝**规范 dataDir** + 项目 id（同一进程内跑多数据目录/隔离夹具时不互相串） */
 function scanKeyOf(dataDir: string, projectId: string): string {
   return `${path.resolve(dataDir)}\u0000${projectId}`;
 }
 
-/** 同 key 并发扫描合并成一次（单飞）；结果由所有等待者共享（彼此独立、无副作用叠加） */
-const inflight = new Map<string, Promise<SyncScanOutcome>>();
+/**
+ * 一轮扫描（只读计划 + 主宿主提交）。**关键：每轮独立结算，不与后续轮次串成一条无限 promise 链。**
+ *
+ * 实现（V09-31/37 目标二）：扫描**计划**在独立扫描池的 **worker 线程**里算（纯只读）；
+ * 提交（`putEvidence` + `sync.evidence_checked`）由**唯一主宿主**这里的 `commitSyncScan` 做——
+ * worker **不写业务账本**。扫描计划槽与读/准备槽是**两个池**，scanner 不在持有槽时等待 prep，
+ * 因此不会死锁（计划算完即释放槽，主宿主随后才提交）。worker 起不来时**如实记日志**并退化为进程内扫描
+ * （后台维护不能因 worker 不可用永久停摆），不是静默吞掉。
+ *
+ * 语义（2026-10-03 复审返工，替换旧的 `first.then(()=>rerun?…:…)` 无限补跑链）：
+ *   · 一个请求由「在它**之后开始**的一轮」覆盖；该轮完成即返回本请求的结论（成功或失败），
+ *     **不等待**它之后由别的请求触发的更多轮——所以持续通知（每 2 秒一次、扫描 >2 秒）下，
+ *     每个请求最多等「当前一轮收尾 + 自己那一轮」≈2 轮，不会被无限补跑链挂死；
+ *   · 在途期间到来的请求合并进**已排定的下一轮**（不是复用同一 promise）：下一轮在当前轮结束后
+ *     启动，读到的是那之后的最新收件目录 → 在途期间的新登记批次/新证据不丢；
+ *   · 已排定的下一轮一定会被启动（即使当前轮失败），stop 等待在途 promise 时也就能等到它——
+ *     **停机不漏补跑**；
+ *   · **错误语义**：一个请求只拿「覆盖它的那一轮」的结论。某轮失败只让该轮的请求失败，
+ *     **绝不**用后一轮的成功去掩盖（旧实现把补跑并进同一 promise 正是这个缺陷）。
+ */
+interface SyncRound {
+  req: SyncScanRequest;
+  /** 本轮结算后兑现给「在本轮开始前到达的请求」 */
+  promise: Promise<SyncScanOutcome>;
+  resolve: (o: SyncScanOutcome) => void;
+  reject: (e: unknown) => void;
+  settled: boolean;
+}
 
-/** 请求一次扫描（后台与显式 scan 共用；同 key 在途请求合并） */
+interface ScanState {
+  /** 正在执行的一轮 */
+  running: SyncRound | null;
+  /** 已排定、等 running 结束后启动的下一轮（不是无限链：它只是「覆盖在途期间请求」的一轮） */
+  queued: SyncRound | null;
+}
+
+const scanStates = new Map<string, ScanState>();
+
+function makeRound(req: SyncScanRequest): SyncRound {
+  let resolve!: (o: SyncScanOutcome) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<SyncScanOutcome>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  void promise.catch(() => {}); // 防无人 await 时的未处理 rejection；结论仍原样给已注册的 awaiter
+  return { req, promise, resolve, reject, settled: false };
+}
+
+function stateOf(key: string): ScanState {
+  let s = scanStates.get(key);
+  if (s === undefined) {
+    s = { running: null, queued: null };
+    scanStates.set(key, s);
+  }
+  return s;
+}
+
+function startRound(key: string, round: SyncRound): void {
+  const st = stateOf(key);
+  st.running = round;
+  const scan: Promise<SyncScanOutcome> = runHostedScan(round.req);
+  void scan.then(
+    (outcome) => settleRound(key, round, outcome, null),
+    (err: unknown) => settleRound(key, round, null, err),
+  );
+}
+
+/**
+ * 宿主侧扫描编排：worker 里算只读计划 → 主宿主提交。worker 不可用/超时/失败时**如实记日志**并退化为
+ * 进程内扫描（`scanSyncProject` 与提交同一份实现），后台维护不因 worker 起不来而永久停摆。
+ */
+async function runHostedScan(req: SyncScanRequest): Promise<SyncScanOutcome> {
+  try {
+    const plan = (await runScanJob("sync_scan", {
+      projectId: req.projectId,
+      dataDir: req.dataDir,
+      ...(req.actorId === undefined ? {} : { actorId: req.actorId }),
+      ...(req.role === undefined ? {} : { role: req.role }),
+    })) as SyncScanPlan;
+    // 报告也挪进只读 worker（契约 U4：健康/进度轻读不被重派生占住）——但必须带**主宿主真实** discovery issues
+    // 并回包对账（worker 有独立内存，宿主汇不共享）：派发前主线程读出，回包后再读一次，抖动则有界重算，
+    // 仍不稳抛 HEALTH_UNSTABLE（503）。**绝不**因为报告在别处算就丢掉宿主后台错误、恢复误绿。
+    return await commitSyncScan(
+      {
+        projectId: req.projectId,
+        dataDir: req.dataDir,
+        submitter: req.submitter,
+        ...(req.actorId === undefined ? {} : { actorId: req.actorId }),
+        ...(req.role === undefined ? {} : { role: req.role }),
+        report: async (a) => {
+          const reconciled = await runWithHostHealth(
+            () => readProjectDiscoveryIssues(a.projectId, a.dataDir),
+            (issues) => runReadJob("sync_status", { projectId: a.projectId, dataDir: a.dataDir, discoveryIssues: issues }),
+          );
+          return reconciled.value as import("../../shared/syncEvidence").SyncStatusReport;
+        },
+      },
+      plan,
+    );
+  } catch (e) {
+    // worker 基础设施不可用（起不来/队列满/超时）**不再偷偷回退主线程长算**（那会把主线程又占住、过载更堵）：
+    // 明确可重试错误原样上抛（503），由调用方稍后重试。只有显式 oracle 开关 TATAI_SCAN_LOCAL=1 才进程内扫描；
+    // 作业自身抛出的错（ReadJobFailed / SOURCE_CHANGED 等）任何情况下都**真抛回**，不用"退化后成功"掩盖。
+    if (
+      (process.env.TATAI_SCAN_LOCAL ?? "") === "1" &&
+      (e instanceof ReadWorkersUnavailable || e instanceof ReadQueueFull || e instanceof ReadJobTimeout)
+    ) {
+      log(`扫描 worker 不可用（${(e as { code?: string }).code ?? "?"}），显式本地 oracle 进程内扫描：${errText(e)}`);
+      return scanSyncProject(req);
+    }
+    throw e;
+  }
+}
+
+function settleRound(key: string, round: SyncRound, outcome: SyncScanOutcome | null, err: unknown): void {
+  if (round.settled) return;
+  round.settled = true;
+  const st = stateOf(key);
+  if (st.running === round) st.running = null;
+  // **同步先启动已排定的下一轮**（在任何 awaiter 续体注册之前）：await 返回后到来的新请求看到的是
+  // 新一轮在跑，而不是把上一轮结果当成新一轮。下一轮只在被请求过时才存在，不是无限补跑链。
+  const q = st.queued;
+  if (q !== null) {
+    st.queued = null;
+    startRound(key, q);
+  }
+  if (st.running === null && st.queued === null) scanStates.delete(key);
+  // 本轮请求只拿本轮结论：不让后续轮次的成功掩盖本轮失败。
+  if (err === null) round.resolve(outcome as SyncScanOutcome);
+  else round.reject(err);
+}
+
+/** 请求一次扫描（后台与显式 scan 共用；同 key 在途请求由「之后开始的一轮」覆盖，不丢通知且不无限挂） */
 export function requestSyncScan(req: SyncScanRequest): Promise<SyncScanOutcome> {
   const key = scanKeyOf(req.dataDir, req.projectId);
-  const existing = inflight.get(key);
-  if (existing !== undefined) return existing;
-  const run = scanSyncProject({
-    projectId: req.projectId,
-    dataDir: req.dataDir,
-    submitter: req.submitter,
-    ...(req.actorId === undefined ? {} : { actorId: req.actorId }),
-    ...(req.role === undefined ? {} : { role: req.role }),
-  });
-  const tracked = run.finally(() => {
-    // 只删自己那一条：restart 后旧在途的 finally 不得误删新一轮的单飞槽
-    if (inflight.get(key) === tracked) inflight.delete(key);
-  });
-  inflight.set(key, tracked);
-  return tracked;
+  const st = stateOf(key);
+  if (st.running === null && st.queued === null) {
+    const round = makeRound(req);
+    startRound(key, round);
+    return round.promise;
+  }
+  if (st.queued === null) st.queued = makeRound(req);
+  return st.queued.promise;
 }
 
 /** HTTP 显式扫描入口（service.ts 的 /api/work/sync/scan）——与后台同一份单飞队列 */
@@ -87,6 +218,8 @@ const SYNC_REGISTRY_DEBOUNCE_MS = 500;
 /** 停机等待在途扫描"多久算久"的告警阈值（毫秒）：只记告警，**不**据此提前返回（见 `awaitInflight`） */
 const SYNC_STOP_WARN_MS = 10_000;
 /** 轮询每项目最多纳入指纹的证据文件数（有界）；**超出即 overflow**，由调用方按 fail-closed 上报，不截断冒充完整 */
+/** 轮询每项目最多纳入指纹的证据文件数（有界）；**远超的部分若是已被有效契约取代的历史文件则不计入**
+ *  （历史退出当前发现预算），其余超出即 overflow，由调用方按 fail-closed 上报，不截断冒充完整 */
 const SYNC_POLL_MAX_EVIDENCE_FILES = 64;
 
 /** 一个被后台跟踪的项目（注册表里出现过；有同步配置才挂收件监听） */
@@ -107,6 +240,8 @@ interface ProjectWatch {
   configured: boolean;
   /** 卸载/换路径后自增：旧监听回调据此作废，不再调度扫描（旧 watcher 关闭不误写） */
   generation: number;
+  /** 已取代历史批次 id 的缓存（按事件账本身份失效）——历史退出当前发现预算，避免每次轮询重折叠账本 */
+  historicalCache: { eventsId: string; ids: Set<string> | null } | null;
   /** 该项目当前已知的发现失败（watch / 本领域事实或收件目录读不出 / 扫描提交）——按下标整体替换上报 */
   watch_error: string | null;
   facts_error: string | null;
@@ -201,14 +336,21 @@ function eventsIdentity(projectId: string, dataDir: string): { id: string; error
  * 为什么轮询也要看收件目录：inbox watcher 在宿主刚起来/刚重挂的那一瞬间还没 ready，期间落地的
  * 证据文件可能被 `ignoreInitial` 吞掉；有界轮询是它的兜底（契约「可用有界增量轮询 + 准确 inbox watch」）。
  *
- * 硬口径（返工 B 终版）：
+ * 硬口径（返工 B 终版 + 2026-10-03 复审返工）：
  *   ① **不 silent catch**：只有 ENOENT 算"目录/文件暂不在"，其余读失败（ENOTDIR/EPERM/EACCES/EIO…）
  *      一律**显式带回 `error`**，由调用方进 health——权限/IO 异常**不得**用 `gone` 吞成"没有证据"；
- *   ② **有界且不冒充完整**：最多纳入 `SYNC_POLL_MAX_EVIDENCE_FILES` 个证据文件，超出即 `overflow=true`；
- *      截断后的指纹**不能**保证发现后续文件的变化（watcher 故障时尤其致命），调用方据此 **fail-closed**
- *      上报（契约「达到上限报 incomplete 及原因，不能截断后报通过」），不得悄悄当作"没变化"。
+ *   ② **历史退出当前发现预算**：已被**有效契约**取代的历史批次（`historicalOf()`）的证据文件不计入
+ *      上限、也不进指纹——否则攒够 65 个历史文件就把当前 active 永久判 incomplete（与"历史积累不拖死当前"冲突）。
+ *      但 `historicalOf()` 返回 null（契约域坏事实/读不出）时**不豁免任何文件**：损坏契约不得用来排除历史，
+ *      宁可都计入并 fail-closed；
+ *   ③ **有界且不冒充完整**：当前（active/未知/未登记）文件最多纳入 `SYNC_POLL_MAX_EVIDENCE_FILES` 个，
+ *      超出即 `overflow=true`；截断后的指纹**不能**保证发现后续文件的变化（watcher 故障时尤其致命），
+ *      调用方据此 **fail-closed** 上报（契约「达到上限报 incomplete 及原因，不能截断后报通过」）。
  */
-function inboxFingerprint(root: string): { fp: string; count: number; overflow: boolean; error: string | null } {
+function inboxFingerprint(
+  root: string,
+  historicalOf: () => ReadonlySet<string> | null,
+): { fp: string; count: number; overflow: boolean; error: string | null } {
   const dir = path.join(root, SYNC_INBOX_REL);
   let names: string[];
   try {
@@ -218,11 +360,19 @@ function inboxFingerprint(root: string): { fp: string; count: number; overflow: 
     if (errno === "ENOENT") return { fp: "", count: 0, overflow: false, error: null };
     return { fp: "", count: 0, overflow: false, error: `收件目录读不出：${errText(e)}` };
   }
+  const evidence = names.filter((n) => n.endsWith(SYNC_EVIDENCE_FILE_SUFFIX)).sort();
+  // 只有超过上限才需要（较贵的）折叠契约来区分历史；小收件目录照旧全量入指纹。
+  const exempt: ReadonlySet<string> = evidence.length > SYNC_POLL_MAX_EVIDENCE_FILES ? (historicalOf() ?? new Set()) : new Set();
   const digest = crypto.createHash("sha256");
   let count = 0;
+  let exemptCount = 0;
   let overflow = false;
-  for (const name of names.sort()) {
-    if (!name.endsWith(SYNC_EVIDENCE_FILE_SUFFIX)) continue;
+  for (const name of evidence) {
+    const id = batchIdOfEvidenceFile(name);
+    if (id !== null && exempt.has(id)) {
+      exemptCount += 1; // 历史：退出当前发现预算（不计入上限、不进指纹）
+      continue;
+    }
     count += 1;
     if (count > SYNC_POLL_MAX_EVIDENCE_FILES) {
       overflow = true;
@@ -242,7 +392,7 @@ function inboxFingerprint(root: string): { fp: string; count: number; overflow: 
       return { fp: "", count, overflow, error: `收件目录证据文件 ${name} 判不出：${errText(e)}` };
     }
   }
-  return { fp: `${digest.digest("hex")}#${count}`, count, overflow, error: null };
+  return { fp: `${digest.digest("hex")}#${count}#h${exemptCount}`, count, overflow, error: null };
 }
 
 // ── 所有权复核（V09-29 恢复保护：旧宿主失去描述符即停发现，不再扫描写账） ──
@@ -440,6 +590,7 @@ function pollProjects(rt: DiscoveryRuntime, why: string): number {
       w.eventsId = "";
       w.inboxFp = "";
       w.configured = false;
+      w.historicalCache = null;
     }
     if (w === undefined) {
       w = {
@@ -452,6 +603,7 @@ function pollProjects(rt: DiscoveryRuntime, why: string): number {
         inboxFp: "",
         configured: false,
         generation: 0,
+        historicalCache: null,
         watch_error: null,
         facts_error: null,
         scan_error: null,
@@ -463,7 +615,19 @@ function pollProjects(rt: DiscoveryRuntime, why: string): number {
     // 便宜增量判据：事件账本身份变了（或还没配置且收件目录在场）才重解析本领域事实
     const eventsId = eventsIdentity(p.id, rt.dataDir);
     const inbox = probeInbox(w.root);
-    const inboxFp = inboxFingerprint(w.root);
+    const historicalOf = (): ReadonlySet<string> | null => {
+      // 历史批次 id 按事件账本身份缓存：账本没变就不重复折叠（省掉每次轮询的整本解析）。
+      if (w.historicalCache !== null && w.historicalCache.eventsId === eventsId.id) return w.historicalCache.ids;
+      let ids: Set<string> | null;
+      try {
+        ids = historicalBatchIds(p.id, rt.dataDir);
+      } catch {
+        ids = null;
+      }
+      w.historicalCache = { eventsId: eventsId.id, ids };
+      return ids;
+    };
+    const inboxFp = inboxFingerprint(w.root, historicalOf);
     const factsErrors = [eventsId.error, inbox.error, inboxFp.error].filter((x): x is string => x !== null);
     if (inboxFp.overflow) {
       // 达到有界轮询上限：指纹已不能再保证覆盖后续文件的变化（watcher 故障时尤甚）→ 显式 fail-closed，

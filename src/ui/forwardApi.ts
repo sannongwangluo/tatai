@@ -1,18 +1,22 @@
-// 正向成套图纸入口的前端 API（PLAN.md V09-28；DESIGN.md §2.9/§6.7；docs/forward-progress-contract.md F1）。
+// 正向成套图纸入口的前端 API（PLAN.md V09-28；DESIGN.md §2.9/§6.7；docs/forward-progress-contract.md F1；
+// V09-36 起本文件的只读读口并入在途请求共享）。
 //
 // 为什么单开一个文件（而不是塞进 `api.ts`）：本卡的文件责任把基线入口的前端调用收在
-// `src/ui/forwardApi.ts`；`api.ts` 由既有卡维护，本卡不动它。两者共用同一套口径——
-// 相对路径 + 壳内基址前缀（`apiBase()`），与 `api.ts#apiFetch` 同款一行包装。
+// `src/ui/forwardApi.ts`。两者共用同一套口径——相对路径 + 壳内基址前缀（`apiBase()`），并复用
+// `api.ts#rawFetch` 作为**唯一裸 fetch 出口**、经 `sharedReadFetch` 做在途合并（V09-36）：
+// 相同 URL/参数的 GET 并发只打一次网络，每个调用者各拿独立可消费的 Response。
 //
 // 端点都是**已存在**的桌面/项目路由（`src/server/index.ts` 的 `/documents`、`/documents/preserve`、
 // `/documents/activate`），本卡不为界面新开写口——界面走的就是 MCP/HTTP 同一份 documents 判据。
 // 类型照 `api.ts` 的既有口径 **type-only** 复用服务端模块（值 import 会把 node 依赖链拖进浏览器包）。
 import { apiBase } from "./tauri-env";
+import { rawFetch } from "./api";
+import { sharedReadFetch } from "./sharedRead";
 import type { ProjectBaseline, BaselineAdvance } from "../server/work/documents";
 
-/** 与 `api.ts#apiFetch` 同款：壳内加基址前缀，非壳内是相对路径（行为逐字不变）。 */
+/** 与 `api.ts#apiFetch` 同款：壳内加基址前缀，非壳内是相对路径；GET 读口共享在途请求（V09-36）。 */
 function forwardFetch(input: string, init?: RequestInit): Promise<Response> {
-  return fetch(`${apiBase()}${input}`, init);
+  return sharedReadFetch(`${apiBase()}${input}`, init, rawFetch);
 }
 
 /** `GET /api/projects/:id/documents` 里每份图纸的摘要（缺图纸时只有 exists/kind） */

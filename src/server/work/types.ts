@@ -30,6 +30,11 @@ export type WorkErrorCode =
   | "TAIL_QUARANTINED"
   /** 事件文件中段损坏（不是尾行）：必须暴露，不得跳过继续 */
   | "MIDDLE_CORRUPT"
+  /**
+   * 读取期间账本一直在变（短读/并发追加/替换），重试后仍拿不到稳定现场：明确拒绝这次读，
+   * 避免把"读到一半/混了两个版本"的文件当成完整事实（V09-38 复审修正）。可重试的瞬时态（503）。
+   */
+  | "LEDGER_UNSTABLE"
   /** 事件文件里的信封不符合 §2.6 字段口径 */
   | "EVENT_INVALID"
   /** 证据不可用：引用了不存在的证据/内容与内容地址不符/试图改写不可变证据（V06-09） */
@@ -43,6 +48,7 @@ export const WORK_ERROR_CODES: readonly WorkErrorCode[] = [
   "PROJECTION_FAILED",
   "TAIL_QUARANTINED",
   "MIDDLE_CORRUPT",
+  "LEDGER_UNSTABLE",
   "EVENT_INVALID",
   "EVIDENCE_INVALID",
 ];
@@ -237,6 +243,78 @@ export interface WorkEntityState {
   payload: Record<string, unknown>;
 }
 
+// ── 账本内容身份、折叠基线与跨进程快照来源证明（V09-38；DESIGN.md §6.8 / 契约 U1·U2） ──
+//
+// 这些**不是**"当前有效"的证明，也**不是**事实源：它们只描述"账本字节现在是什么"与"哪一段已被折过"，
+// 用来在**核验成立**时加速派生。放行判据必须建立在本次实际内容哈希之上——mtime/size/seq/监听/TTL 一律不作数。
+
+/** 账本内容身份：`prefix_sha256` = sha256(账本字节 `[0, verified_bytes)`)；`verified_bytes` 是行边界 */
+export interface LedgerContentFingerprint {
+  /** 现读时的文件总字节 */
+  file_bytes: number;
+  /** 已被证实的行边界偏移（≤ file_bytes；只有整行收尾时才等于 file_bytes） */
+  verified_bytes: number;
+  /** sha256(账本字节 [0, verified_bytes)) */
+  prefix_sha256: string;
+}
+
+/** 本次现读算出的前缀字节证明：证明 `[0, prefix_bytes)` 这段字节此刻与生成基线时逐字节相同 */
+export interface LedgerPrefixProof {
+  prefix_bytes: number;
+  prefix_sha256: string;
+  /** 现读时的文件总字节（必须与本次 content.file_bytes 一致，防止"证明与内容不同一次读取"） */
+  file_bytes: number;
+}
+
+/** 一份已折叠基线（可重建派生物；只在内容证明成立时用于续折，绝不当作事实源） */
+export interface FoldBase {
+  /** 该基线折叠所依据的账本内容身份 */
+  content: LedgerContentFingerprint;
+  /** 基线覆盖的事件条数（= 已折叠前缀长度，对应 `content.verified_bytes` 这段字节） */
+  folded_events: number;
+  last_seq: number;
+  last_event_id: string | null;
+  entities: Record<string, WorkEntityState>;
+  /** 已用过的幂等键 → seq（续折时继续去重） */
+  seen_keys: Map<string, number>;
+  /**
+   * 幂等键表是否完整。默认 true（进程内基线由全量重折或前缀续折得到，键表覆盖全部已折事件）。
+   * 跨进程从 `state.json` 复用的基线**拿不到**前缀幂等键（快照不存这类事实），只能标 false：
+   * 此时只允许"折叠 0 条新增"（不触碰键表），一旦要折新事件就必须回退全量。
+   */
+  seen_keys_complete?: boolean;
+}
+
+/** 折叠/校验规则版本：算法或判据改变时递增，跨进程快照据此失效（旧快照回退全量） */
+export const FOLD_RULES_VERSION = "fold-v1";
+
+/** 跨进程快照来源证明的 schema 名 */
+export const LEDGER_CONTENT_SCHEMA = "ledger-content-v1" as const;
+
+/**
+ * 磁盘快照（`state.json`）上可选携带的**账本来源证明**（V09-38 复审：持久增量）。
+ *
+ * 写入方（`service.ts` 的唯一写宿主）在 `writeSnapshot` 前按**当前现读账本**填它；
+ * 读取方只有在**(a)** 证明存在且 schema/规则版本一致、**(b)** 与**本次现读账本**逐字节摘要一致、
+ * **(c)** 边界事件（seq + event_id）指认成立时，才允许把该快照的 `entities` 当作续折基线。
+ * 缺失、伪造、规则变更、边界不符 → **一律回退全量重折**，绝不用未核验的旧快照顶替。
+ *
+ * 注意：即便复用成立，读侧仍须每次重算账本摘要（省的是 parse + fold，不是哈希）。
+ */
+export interface SnapshotSourceFingerprint {
+  schema: typeof LEDGER_CONTENT_SCHEMA;
+  /** 生成该快照时所依据账本的内容身份 */
+  file_bytes: number;
+  verified_bytes: number;
+  prefix_sha256: string;
+  /** 该快照折叠覆盖的事件条数（应等于 verified_bytes 这段字节里的完整事件数） */
+  folded_events: number;
+  last_seq: number;
+  last_event_id: string | null;
+  /** 折叠规则的版本（`FOLD_RULES_VERSION`）；与当前实现不同即不可复用 */
+  fold_rules_version: string;
+}
+
 /** 可重建的项目快照（`.工作台/work/state.json`；DESIGN.md §2.6：带 last_seq 的投影） */
 export interface WorkSnapshot {
   schema_version: 2;
@@ -247,6 +325,8 @@ export interface WorkSnapshot {
   entities: Record<string, WorkEntityState>;
   /** 投影失败原因：非空表示快照落后于事件，界面/调用方必须按"陈旧"处理 */
   projection_error: string | null;
+  /** 可选：本快照的账本来源证明（缺失/伪造/规则变 → 读侧回退全量，见 `SnapshotSourceFingerprint`） */
+  source_fp?: SnapshotSourceFingerprint;
   /** 读取时数据源的状态（读服务不可达时由客户端补上，磁盘上的快照本身不写这个字段） */
   stale?: boolean;
   stale_reason?: string;

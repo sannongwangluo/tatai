@@ -40,7 +40,7 @@ check 为闭合的 discriminated union，每类型只接受明确字段。保持
 
 后台在唯一写服务宿主启动时，对已注册 v2 项目做有界首次扫描，并监听约定目录新增/替换/删除；不依赖用户先打开项目，不在 MCP 宿主各启动一套写者。可使用现有 chokidar 和生命周期设施；关闭宿主清理监听/定时器/队列。只处理有契约或明确 inbox 的项目，扫描项目数量/文件数/文件大小有界，达到上限报 incomplete 及原因，不能截断后报通过。目录不存在正常为空；联接目录不跟随。
 
-后台自动扫描和显式 scan_sync_evidence 共用同一逻辑、单飞队列和真正唯一写口。必须 await WorkReceipt、核 ok/projection、读回；拒绝 silent catch。稳定幂等键由 batch/contract/evidence/current target fingerprint+verdict 构成，不随实体 revision 漂移。扫描重复、文件重复通知、响应丢失、重启并发均零重复效果；错误暴露但不破坏其他项目。
+后台自动扫描和显式 scan_sync_evidence 共用同一逻辑、单飞队列和真正唯一写口。必须 await WorkReceipt、核 ok/projection、读回；拒绝 silent catch。稳定幂等键由 batch/contract/evidence/current target fingerprint+verdict 构成，不随实体 revision 漂移。扫描重复、文件重复通知、响应丢失、重启并发均零重复效果；错误暴露但不破坏其他项目。**扫描只评估现行（active）批次**：已被取代的历史批次不评估、不写入（其结论以账本回执为准，见下）；收件目录里同一批次的证据在扫描内先**全部评估、再逐条提交**（写回本身不再打断同一轮的真实输入复用）。**单飞不丢通知**：某 key 已有在途扫描时再来一次请求，每个请求由「在它之后开始的一轮」覆盖、随自己那一轮完成即返回，**不等待后续无限新请求**；在途期间的请求合并进**已排定的下一轮**（不是复用同一 promise，也不是无限补跑链），该轮读完最新收件目录，故在途期间新登记批次/新投放证据不会因为"已经扫过了"被丢掉（watcher 漏报时尤其重要）；本轮错误如实抛回本轮请求、不被后轮成功掩盖，排定的补跑轮必被启动（stop 等待在途/排队后返回、返回后不再新增扫描写入）。
 
 宿主定版：扫描器只在本进程已成为唯一写服务并发布/确认描述符后启动；桌面和独立daemon共用该生命周期，退位候选不能先扫。精确监听inbox，忽略自写events/state；项目注册表可增量发现，不只启动时一次列出。指纹不得包含自己刚追加的同步事件序号/墙钟/检查时间（否则每扫描一次都变）；at_registration截点稳定，其余实际任务/定义采用相关业务事实投影指纹。不可读或损坏的本领域事件不当成not_configured。
 
@@ -48,17 +48,17 @@ check 为闭合的 discriminated union，每类型只接受明确字段。保持
 
 跨进程读取：MCP stdio不是后台宿主，不能拿本进程空错误汇冒充“后台无故障”。MCP同步状态及project_entry须从唯一宿主只读状态/健康接口取得同份错误，再用同源判据；不启动额外写者。宿主不可达或读口不完整时明确显示无法核对后台健康，不能静默丢弃已知发现故障后仍报告同步通过。
 
-默认只读 read_sync_status 每次重读必要文件和实际目标，对比登记/最近扫描；修改、删除目标、证据或来源后立即显示 stale/missing/failed，历史 passed 不等于当前 passed。后台捕获目标变化可复核留痕；即使监听没捕获，读口/认领门禁实际复核也不能继续使用旧通过。评估输入与记录时重核版本，防计算后目标变更假通过；写锁内同步契约校验与唯一服务边界核验，不允许直连伪造 sync.evidence_checked 的 passed 绕过检查。
+默认只读 read_sync_status 每次重读必要文件和实际目标，对比登记/最近扫描；修改、删除目标、证据或来源后立即显示 stale/missing/failed，历史 passed 不等于当前 passed。**这条实时口径只适用于现行（active）批次**；已被 supersede 的历史批次不再逐次实时重算——它展示**账本里最后一次有效核验回执**的结论与核验时间（`verified_at`，只作历史、不计入范围与差项、不再阻断），账本没有有效回执时明确「未核验」（`verified_at=null`，绝不显示为通过）。需要时可用显式入口（`readSyncStatus` 的 `liveHistorical`）对历史批次做一次实时复查，但常规只读不再把几十个历史批次重新卷进来（2026-10-03 增量核验，见附录）。后台捕获目标变化可复核留痕；即使监听没捕获，读口/认领门禁实际复核也不能继续使用旧通过。评估输入与记录时重核版本，防计算后目标变更假通过；写锁内同步契约校验与唯一服务边界核验，不允许直连伪造 sync.evidence_checked 的 passed 绕过检查。
 
 依赖方向：同步不得接进 collectProjectFacts/projectWithReleases，图builder不能回穿同步；只在project_entry响应/认领边界读取同步判定。计算真实目标可在锁外，提交前带稳定目标指纹，锁内以有界目标快照核验身份、内容与实际指纹；不要在锁内跑不受控全仓扫描，也不得只比较调用方自己提供的摘要。锁等待/耗时/变化必须明确失败或重试不通过，不能覆盖活锁。文件系统并不受事件锁统一事务保护，要求评估前后指纹一致；不作“任意外部并发写都绝对原子”的承诺。
 
-active blocks_entry 契约未当前通过时：project_entry 添加 sync_summary 和 required_reads，next_action=blocked 并列出差项；claimTask 与唯一写服务锁内 task.claimed（非续约）同样拒绝，避免绕开入口。superseded 批次只作历史不再阻塞。自动接收证据不产生 task.result_submitted 或用户 Gate；同步检查通过只是取消本批次接续阻断，仍按原基线、角色、业务依赖决定下一步。
+active blocks_entry 契约未当前通过时：project_entry 添加 sync_summary 和 required_reads，next_action=blocked 并列出差项；claimTask 与唯一写服务锁内 task.claimed（非续约）同样拒绝，避免绕开入口。superseded 批次只作历史不再阻塞，也不再逐次实时重算——其结论来自账本最后一次有效核验回执（带 `verified_at`），缺回执即「未核验」；写口同样拒绝给已被取代的批次新增核验事件（锁外与锁内各核一次 active，防"锁外备好后被取代"竞态，零字节）。自动接收证据不产生 task.result_submitted 或用户 Gate；同步检查通过只是取消本批次接续阻断，仍按原基线、角色、业务依赖决定下一步。
 
 无契约的旧项目完全兼容；有非法或不可读的本领域事实明确失败，不当成未配置。同步只对声明范围作结论，范围以外未知内容不声称已覆盖。
 
 ## 接口、界面和交付
 
-界面、HTTP和MCP共用 `src/shared/syncEvidence.ts` 的只读返回契约（后端实现者维护定义，UI不能另造类型语义）：`SyncStatusReport={project_id,configured,overall,checked_at,scan_error,batches,unregistered_evidence,collection}`。overall/batch.verdict/item.verdict 值集为 not_configured/missing/passed/failed/stale/needs_review/invalid/incomplete（item不使用not_configured）。batch={batch_id,title,active,blocks_entry,verdict,contract_sha256,evidence_path,items}；item={id,label,required,verdict,expected,actual,reasons:string[],artifacts:{path,sha256}[]}；expected/actual为可序列化JSON；unregistered_evidence={path,batch_id,reason}[]；collection={complete:boolean,reasons:string[]}；checked_at为实际本次核对时间，scan_error=null|string。未配置batches=[]，configured=false。HTTP读口 `GET /api/projects/:id/sync-status`，只读、不自动扫描写账；显式写扫描接口用现有可信本地接口惯例，不挂未授权远程路由。
+界面、HTTP和MCP共用 `src/shared/syncEvidence.ts` 的只读返回契约（后端实现者维护定义，UI不能另造类型语义）：`SyncStatusReport={project_id,configured,overall,checked_at,scan_error,batches,unregistered_evidence,collection}`。overall/batch.verdict/item.verdict 值集为 not_configured/missing/passed/failed/stale/needs_review/invalid/incomplete（item不使用not_configured）。batch={batch_id,title,active,historical,blocks_entry,verdict,contract_sha256,evidence_path,verified_at,items}；其中 `historical=true`＝本行结论来自**账本回执**而非本次实时核验（`verdict`/`items` 来自账本最后一条有效回执，`verified_at`＝该回执的核验时间；无回执时 `verified_at=null`、`verdict` 不可能是 passed）；默认口径下 `historical ⟺ active=false`，现行批次 `historical=false` 且 `verified_at=null`（现行批次的核对时间看报告级 `checked_at`）；显式历史复查（`readSyncStatus` 的 `liveHistorical`）时历史批次也走实时求值，`historical=false`（行仍按 `active=false` 归历史组；`data-sync-batch-history-note` 如实区分「历史回执/未核验」与「本次显式实时复查」两种情形）；item={id,label,required,verdict,expected,actual,reasons:string[],artifacts:{path,sha256}[]}；expected/actual为可序列化JSON（历史回执行不带本次实时 expected/actual，为 null 并在 reasons 注明「历史回执」而非当前有效）；unregistered_evidence={path,batch_id,reason}[]；collection={complete:boolean,reasons:string[]}；checked_at为实际本次核对时间，scan_error=null|string。未配置batches=[]，configured=false。HTTP读口 `GET /api/projects/:id/sync-status`，只读、不自动扫描写账；显式写扫描接口用现有可信本地接口惯例，不挂未授权远程路由。
 
 - MCP：register_sync_contract（明确写入）、scan_sync_evidence（明确有写入）、read_sync_status（只读）。HTTP/界面同判据；采用现有 localhost 写口信任边界，远程功能保持关闭，不开放新未授权远程写路由。
 - `register_sync_contract.contract` 的 MCP 声明接受 object 或 JSON string；文本通道额外拒绝重复字段（含转义同名）。成功及相同内容重复登记均返回 `project_id`、`batch_id`、`contract_sha256`、`registered_seq`。后者是本项目真实 `sync.contract_registered` 原事件的序号，不能用当前 last_seq 代替；重复响应附只读 `registration` 元数据，不伪造新的写回执，不新增事件。调用方可据此恢复 `at_registration` 截点。
@@ -117,6 +117,48 @@ active blocks_entry 契约未当前通过时：project_entry 添加 sync_summary
   （设计比内容哈希、施工图比定义哈希）且已发布图由该基线构建——**旧 `baseline_id` 未变但设计源变过仍非 passed**。
 - **后台发现错误消费（组合复核）**：宿主读口/gate 读取零依赖 `syncRuntimeHealth` 的 `readSyncDiscoveryIssues`，不回穿发现模块或图builder。MCP是另一进程，`syncHost.hostSyncView` 经现有描述符只读唯一宿主报告/故障；不可达且已配置时明确失败，不因本进程错误汇为空假称后台健康。只读路径不拉起写者。旧无配置项目保持兼容。
 - **读取预算（最后复核）**：来源实核默认16MB总预算；锁内来源与实际目标共用16MB预算，单文件仍有8MB上限，读前超界不读且不判通过。图输入有单文件8MB/合计16MB预算，异常或超界明确failed/incomplete；只有ENOENT算合法缺失。实际图输入身份和非sync业务事件投影进锁内外指纹，图builder仅在锁外运行；同步证据写口和非续约认领均按此边界核验。
-- **发现与停止界限**：后台有界轮询每项目64个证据文件，超过则显式不完整，不用截断指纹报通过；扫描侧512文件/64MB总证据读取是另一界限，先触及发现界限仍须明确报告。每项目真防抖、按dataDir+project单飞；停止关监听和定时器后等待已启动扫描全部终止，10秒只是告警，不成功返回后留晚写。在途永不终止会延迟优雅退出，不承诺无条件有界停机。
+- **发现与停止界限**：后台有界轮询每项目64个当前证据文件、扫描侧512文件/64MB总证据读取是另一界限（**只计当前（active/未知/未登记）证据；已被有效契约取代的历史文件退出当前发现预算、不计入也不进指纹**），当前证据超过则显式不完整，不用截断指纹报通过，先触及发现界限仍须明确报告；契约域坏事实时不豁免任何文件。每项目真防抖、按dataDir+project单飞；停止关监听和定时器后等待已启动扫描全部终止，10秒只是告警，不成功返回后留晚写。在途永不终止会延迟优雅退出，不承诺无条件有界停机。
 - **验证**：`scripts/verify-sync-evidence.ts`（先红后绿，原始日志 `.工作台/verify/sync-evidence-20260930/backend/`）覆盖上文「必需验收」与 A–F 定版反例；
   真实示例项目批次登记、安装版与终审属 V09-25，不在本附录。
+
+### 增量核验（2026-10-03，性能修复；用户已批准方向）
+
+- **动机（实测）**：`readSyncStatus` 过去对**全部已登记批次**逐批实时求值。一个真实项目（示例项目）账本里有 44 条 `sync.contract_registered`，
+  其中约 42 批带证据：一次只读要跑 44 次逐项裁决、反复读同一批目标文件（3898 条 item / 2004 个去重 artifact 路径，
+  单路径最多重复 96 次）、并对每个批次重算一次六图输入身份——而其中绝大多数是**已被 supersede 的历史批次**，
+  契约冻结、`at_registration` 截点固定，重算只是把旧结论重演。于是核验把实际开发卡住（宿主直读实测 8–10 秒，超客户端 5 秒预算）。
+- **语义修正（本文正文已同步）**：历史批次改为展示**账本最后一次有效核验回执**（`historical`/`verified_at`，缺回执即「未核验」）；
+  现行批次**照旧**逐项按当前实际目标实时重算。active 必需范围一项不减，`graph_full` 与锁内复核均不放松。
+- **扫描侧**：只评估现行批次；同轮内**先全部评估、再逐条提交**（避免自写 `sync.evidence_checked` 打断同一轮的真实输入复用）；
+  单飞在途请求合并成**一轮补跑**，不丢在途期间的新登记/新证据。
+- **写前防 supersede 竞态**：`prepareSyncEvidenceCheck`（锁外）与 `assertSyncEvidenceWriteCommand`（锁内）各核一次 `active`；
+  批次在"锁外备好后、写入前"被取代 → 明确拒（`sync_batch_superseded`）、**零字节**。
+- **复用的边界（不放松）**：六图探针的调用内复用键仍以**内容身份**为准（生效基线、设计/施工源修订、有界图输入文件 sha256、
+  业务事件投影指纹、**事件账本文件内容 sha256**），**不含** size/mtime/TTL，也不含自己的 sync 事件序号/墙钟；
+  同长度改写、保留 mtime 都按内容失效；键核不出来一律不复用、逐次真建。证据包未变**不能**证明目标未变。
+- **验证**：`scripts/verify-sync-incremental.ts`（先红后绿）覆盖 active/历史分离、历史不读目标、历史目标改/删后历史结论不变而现行立刻变、
+  无回执历史未核验、扫描只写现行、写前 supersede 竞态零字节、在途补跑不丢通知、同长度保留 mtime 改写立即反映；
+  `scripts/verify-sync-request-reuse.ts` 按新语义更新（历史批次改走回执、复用断言落在现行批次）。
+
+### 增量核验复审返工（2026-10-03 第二轮，Codex 复审 1/2/3/7/8 项）
+
+- **单飞完成代际有界（替换无限补跑链）**：每个请求由「在它**之后开始**的一轮」覆盖；原请求随自己那一轮完成即返回，
+  **不等待**后续无限新请求；在途期间的请求合并进**已排定的下一轮**（不是复用同一 promise），该轮读完最新收件目录，
+  在途期间的新登记/新证据不丢。**错误语义**：本轮失败如实抛回本轮请求，**不被后轮成功掩盖**；排定的补跑轮在本轮
+  结算时**同步先启动**，所以 `stop` 等待在途 promise 时也能等到它——**停机不漏补跑**，`stopSyncDiscovery` 返回后
+  不再新增扫描写入。持续通知（每 2 秒一次、扫描 >2 秒）下每请求最多等 ≈2 轮，不被挂死。
+- **历史回执逐条校验（不引入新门禁）**：`foldSyncReceipts` 除形状外，按**本批次契约**核对 item 集合完整、重复 id、
+  `required`、`overall` 与必需项一致（`overall=passed` 必须所有必需项 passed）。缺项/不一致的旧回执**不展示 passed**
+  （`verified_at=null`、行按不可用/未核验如实呈现）；**历史回执损坏不升级成报告级 `problems`**——历史只作展示，
+  报告与认领的当前门禁都不因此新增阻断（不因展示缓存读取制造无依据新阻断）。
+- **历史退出当前发现预算（区分历史/active/未知）**：后台有界轮询的每项目 64 文件上限与读取侧 512 文件/64MB 上限
+  **只计当前（active/未知/未登记）证据**；已被**有效契约**取代（`active=false`）的历史文件不计入，也不进发现指纹。
+  未知或 active 超限仍 `incomplete`/fail-closed，不截断后报通过；契约域有坏事实时 `historicalBatchIds` 返回 **null**，
+  **不豁免任何文件**（损坏契约不得用来把文件排除出当前预算）。补 100 历史 + 1 现行、65 未知、坏契约负例。
+- **六图探针构建期间输入变动的明确过期**：`memoizeGraphProbe` 构建前后输入身份不一致（或事后核不出键）时，返回
+  **明确过期**结果（`ok=false`、`verdict=stale`），让 `graph_full` 不通过——不再「只不入缓存」照常返回本次旧结果。
+  尤其只有 1 个现行批次、没有下一批触发重算时，也不会把旧事件快照配新身份判 passed。
+- **验证**：`scripts/verify-sync-incremental.ts` 增 K（100 历史+1 现行不拖死当前、坏契约不豁免、65 未知仍 fail-closed）、
+  L（构建期间真外部输入改变 → 明确过期）、M（停机等在途+排队、返回后不重启）三段；同文件 G 段改为完成代际有界断言；
+  `scripts/verify-sync-request-reuse.ts` 增 C-3/E-5（真文件/真事件在 build 期间改变 → 明确过期）；`verify-sync-discovery` S3
+  改为「等价规范 dataDir 共用同一单飞队列」。

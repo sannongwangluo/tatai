@@ -270,9 +270,11 @@ sec("S3 单飞 key＝规范 dataDir+project（夹具不串、同项目真单飞�
   const p1 = discoveryMod.runSyncScanForRequest({ projectId: "P", dataDir: ddA, submitter: svcA.submitter });
   const p2 = discoveryMod.runSyncScanForRequest({ projectId: "P", dataDir: ddB, submitter: svcB.submitter });
   const p3 = discoveryMod.runSyncScanForRequest({ projectId: "P", dataDir: canonical, submitter: svcA.submitter });
+  const p4 = discoveryMod.runSyncScanForRequest({ projectId: "P", dataDir: canonical, submitter: svcA.submitter });
   ok(p1 !== p2, "S3-1 同 projectId、不同 dataDir → 不共用单飞槽（隔离夹具不串）");
-  ok(p1 === p3, "S3-2 同 projectId、等价规范 dataDir（含 ./..） → 共用同一在途（真单飞）");
-  await Promise.allSettled([p1, p2, p3]);
+  ok(p3 === p4, "S3-2 同 projectId、等价规范 dataDir（含 ./..） → 共用同一单飞队列（在途请求合并进同一轮）");
+  ok(p1 !== p3, "S3-3 规范 dataDir 与本轮在途 promise 不同：新一轮独立结算（完成代际有界，不是无限补跑链）");
+  await Promise.allSettled([p1, p2, p3, p4]);
 });
 
 // ── 共享的长生命周期夹具：项目已有契约＋证据包 ──

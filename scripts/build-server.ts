@@ -356,6 +356,8 @@ const result = await build({
         index: path.join(REPO_ROOT, "src", "server", "index.ts"),
         mcp: path.join(REPO_ROOT, "src", "mcp", "index.ts"),
         "write-service": path.join(REPO_ROOT, "src", "server", "work", "daemon.ts"),
+        // V09-37：宿主只读派生的工作线程入口（打包态由 readWorkerPool 按 read-worker.js 起）
+        "read-worker": path.join(REPO_ROOT, "src", "server", "work", "readWorker.ts"),
       },
       external: externals,
       output: { entryFileNames: "[name].js", format: "es" },
@@ -371,6 +373,7 @@ console.log(`[build-server] vite 产出 chunk：${emitted.join(", ")}`);
 ok(fs.existsSync(path.join(OUT_DIR, "index.js")), "① 后端入口 index.js 产出");
 ok(fs.existsSync(path.join(OUT_DIR, "mcp.js")), "① MCP 入口 mcp.js 产出");
 ok(fs.existsSync(path.join(OUT_DIR, "write-service.js")), "① 独立写入服务入口 write-service.js 产出（V07-01，MCP 自愈按需拉起的就是它）");
+ok(fs.existsSync(path.join(OUT_DIR, "read-worker.js")), "① 只读 worker 入口 read-worker.js 产出（V09-37，宿主只读派生的工作线程；readWorkerPool 打包态按它起）");
 
 // ───────────────────────── ② 原生依赖按白名单落地 ─────────────────────────
 
@@ -452,7 +455,8 @@ for (const f of files) console.log(`[build-server]   ${f.rel}  ${f.bytes} B`);
 ok(
   files.some((f) => f.rel === "index.js") &&
     files.some((f) => f.rel === "mcp.js") &&
-    files.some((f) => f.rel === "write-service.js"),
-  "③ 布局核对：三个入口都在包内根目录（backend.rs 找的 server/index.js、MCP 的 mcp.js、自愈拉起的 write-service.js）",
+    files.some((f) => f.rel === "write-service.js") &&
+    files.some((f) => f.rel === "read-worker.js"),
+  "③ 布局核对：四个入口都在包内根目录（backend.rs 找的 server/index.js、MCP 的 mcp.js、自愈拉起的 write-service.js、只读 worker 的 read-worker.js）",
 );
 console.log(`\n[build-server] 完成：${process.exitCode === 1 ? "有 FAIL，见上" : "全部 PASS"}`);

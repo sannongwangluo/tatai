@@ -804,10 +804,16 @@ export function foldFindings(events: WorkEvent[]): { findings: Record<string, Fi
   return { findings, ignored_entities: [...ignored].sort() };
 }
 
-/** 从磁盘事件文件读并折叠缺陷（读路径；中段损坏会抛，不吞） */
-export function readFindings(workDir: string): { findings: Record<string, FindingState>; ignored_entities: string[] } {
-  const { events } = loadEvents(workDir);
-  return foldFindings(events);
+/**
+ * 从磁盘事件文件读并折叠缺陷（读路径；中段损坏会抛，不吞）。
+ * `events` 给定时直接折叠这份**同一 workDir 的**现读快照，不再读盘（来源一致性由调用方保证，
+ * 见 `statusProjection.EventsSnapshot`）；缺省仍现读，行为不变。
+ */
+export function readFindings(
+  workDir: string,
+  events?: WorkEvent[],
+): { findings: Record<string, FindingState>; ignored_entities: string[] } {
+  return foldFindings(events ?? loadEvents(workDir).events);
 }
 
 // ── 缺陷事件写入（唯一写入者：提交事件，不绕开） ──

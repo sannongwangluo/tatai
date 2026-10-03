@@ -32,6 +32,13 @@ import {
   type ReadReceipt,
 } from "../chatTools";
 import {
+  cursorBinding,
+  makeProjectCursor,
+  parseProjectCursor,
+  CONTINUATION_PAGE_MAX_CHARS,
+  type CursorDoc,
+} from "../../shared/continuationCursor";
+import {
   activeBaseline,
   BASELINES_FILE,
   loadDocument,
@@ -42,16 +49,23 @@ import {
   type ProjectBaseline,
 } from "./documents";
 import { EVENTS_FILE } from "./eventStore";
+import { readLedger } from "./ledgerRead";
 import { importTaskDefinitions, taskDefinitionHash, type TaskDefinition } from "./plan";
+import { PROJECT_NOTES_REL, projectNotesFileInfo } from "./projectIndex";
 import { readTaskStates, type TaskState } from "./tasks";
+import type { LedgerContentFingerprint, WorkEvent } from "./types";
 
 /** 上下文包格式版本（与 v2 事件格式分开：包是派生物，不进事实源） */
 export const CONTEXT_PACKAGE_SCHEMA = 1 as const;
 
 /** 一个包内联文本的默认字符预算（简报 + 任务/章节 + 当前页；超了如实记进 omitted） */
 export const CONTEXT_MAX_CHARS = 24_000;
-/** 单页按需原文的默认字符预算（与既有"约 2 万字符设计背景"同量级，但这次是**带账本**的） */
-export const CONTEXT_PAGE_MAX_CHARS = 20_000;
+/**
+ * 单页按需原文的默认字符预算（与既有"约 2 万字符设计背景"同量级，但这次是**带账本**的）。
+ * 值取自**纯 shared** 常量（`shared/continuationCursor.ts`）：MCP 续读实现用同一口径，
+ * 且 context 与本模块不再与 continuation 互相 import 成环（复审材料项）。
+ */
+export const CONTEXT_PAGE_MAX_CHARS = CONTINUATION_PAGE_MAX_CHARS;
 /** 包内列出的任务条数上限 */
 export const CONTEXT_TASKS_MAX = 20;
 /** 包内列出的相关章节条数上限 */
@@ -90,7 +104,7 @@ export function isContextError(e: unknown): e is ContextError {
 // ── 来源清单 ──
 
 /** 来源在包里的角色 */
-export type ContextSourceKind = "design" | "plan" | "baseline" | "task_state" | "file";
+export type ContextSourceKind = "design" | "plan" | "baseline" | "task_state" | "file" | "project_notes";
 
 /** §2.8 的状态口径：成功 / 失败 / 截断 / 二进制排除（+ 一个字节都没取到的未读） */
 export type SourceStatus = "ok" | "truncated" | "failed" | "binary_excluded" | "not_read";
@@ -565,20 +579,43 @@ export function readContextSource(
 
   let start = 1;
   if (opts.cursor !== undefined && opts.cursor !== "") {
-    const cur = parseCursor(opts.cursor);
-    if (cur === null) {
-      throw new ContextError("INVALID_CURSOR", `游标形态不合法：${JSON.stringify(opts.cursor)}`, {
-        cursor: opts.cursor,
-      });
+    // U3 上游接线：泛型文件读口**兼容消费**新格式 `tcur1`（完整 sha ＋ 项目/文档绑定），
+    // 因为上下文包的设计/施工页现在给的正是它——若只认旧 `tctx1`，包里的指路标就用不了。
+    // 旧 `tctx1` 行为**逐字不变**（16 位前缀匹配）。校验：完整哈希不符＝SOURCE_CHANGED、绑定不符＝CROSS_PROJECT。
+    const modern = parseProjectCursor(opts.cursor);
+    if (modern !== null) {
+      if (modern.fullSha !== version) {
+        throw new ContextError(
+          "SOURCE_CHANGED",
+          `源内容已变，游标失效（游标绑定完整哈希 ${modern.fullSha.slice(0, 16)}…，当前 ${version.slice(0, 16)}…）：${rel}`,
+          { path: rel, cursor_version: modern.fullSha, current_version: version },
+        );
+      }
+      const expectBind = cursorBinding(projectId, modern.doc, version);
+      if (modern.bind !== expectBind) {
+        throw new ContextError("INVALID_CURSOR", `游标项目/文档绑定不符（绑定 ${modern.bind}，当前应为 ${expectBind}）：${rel}`, {
+          path: rel,
+          cursor_bind: modern.bind,
+          expected_bind: expectBind,
+        });
+      }
+      start = Math.min(Math.max(1, modern.start), lines.length + 1);
+    } else {
+      const cur = parseCursor(opts.cursor);
+      if (cur === null) {
+        throw new ContextError("INVALID_CURSOR", `游标形态不合法：${JSON.stringify(opts.cursor)}`, {
+          cursor: opts.cursor,
+        });
+      }
+      if (!cursorMatchesVersion(cur, version)) {
+        throw new ContextError(
+          "SOURCE_CHANGED",
+          `源内容已变，旧游标失效（游标绑定 ${cur.version}，当前 ${version.slice(0, 16)}）：${rel}`,
+          { path: rel, cursor_version: cur.version, current_version: version },
+        );
+      }
+      start = Math.min(Math.max(1, cur.start), lines.length + 1);
     }
-    if (!cursorMatchesVersion(cur, version)) {
-      throw new ContextError(
-        "SOURCE_CHANGED",
-        `源内容已变，旧游标失效（游标绑定 ${cur.version}，当前 ${version.slice(0, 16)}）：${rel}`,
-        { path: rel, cursor_version: cur.version, current_version: version },
-      );
-    }
-    start = Math.min(Math.max(1, cur.start), lines.length + 1);
   }
 
   const picked: string[] = [];
@@ -720,6 +757,18 @@ export interface BuildContextOptions {
   ledger?: CoverageLedger;
   /** 旧包（增量重建用）：只重读变了的来源 */
   previous?: ContextPackage | null;
+  /**
+   * 共享账本事件（V09-39 上游接线）：调用方（唯一宿主只读入口 / `entry.ts`）已为本次请求现读的**同一份**
+   * `WorkEvent[]` 快照。给了就**不再另读盘**（`readTaskStates` 直接折叠这份事件）；缺省仍现读，行为不变。
+   * 空数组是**合法快照**（"这个 workDir 现在没有事件"），不得当作"没传"再读一遍。
+   */
+  events?: readonly WorkEvent[];
+  /**
+   * 与 `events` 同源的账本**内容身份**（`ledgerRead.readLedger().content`：真实字节 sha256）。
+   * 有它就用它当 `task_state` 来源的内容哈希；**绝不拿 `last_seq:N` 冒充内容哈希**（契约 U1/U2）。
+   * 只传 `events` 未传它时，该来源内容哈希**留空**（如实：本次未带内容身份），而不是编造。
+   */
+  eventsContent?: LedgerContentFingerprint;
 }
 
 /** 包内存注册表：`refreshContextPackage` / `packageStaleness` 要能按 id 找回上一版 */
@@ -937,6 +986,30 @@ export function buildContextPackage(projectId: string, opts: BuildContextOptions
     });
   }
 
+  // ②b 可选：项目说明索引（docs/project-notes.json，V09-39）——存在就纳入来源清单（真实内容哈希）；
+  //     不存在是**正常空态**（不强制首建全仓说明才接续、也不进 omitted）；异 schema/读不出如实标。
+  try {
+    const notes = projectNotesFileInfo(projectId, opts.dataDir);
+    if (notes.exists) {
+      manifest.push({
+        path: PROJECT_NOTES_REL,
+        kind: "project_notes",
+        content_sha256: notes.version_sha256,
+        size: null,
+        taken: null,
+        taken_bytes: null,
+        covered: { chars: 0, total_chars: null, complete: true },
+        status: notes.schema_ok ? "ok" : "failed",
+        note: notes.schema_ok
+          ? `Agent 编写的项目说明索引（待审说明层，${notes.entry_count} 条）：不是设计/事件/验收事实，不改六图颜色/状态/Gate`
+          : `说明索引存在但不是本 schema（${notes.conflict?.code ?? "conflict"}）：不按本 schema 采信、不可覆盖`,
+      });
+      if (!notes.schema_ok) stale.push(`说明索引不可按本 schema 采信：${notes.conflict?.message ?? ""}`);
+    }
+  } catch (e) {
+    stale.push(`说明索引读取失败：${sanitizeErrorMessage((e as Error).message)}`);
+  }
+
   // 增量重建的沿用判据：图纸修订与提问都没变 → 上次派生的任务/章节直接沿用（不重解析）
   const derivedReusable =
     previous !== null &&
@@ -1039,8 +1112,26 @@ export function buildContextPackage(projectId: string, opts: BuildContextOptions
   );
   const taskCounts: Record<string, number> = {};
   const states: Record<string, TaskState> = {};
+  // V09-39 上游接线：优先复用调用方（唯一宿主只读入口 / entry.ts）已现读的**同一份**账本事件，不再另读盘；
+  // 未提供时现读一次 `readLedger`（顺带拿到**真实内容身份**）。`eventsContent` 是真实字节 sha256，
+  // **绝不拿 `last_seq:N` 冒充内容哈希**（契约 U1/U2；复审材料项）。
+  let ledgerEvents: readonly WorkEvent[] | undefined = opts.events;
+  let ledgerContent: LedgerContentFingerprint | null = opts.eventsContent ?? null;
+  if (ledgerEvents === undefined) {
+    try {
+      const read = readLedger(projectWorkDir(projectId, opts.dataDir));
+      ledgerEvents = read.events;
+      ledgerContent = read.content;
+    } catch {
+      // 现读失败：留给下面的 readTaskStates 走原路径抛错并如实登记（失败语义逐字不变）
+      ledgerContent = null;
+    }
+  }
   try {
-    const projection = readTaskStates(projectWorkDir(projectId, opts.dataDir));
+    const projection = readTaskStates(
+      projectWorkDir(projectId, opts.dataDir),
+      ledgerEvents === undefined ? undefined : [...ledgerEvents],
+    );
     for (const s of Object.values(projection.states)) {
       states[s.task_id] = s;
       taskCounts[s.status] = (taskCounts[s.status] ?? 0) + 1;
@@ -1064,13 +1155,18 @@ export function buildContextPackage(projectId: string, opts: BuildContextOptions
     manifest.push({
       path: `${workbenchRel}/${EVENTS_FILE}`,
       kind: "task_state",
-      content_sha256: `last_seq:${projection.last_seq}`,
+      // 真实账本内容身份（已验证字节的 sha256）；没有内容身份时如实留空，**不用 last_seq 冒充内容哈希**
+      content_sha256: ledgerContent === null ? null : ledgerContent.prefix_sha256,
       size: null,
       taken: null,
       taken_bytes: null,
       covered: { chars: 0, total_chars: null, complete: true },
       status: "ok",
-      note: `任务运行状态投影（重放到 seq ${projection.last_seq}）`,
+      note:
+        `任务运行状态投影（重放到 seq ${projection.last_seq}）` +
+        (ledgerContent === null
+          ? "；本包未带账本内容身份，内容哈希留空（不以 last_seq 冒充内容哈希）"
+          : `；账本内容身份 sha256=${ledgerContent.prefix_sha256.slice(0, 12)}…（已验证 ${ledgerContent.verified_bytes} 字节）`),
     });
   } catch (e) {
     const reason = sanitizeErrorMessage((e as Error).message);
@@ -1108,6 +1204,19 @@ export function buildContextPackage(projectId: string, opts: BuildContextOptions
       ...(opts.dataDir === undefined ? {} : { dataDir: opts.dataDir }),
       maxChars: pageBudget,
     });
+    // U3 上游接线：设计/施工页给**新格式** `tcur1` 完整版本游标（完整 64 位 sha ＋ 项目/文档绑定），
+    // 才能被 read_design/read_plan 直接消费；旧的 `tctx1` 短前缀只定位、会被新 MCP 拒（复审材料项）。
+    // 泛型文件读取接口（readContextSource）**保持旧游标**——兼容不改；只有这里的设计/施工页换新格式。
+    const pageDocKind: CursorDoc | null =
+      design.loaded !== null && pageDoc === design.loaded
+        ? "design"
+        : plan.loaded !== null && pageDoc === plan.loaded
+          ? "plan"
+          : null;
+    const pageCursor =
+      !read.complete && pageDocKind !== null
+        ? makeProjectCursor(projectId, pageDocKind, read.content_sha256, "lines", read.range.end + 1)
+        : read.next_cursor;
     page = {
       path: read.path,
       version: read.version,
@@ -1115,10 +1224,10 @@ export function buildContextPackage(projectId: string, opts: BuildContextOptions
       range: read.range,
       byte_range: read.byte_range,
       total: read.total,
-      next_cursor: read.next_cursor,
+      next_cursor: pageCursor,
       complete: read.complete,
     };
-    next_cursor = read.next_cursor;
+    next_cursor = pageCursor;
     noteTaken(
       manifest,
       read.path,
@@ -1134,7 +1243,7 @@ export function buildContextPackage(projectId: string, opts: BuildContextOptions
         reason: "over_budget",
         detail:
           `本页只取第 ${read.range.start}–${read.range.end} 行（共 ${read.total.lines} 行）；` +
-          `其余范围未取，续读游标 ${read.next_cursor ?? "-"}`,
+          `其余范围未取，续读游标 ${pageCursor ?? "-"}`,
         size: { lines: read.total.lines, bytes: read.total.bytes, chars: read.total.chars },
       });
     }
@@ -1367,6 +1476,14 @@ export interface ResumeCheckpoint {
 export const checkpointPath = (projectId: string, dataDir?: string): string =>
   path.join(projectWorkDir(projectId, dataDir), RESUME_FILE);
 
+/** 续读游标（新 `tcur1` 完整版本 或 旧 `tctx1` 短前缀）绑定的下一段起点（1 起）；解析不出为 null */
+function cursorStartOf(cursor: string): number | null {
+  const legacy = parseCursor(cursor);
+  if (legacy !== null) return legacy.start;
+  const modern = parseProjectCursor(cursor);
+  return modern === null ? null : modern.start;
+}
+
 /** 从账本造检查点（只有真读到过的来源才进 confirmed_sources） */
 export function buildResumeCheckpoint(
   pkg: ContextPackage,
@@ -1385,7 +1502,7 @@ export function buildResumeCheckpoint(
           path: partial.path,
           cursor: partial.resume_cursor,
           unit: "lines" as CoverageUnit,
-          start: parseCursor(partial.resume_cursor ?? "")?.start ?? 1,
+          start: cursorStartOf(partial.resume_cursor ?? "") ?? 1,
           detail: `从 ${partial.path} 的游标处接着读（已取 ${partial.covered_chars} 字）`,
         }
       : pkg.next_cursor !== null && pkg.page !== null
@@ -1393,7 +1510,7 @@ export function buildResumeCheckpoint(
             path: pkg.page.path,
             cursor: pkg.next_cursor,
             unit: "lines" as CoverageUnit,
-            start: parseCursor(pkg.next_cursor)?.start ?? 1,
+            start: cursorStartOf(pkg.next_cursor) ?? 1,
             detail: `继续取 ${pkg.page.path} 的下一段（本包只取到第 ${pkg.page.range.end} 行）`,
           }
         : unread.length > 0
@@ -1510,12 +1627,15 @@ export function resolveCheckpoint(
     );
   }
   if (checkpoint.resume_position !== null) {
-    lines.push(
-      `续接位置：${checkpoint.resume_position.detail}` +
-        (checkpoint.resume_position.cursor !== null
-          ? `（下次 read_file 直接带 cursor=${checkpoint.resume_position.cursor}）`
-          : ""),
-    );
+    const cur = checkpoint.resume_position.cursor;
+    // 新格式 `tcur1` 完整版本游标由 read_design/read_plan 消费（read_file 只认旧 `tctx1`）——指对工具，别指错路。
+    const howto =
+      cur === null
+        ? ""
+        : parseProjectCursor(cur) !== null
+          ? `（下次用 read_design/read_plan 直接带 cursor=${cur}）`
+          : `（下次 read_file 直接带 cursor=${cur}）`;
+    lines.push(`续接位置：${checkpoint.resume_position.detail}${howto}`);
   }
   return { confirmed_sources: confirmed, source_changed, text: lines.join("\n"), resume_position: checkpoint.resume_position };
 }

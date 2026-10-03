@@ -50,15 +50,19 @@ import {
   acceptanceDimensionOf,
   checksFromFacts,
   collectProjectFacts,
+  eventsSnapshotOf,
   dependencyRelease,
   objectsFromFacts,
   projectStatuses,
+  type EventsSnapshot,
+  type ProjectFacts,
   type StatusProjection,
   type StatusProjectionSet,
 } from "./statusProjection";
 import { alignDefinitionsAndStates, readTaskStates, TASK_STATUS_LABELS, type TaskState } from "./tasks";
 import { loadStageReads, STAGE_READS_REL, type StageReadKind, type StageReadsLoad } from "./stageReads";
 import { computeSyncBlock, SYNC_INBOX_REL, type SyncBlockInfo } from "./sync";
+import { preconditionsOf, type EntryPreconditions } from "./preconditions";
 import type { SyncVerdict } from "../../shared/syncEvidence";
 import { WorkError } from "./types";
 import { compareIsoTime, latestByTime } from "../time";
@@ -139,6 +143,19 @@ export interface ProjectEntryOptions {
    * 不给＝读本进程汇（宿主自身路径；老调用方行为不变）。
    */
   syncDiscoveryIssues?: string[];
+  /**
+   * V09-34：请求附一份**接续前置事实说明**（`preconditions`）。默认 **false**＝不附，保持 §6.7 只读返回
+   * **恰好九个字段**的既有默认契约；true = 从**本次已算的同一份 EntryFacts** 派生说明性清单（`blocking:false`，
+   * 不新增门禁、不改 next_action/reasons）。这是轻量选项：默认省略该字段，需要时显式索取。
+   */
+  preconditions?: boolean;
+  /**
+   * V09-31：**本次请求已经现读的事件快照**（`.工作台/work/` 同一 workDir、同一截点）。宿主只读入口一次
+   * 取快照后，把它同时喂给入口、六图摘要与同步判据——三者出自**同一版事实**，不再各读一遍盘。
+   * **只活在这一次调用栈里**：缺省＝本函数自己现读（行为逐字不变）；来源 workDir 不一致时由
+   * `eventsOfSnapshot` 回退现读（不会把别人的账本当自己的）。这是进程内选项，不进 §6.7 契约。
+   */
+  events?: EventsSnapshot;
 }
 
 // ── 能力发现（§6.2：如实区分 只读 / 可接续 / 可协调执行） ──
@@ -456,6 +473,12 @@ export interface ProjectEntry {
   required_reads: RequiredRead[];
   /** 同步证据摘要（V09-23／DESIGN §2.10）：在**响应层**拼，不塞进 collectProjectFacts（findings D）。未配置项目为 null。 */
   sync_summary: EntrySyncSummary | null;
+  /**
+   * V09-34 接续前置事实说明（**仅说明**）：只在 `opts.preconditions === true` 时给出（默认**省略**，
+   * 保持 §6.7 九字段默认契约）。逐项从**本次已算的同一份 EntryFacts** 派生，`blocking:false`、
+   * 不新增门禁、不改 `next_action`/`reasons`（见 `preconditions.ts`）。
+   */
+  preconditions?: EntryPreconditions;
 }
 
 /** 同步证据的响应层摘要（判据来源＝sync.computeSyncBlock，与 claimTask / 写口**同一份**） */
@@ -468,7 +491,7 @@ export interface EntrySyncSummary {
 
 // ── 现场事实（只读；读不出来如实标 unreadable，不假装空状态） ──
 
-interface EntryFacts {
+export interface EntryFacts {
   projectId: string;
   dataDir: string;
   workDir: string;
@@ -494,10 +517,29 @@ interface EntryFacts {
   executions_unreadable: string | null;
   baseline: ProjectBaseline | null;
   baselineRevalidate: string[];
+  /**
+   * 生效基线**是否有效**（V09-31 复审）：结构化布尔＝有生效基线且**一条失效理由都没有**。
+   * 判定层与前置说明一律用它，不许再拿 `baselineRevalidate` 的中文去 substring 匹配。
+   */
+  baselineValid: boolean;
+  /** 源是否在基线激活后变过（结构化；与 `baselineValid` 区分：变过只是失效的一种） */
+  baselineSourceChanged: boolean;
   /** 项目级阶段必读指针（`.工作台/work/stage-reads.json`；不存在=absent，老项目原样兼容） */
   stageReads: StageReadsLoad;
   /** 同步证据阻断（V09-23／DESIGN §2.10；未配置项目为 null，保持兼容） */
   syncBlock: SyncBlockInfo | null;
+  /**
+   * 同步阻断**读不出来**的原因（V09-31 复审）：非 null = 同步现场未知——不能与「未配置」混为一谈
+   * （`syncBlock` 为 null 且本字段为 null 才是"没配置/老项目"；读失败是另一种事实）。
+   */
+  syncBlockUnreadable: string | null;
+  /**
+   * 本次请求是否**真的**用同一份现读事件快照贯通了全链（V09-31 复审：「说明称全链同一版需事实支持」）：
+   * true = `eventsSnapshotOf` 现读成功且沿任务/认领/执行/同步/投影共享；false = 快照读不出、下游各处回退现读。
+   */
+  eventsShared: boolean;
+  /** 快照读不出来的原因（`eventsShared=false` 时给；成功时 null） */
+  eventsSnapshotUnreadable: string | null;
   design: ReturnType<typeof loadDocument>;
   plan: ReturnType<typeof loadDocument>;
   context: ContextPackage | null;
@@ -520,9 +562,21 @@ export function projectWithReleases(facts: {
   projectId: string;
   dataDir: string;
   definitions: TaskDefinition[];
+  /** 可选：本次调用已读的事件快照（仅同一 workDir 复用，见 `EventsSnapshot`）；缺省各调用点现读 */
+  events?: EventsSnapshot;
+  /**
+   * 可选（V09-30）：本次调用**已经算好的**同一份现场事实（同 projectId/dataDir/events 由调用方保证）。
+   * 给了就直接用，**不再调 `collectProjectFacts`**——消除 `gatherFacts` 里「直接算一次 + 本函数内再算一次」
+   * 的重复派生；缺省行为不变（自己现算，老调用点逐字照旧）。
+   */
+  projectFacts?: ProjectFacts;
   byId?: never;
 }): StatusProjectionSet {
-  const projectFacts = collectProjectFacts(facts.projectId, facts.dataDir);
+  const projectFacts = facts.projectFacts ?? collectProjectFacts(
+    facts.projectId,
+    facts.dataDir,
+    facts.events === undefined ? {} : { events: facts.events },
+  );
   const defs = facts.definitions.length > 0 ? facts.definitions : projectFacts.definitions;
   const acceptances = Object.values(projectFacts.audit.acceptances);
   // V09-29（契约 F4）：检查输入带**源清单现读复核**（绑 code 且证据带 source_manifest 的那些）；
@@ -565,8 +619,11 @@ export function projectWithReleases(facts: {
  * 基线有效性判据（DESIGN.md §2.9 / §5.6）：生效基线 + 两份源图纸是否在激活后变过。
  *
  * 抽出来是为了**一事一源**：项目入口（gatherFacts）与 doctor 工具都要报"基线还有效吗"，
- * 两处各写一遍必然漂移——尤其那句"在基线激活后变过"还被入口的判定层按字面引用。
+ * 两处各写一遍必然漂移。
  * 返回的 messages 顺序与原实现一致（尚未激活 → 变过），调用方直接拼进各自的 reasons。
+ * `source_changed` 与 `valid` 都是**结构化布尔**（V09-31 复审）：判定层与前置说明**不许**再拿
+ * messages 里那句中文去 `includes("在基线激活后变过")` ——那样一旦出现其它失效理由（保全对象篡改/缺失）
+ * 就会被误判成"有效/satisfied"。`valid` ＝ 有生效基线且 messages 为空（一条失效理由都没有）。
  */
 export function baselineRevalidateOf(
   baseline: ProjectBaseline | null,
@@ -580,11 +637,11 @@ export function baselineRevalidateOf(
      */
     plan_definition_revision?: string | null;
   },
-): { messages: string[]; source_changed: boolean } {
+): { messages: string[]; source_changed: boolean; valid: boolean } {
   const messages: string[] = [];
   if (baseline === null) {
     messages.push("尚未激活成套图纸基线（生效决定为空，不能假设按哪一版干活）");
-    return { messages, source_changed: false };
+    return { messages, source_changed: false, valid: false };
   }
   const nowPlan = current.plan_definition_revision ?? current.plan_revision;
   const sourceChanged =
@@ -596,11 +653,19 @@ export function baselineRevalidateOf(
         `plan 定义=${baseline.plan_revision.definition_sha256.slice(0, 12)}…；设计比内容哈希、施工图比定义哈希）：影响待查（§5.6）`,
     );
   }
-  return { messages, source_changed: sourceChanged };
+  // V09-31 复审：`valid` **按结构事实**给——**不是**拿消息文本去 match「变过」那句（复审：其它 baselineRevalidate
+  // 失败，如保全对象篡改/缺失，同样不能标 satisfied）。有生效基线且**一条失效理由都没有**才算有效。
+  return { messages, source_changed: sourceChanged, valid: messages.length === 0 };
 }
 
 /** 汇总现场事实（全部只读；任何一步读不出来都记进 `unreadable`，由判定层 fail-closed） */
-function gatherFacts(projectId: string, dataDir: string, now: string, syncDiscoveryIssues?: string[]): EntryFacts {
+function gatherFacts(
+  projectId: string,
+  dataDir: string,
+  now: string,
+  syncDiscoveryIssues?: string[],
+  sharedSnapshot?: EventsSnapshot,
+): EntryFacts {
   const project = getProject(projectId, dataDir);
   if (!project) {
     throw new WorkError("INVALID_COMMAND", `项目不存在: ${projectId}`, { project_id: projectId });
@@ -618,23 +683,56 @@ function gatherFacts(projectId: string, dataDir: string, now: string, syncDiscov
       reasons: [`${STAGE_READS_REL} 读取失败：${e instanceof Error ? e.message : String(e)}`],
     };
   }
+  // V09-30：同一次请求**只读一次事件账本**（`eventsSnapshotOf`），把这份同一 workDir 的同一截点快照沿
+  // 任务/认领/执行/同步核验/投影全链传下去共享——与六图摘要同一套 `EventsSnapshot` 骨架。它**只活在这一次
+  // 调用栈里**：下一次调用立刻现读、立刻见到新事件，**绝不跨请求缓存旧绿**。读不出来就不传（`eventsSnapshot=null`），
+  // 下游各按既有路径现读并如实报错，失败语义逐字不变（不把读失败伪装成空状态）。
+  //
+  // V09-31：调用方（宿主只读入口）可**传入**它已经为整次请求现读的那一份快照——入口、六图摘要与同步判据
+  // 共用同一版事实，不再各读一遍盘。来源 workDir 与本项目不一致时**不算数**（`eventsOfSnapshot` 会回退现读），
+  // 且 `eventsShared` 只如实反映"这一次**真的**复用了同一份快照"（复审：说明称全链同一版需事实支持）。
+  let eventsSnapshot: EventsSnapshot | null = null;
+  let eventsSnapshotUnreadable: string | null = null;
+  if (
+    sharedSnapshot !== undefined &&
+    sharedSnapshot !== null &&
+    sharedSnapshot.work_dir === workDir
+  ) {
+    eventsSnapshot = sharedSnapshot;
+  } else {
+    try {
+      eventsSnapshot = eventsSnapshotOf(projectId, dataDir);
+    } catch (e) {
+      eventsSnapshot = null;
+      eventsSnapshotUnreadable = e instanceof Error ? e.message : String(e);
+    }
+  }
+  const eventsShared = eventsSnapshot !== null;
+  const sharedEvents = eventsSnapshot === null ? undefined : eventsSnapshot.events;
+
   let unreadable: string | null = null;
   let states: Record<string, TaskState> = {};
   let claims: Record<string, ClaimRecord[]> = {};
   try {
-    states = readTaskStates(workDir).states;
-    claims = claimRecordsOf(readClaimEvents(workDir));
+    states = readTaskStates(workDir, sharedEvents).states;
+    claims = claimRecordsOf(readClaimEvents(workDir, sharedEvents));
   } catch (e) {
     unreadable = `事件现场读不出来（${(e as Error).message}）`;
   }
 
   // 同步证据阻断（V09-23／DESIGN §2.10）：只读、fail-closed。未配置项目 computeSyncBlock 返回
   // blocked=false（老项目零影响）；读不出来**不抛**——入口如实按"读不出"处理（见 decideNextAction 第 1.6 步）。
+  // V09-30：喂同一份快照，使同步判据与上面的任务/认领、下面的投影出自**同一版**事实（同版接续，V09-31 请求内部分）。
   let syncBlock: SyncBlockInfo | null = null;
+  let syncBlockUnreadable: string | null = null;
   try {
-    syncBlock = computeSyncBlock(projectId, dataDir, syncDiscoveryIssues === undefined ? {} : { discoveryIssues: syncDiscoveryIssues });
+    syncBlock = computeSyncBlock(projectId, dataDir, {
+      ...(syncDiscoveryIssues === undefined ? {} : { discoveryIssues: syncDiscoveryIssues }),
+      ...(sharedEvents === undefined ? {} : { events: sharedEvents }),
+    });
   } catch (e) {
-    unreadable ??= `同步证据现场读不出来（${(e as Error).message}）`;
+    syncBlockUnreadable = e instanceof Error ? e.message : String(e);
+    unreadable ??= `同步证据现场读不出来（${syncBlockUnreadable}）`;
   }
 
   const design = loadDocument(projectId, "design", dataDir);
@@ -646,21 +744,27 @@ function gatherFacts(projectId: string, dataDir: string, now: string, syncDiscov
 
   let baseline: ProjectBaseline | null = null;
   const baselineRevalidate: string[] = [];
+  let baselineReadable = true;
   try {
     baseline = activeBaseline(projectId, dataDir);
   } catch (e) {
+    baselineReadable = false;
     baselineRevalidate.push(`基线流水不可读：${(e as Error).message}`);
   }
-  baselineRevalidate.push(
-    ...baselineRevalidateOf(baseline, {
-      design_revision: design === null ? null : design.revision.content_sha256,
-      plan_revision: plan === null ? null : plan.revision.content_sha256,
-      plan_definition_revision: plan === null ? null : plan.revision.definition_sha256,
-    }).messages,
-  );
+  const baselineHealth = baselineRevalidateOf(baseline, {
+    design_revision: design === null ? null : design.revision.content_sha256,
+    plan_revision: plan === null ? null : plan.revision.content_sha256,
+    plan_definition_revision: plan === null ? null : plan.revision.definition_sha256,
+  });
+  baselineRevalidate.push(...baselineHealth.messages);
+  // V09-31 复审：结构化给「有效/源变过」——基线流水读不出来时，即便 baseline 恰为非 null 也不算有效。
+  const baselineValid = baselineReadable && baselineHealth.valid;
+  const baselineSourceChanged = baselineHealth.source_changed;
+  // V09-30：`collectProjectFacts` **只算一次**，既供本函数的审计/缺陷取用，又透传给下面的
+  // `projectWithReleases` 复用（消除「直接算一次 + projectWithReleases 内再算一次」的重复派生）。
   const project_facts = (() => {
     try {
-      return collectProjectFacts(projectId, dataDir);
+      return collectProjectFacts(projectId, dataDir, eventsSnapshot === null ? {} : { events: eventsSnapshot });
     } catch (e) {
       unreadable ??= `任务/审计事实读不出来（${(e as Error).message}）`;
       return null;
@@ -669,7 +773,13 @@ function gatherFacts(projectId: string, dataDir: string, now: string, syncDiscov
 
   let projection: StatusProjectionSet = { objects: [], by_id: {}, summary: { counts: {} as never, unmapped: [], blocking_findings: [], basis: "" } };
   try {
-    projection = projectWithReleases({ projectId, dataDir, definitions });
+    projection = projectWithReleases({
+      projectId,
+      dataDir,
+      definitions,
+      ...(eventsSnapshot === null ? {} : { events: eventsSnapshot }),
+      ...(project_facts === null ? {} : { projectFacts: project_facts }),
+    });
   } catch (e) {
     unreadable ??= `状态投影算不出来（${(e as Error).message}）`;
   }
@@ -677,7 +787,15 @@ function gatherFacts(projectId: string, dataDir: string, now: string, syncDiscov
   const align = alignDefinitionsAndStates(definitions, states, plan?.revision.content_sha256 ?? "");
   let context: ContextPackage | null = null;
   try {
-    context = buildContextPackage(projectId, { dataDir, maxChars: 6000, pageMaxChars: 1500 });
+    // V09-39：上下文包**复用本次已现读的同一份账本快照**（`BuildContextOptions.events/eventsContent`）——
+    // 不再另读一遍盘；内容身份与事件同源（契约 U1：不用 last_seq:N 冒充内容哈希）。
+    context = buildContextPackage(projectId, {
+      dataDir,
+      maxChars: 6000,
+      pageMaxChars: 1500,
+      ...(sharedEvents === undefined ? {} : { events: sharedEvents }),
+      ...(eventsSnapshot?.content === undefined ? {} : { eventsContent: eventsSnapshot.content }),
+    });
   } catch {
     // 上下文包建不出来不阻断入口：manifest 如实缺席，entries 在 required_reads 里仍有原文入口
   }
@@ -692,7 +810,8 @@ function gatherFacts(projectId: string, dataDir: string, now: string, syncDiscov
   const audit = project_facts?.audit ?? { submissions: {}, self_checks: {}, independent_audits: {}, fixes: {}, retests: {}, acceptances: {}, ignored_entities: [] };
   const findings = project_facts?.findings ?? (() => {
     try {
-      return Object.values(readFindings(workDir).findings);
+      // V09-30：回退路径也喂同一份快照（`project_facts` 非空时本就不走这里）。
+      return Object.values(readFindings(workDir, sharedEvents).findings);
     } catch {
       return [];
     }
@@ -703,7 +822,8 @@ function gatherFacts(projectId: string, dataDir: string, now: string, syncDiscov
   let executions: ExecutionRecord[] = [];
   let executionsUnreadable: string | null = null;
   try {
-    executions = readExecutions(workDir);
+    // V09-30：执行回执折叠同一份快照（不再单独读一遍账本）。
+    executions = readExecutions(workDir, sharedEvents);
   } catch (e) {
     executionsUnreadable = e instanceof Error ? e.message : String(e);
   }
@@ -740,8 +860,13 @@ function gatherFacts(projectId: string, dataDir: string, now: string, syncDiscov
     ),
     baseline,
     baselineRevalidate,
+    baselineValid,
+    baselineSourceChanged,
     stageReads,
     syncBlock,
+    syncBlockUnreadable,
+    eventsShared,
+    eventsSnapshotUnreadable,
     design,
     plan,
     context,
@@ -1026,7 +1151,7 @@ function decideNextAction(input: DecideInput): Decision {
   });
 
   // ── 3. 源在基线激活后变过 → 影响待查，不派发 ──
-  if (facts.baselineRevalidate.some((r) => r.includes("在基线激活后变过"))) {
+  if (facts.baselineSourceChanged) {
     reasons.push({
       code: "impact_unknown",
       text:
@@ -1736,7 +1861,7 @@ export function evaluateProjectEntry(input: ProjectEntryInput, opts: ProjectEntr
   const dataDir = opts.dataDir ?? resolveDataDir();
   // 租约判定用毫秒精度的 ISO（`nowIso()` 只到秒：秒级以下租约会被算成"还没到期"）
   const now = opts.now ?? new Date().toISOString();
-  const facts = gatherFacts(projectId, dataDir, now, opts.syncDiscoveryIssues);
+  const facts = gatherFacts(projectId, dataDir, now, opts.syncDiscoveryIssues, opts.events);
   const capability = capabilityOf(input.client_capabilities);
   const knownRevision = typeof input.known_revision === "string" && input.known_revision.trim() !== "" ? input.known_revision.trim() : null;
   const resumeHint = typeof input.resume_hint === "string" && input.resume_hint.trim() !== "" ? input.resume_hint.trim() : null;
@@ -1774,6 +1899,9 @@ export function evaluateProjectEntry(input: ProjectEntryInput, opts: ProjectEntr
   const currentChange = currentChangeOf(facts);
   const runs = currentRunsOf(facts);
   const manifest = contextManifestOf(facts.context);
+  // V09-34：本次动作指向的任务（取自已定 decision 的 reasons；只为前置说明定位，不重算判定）。
+  const chosenTaskId =
+    decision.reasons.map((r) => r.task_id).find((id): id is string => typeof id === "string" && id !== "") ?? null;
 
   return {
     project: {
@@ -1825,9 +1953,11 @@ export function evaluateProjectEntry(input: ProjectEntryInput, opts: ProjectEntr
               design_source: facts.baseline.design_revision.source_path,
               plan_source: facts.baseline.plan_revision.source_path,
             },
-      valid: facts.baseline !== null && !facts.baselineRevalidate.some((r) => r.includes("在基线激活后变过")),
+      // V09-31 复审：`valid` 用结构化判据（有生效基线且**一条失效理由都没有**），
+      // 不再拿中文消息 substring 匹配——保全对象篡改/缺失等失效同样会把 valid 置 false。
+      valid: facts.baselineValid,
       revalidate: facts.baselineRevalidate,
-      source_changed_since_baseline: facts.baselineRevalidate.some((r) => r.includes("在基线激活后变过")),
+      source_changed_since_baseline: facts.baselineSourceChanged,
     },
     context_manifest: manifest,
     current_change: currentChange,
@@ -1844,6 +1974,21 @@ export function evaluateProjectEntry(input: ProjectEntryInput, opts: ProjectEntr
             blocked: facts.syncBlock.blocked,
             blocking_batches: facts.syncBlock.batches.map((b) => ({ batch_id: b.batch_id, title: b.title, verdict: b.verdict, reasons: b.reasons })),
           },
+    // V09-34：轻量选项——默认**不加**该字段（保持 §6.7 九字段契约）；`opts.preconditions===true` 时
+    // 从本次同一份 facts 派生说明，不改上面的 `next_action`/`reasons` 任何一项。
+    ...(opts.preconditions === true
+      ? {
+          preconditions: preconditionsOf({
+            facts,
+            action: decision.action,
+            role,
+            roleClass: roleClassOf(role),
+            capability,
+            runs,
+            chosenTaskId,
+          }),
+        }
+      : {}),
   };
 }
 

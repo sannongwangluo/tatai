@@ -24,6 +24,7 @@ import {
 } from "./work/service";
 import { WorkError } from "./work/types";
 import { handleBaselineRequest } from "./work/baselineHost";
+import { handleProjectIndexRequest } from "./work/projectIndexHost";
 import { descriptorBelongsTo, removeDescriptorIfOwned } from "./work/serviceOwnership";
 
 export interface WorkHost {
@@ -96,6 +97,10 @@ export function createWorkHost(
         return true;
       }
       if (await handleBaselineRequest(req, res, { dataDir, token, pathname, assertWriteOwnership })) return true;
+      // V09-39（契约 U5/U5.1）：持久项目说明索引的唯一宿主面 `/api/work/project-index/{upsert,remove}`——
+      // 桌面宿主与独立 daemon 同一份 handle、同一写者；读（read/impact/coverage）不走本模块（本地纯读取）。
+      // POST upsert/remove 已被上面的写方法所有权闸覆盖（非写宿主 503 零字节）。
+      if (await handleProjectIndexRequest(req, res, { dataDir, token, pathname, assertWriteOwnership })) return true;
       return handleWorkRequest(req, res, { service, token, pathname });
     },
     publish(port, host) {

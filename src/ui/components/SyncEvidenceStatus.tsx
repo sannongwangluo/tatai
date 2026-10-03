@@ -10,7 +10,8 @@
 //     不占纵向排版、不加大页签、不挤画布（§3.1/§3.11 的人用图面口径）。详情 toggle 带 `aria-expanded`
 //     与 `aria-controls`，面板用 `role=dialog` + `aria-labelledby` 关联可访问标签。
 //   · **现行 vs 已取代**：范围与差项只按现行（`active`）批次算；被 supersede 的历史单列、默认折叠，
-//     但仍可在详情里点开逐项查（不参与「缺几项」、不再阻断）。
+//     **不再做本次实时核验**——它的结论来自账本最后一次有效核验回执（`verified_at`），缺回执就明确
+//     「未核验」，绝不把历史通过显示成当前有效（2026-10-03 增量核验）。详情里仍可点开逐项查。
 //   · **不串数据**：每次取数带 AbortController + 代际号，切项目/卸载时作废在途回包，
 //     旧项目的响应不写进新项目界面（§3.1）。
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -158,8 +159,7 @@ export function SyncEvidenceStatus({ project }: { project: { id: string } }) {
   // 范围与差项按**现行（active）批次**算；被 supersede 的历史只单列、不参与「缺几项」，但详情里仍可查
   const batches = report === null ? [] : report.batches;
   const activeBatches = batches.filter((b) => b.active);
-  const historyBatches = batches.filter((b) => !b.active);
-  const activeItems = activeBatches.flatMap((b) => b.items);
+  const historyBatches = batches.filter((b) => !b.active);  const activeItems = activeBatches.flatMap((b) => b.items);
   const historyItems = historyBatches.flatMap((b) => b.items);
   const required = activeItems.filter((i) => i.required);
   const missingRequired = required.filter((i) => i.verdict === "missing");
@@ -178,6 +178,7 @@ export function SyncEvidenceStatus({ project }: { project: { id: string } }) {
       data-sync-items-required={report === null ? "" : String(required.length)}
       data-sync-items-missing={report === null ? "" : String(missingRequired.length)}
       data-sync-history-items={report === null ? "" : String(historyItems.length)}
+      data-sync-history-verified={report === null ? "" : String(historyBatches.filter((b) => b.verified_at !== null).length)}
       data-sync-unregistered-count={report === null ? "" : String(report.unregistered_evidence.length)}
       data-sync-collection={report === null ? "" : report.collection.complete ? "complete" : "incomplete"}
       className="relative flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-neutral-800 bg-neutral-900/30 px-3 py-1.5 text-[11px]"
@@ -328,6 +329,8 @@ export function SyncEvidenceStatus({ project }: { project: { id: string } }) {
                     data-sync-batch={b.batch_id}
                     data-sync-batch-verdict={b.verdict}
                     data-sync-batch-active={b.active ? "1" : "0"}
+                    data-sync-batch-historical={b.historical ? "1" : "0"}
+                    data-sync-batch-verified-at={b.verified_at ?? ""}
                     data-sync-batch-missing-required={String(bMissing.length)}
                     open={b.active}
                     className="rounded border border-neutral-800 bg-neutral-950/40 p-2"
@@ -338,9 +341,15 @@ export function SyncEvidenceStatus({ project }: { project: { id: string } }) {
                       </span>
                       {b.active ? (
                         <span className="ml-2 text-[10px] text-emerald-300">现行批次（计入范围与差项）</span>
+                      ) : b.historical ? (
+                        <span className="ml-2 text-[10px] text-neutral-500" data-sync-batch-history-note>
+                          {b.verified_at === null
+                            ? "已被取代的历史批次：账本无有效核验回执（未核验）——不计入范围与差项，不再阻断"
+                            : `历史回执（${b.verified_at}）：展示账本最后一次核验结论，不是本次实时核验——不计入范围与差项，不再阻断`}
+                        </span>
                       ) : (
-                        <span className="ml-2 text-[10px] text-neutral-500">
-                          已被取代（只作历史，不计入范围与差项，不再阻断）
+                        <span className="ml-2 text-[10px] text-neutral-500" data-sync-batch-history-note>
+                          已被取代的历史批次（本次**显式实时复查**：结论来自这次实时核验，仍不计入范围与差项、不再阻断）
                         </span>
                       )}
                       {b.active && b.blocks_entry && (

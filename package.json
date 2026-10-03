@@ -80,6 +80,8 @@
     "verify:v09-22-mcp": "tsx scripts/verify-v09-22-mcp.ts",
     "verify:stage-entry": "tsx scripts/verify-stage-entry.ts",
     "verify:sync-evidence": "tsx scripts/verify-sync-evidence.ts",
+    "verify:sync-incremental": "tsx scripts/verify-sync-incremental.ts",
+    "verify:sync-request-reuse": "tsx scripts/verify-sync-request-reuse.ts",
     "verify:v09-22-ui-installed": "python scripts/verify-v09-22-ui-installed.py",
     "verify:v09-09": "tsx scripts/verify-v09-09.ts",
     "verify:v09-09-ui": "python scripts/verify-v09-09-ui.py",
@@ -170,7 +172,13 @@
     "verify:forward-journey": "tsx scripts/verify-forward-journey.ts",
     "verify:host-ownership": "tsx scripts/verify-host-ownership.ts",
     "verify:definition-align": "tsx scripts/verify-definition-align.ts",
-    "verify:http-source-freshness": "tsx scripts/verify-http-source-freshness.ts"
+    "verify:http-source-freshness": "tsx scripts/verify-http-source-freshness.ts",
+    "verify:unified-entry": "tsx scripts/verify-unified-entry.ts",
+    "verify:unified-materials": "tsx scripts/verify-unified-materials.ts",
+    "verify:unified-incremental": "tsx scripts/verify-unified-incremental.ts",
+    "verify:unified-ui": "tsx scripts/verify-unified-ui.ts",
+    "verify:unified-host": "tsx scripts/verify-unified-host.ts",
+    "verify:unified-index": "tsx scripts/verify-unified-index.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

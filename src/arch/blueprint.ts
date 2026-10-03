@@ -69,7 +69,7 @@ import {
   type RequirementRef,
 } from "../ui/arch/provenance";
 import { projectWithReleases } from "../server/work/entry";
-import { provenanceFactsOf, type StatusProjection } from "../server/work/statusProjection";
+import { eventsOfSnapshot, provenanceFactsOf, type EventsSnapshot, type StatusProjection } from "../server/work/statusProjection";
 import { readRequirements } from "../server/work/requirements";
 import { canvasMembershipGapsOf, capabilityClassOf, taskDerivedModuleStatus } from "../ui/arch/projectGraph";
 import { declaredLinksOf, readLastReconcile } from "./reconcile";
@@ -2629,8 +2629,10 @@ export function viewGraphWithPlan(
 // 各写一套」）。本函数只做**取事实**：蓝图节点/关系（含出处引用与复算结果）＋需求登记（来源一档）
 // ＋任务定义（`requirement_ids` 承接映射）＋状态投影（证据记录），摊成判据的输入。
 //
-// 只读：不写盘、不调模型、不给纳管项目加运行时埋点（§4.1）。代价如实记：本函数读事件账本两次
-// （`readRequirements` 取需求登记 + `projectWithReleases` 取投影），两处各自只有一个真实现，不合并。
+// 只读：不写盘、不调模型、不给纳管项目加运行时埋点（§4.1）。代价如实记：缺省情形本函数读事件账本两次
+// （`readRequirements` 取需求登记 + `projectWithReleases` 取投影），两处各自只有一个真实现，不合并；
+// 调用方若已读好一份**同一 workDir** 的事件快照（`opts.events`，见 V09-30 六图构建内共享），
+// 这两处都复用那一份、不再各自读盘（不同 workDir／截点不串，见 `eventsOfSnapshot`）。
 
 /** 蓝图节点 id → 任务卡号（`plan:task:<卡号>`；不是任务节点返回 null） */
 const taskIdOfPlanNode = (id: string): string | null =>
@@ -2688,12 +2690,13 @@ function refStatusOf(
  */
 export function archProvenanceModelOf(
   projectId: string,
-  opts: { dataDir?: string } = {},
+  opts: { dataDir?: string; events?: EventsSnapshot } = {},
 ): ProvenanceModel {
   const dataDir = opts.dataDir ?? resolveDataDir();
+  const workDir = projectWorkDir(projectId, dataDir);
   const bp = readBlueprint(projectId, opts.dataDir);
   // 需求登记（§2.5 最小集；承接需求必须能解析到登记条目，悬空即点名）
-  const requirementProjection = readRequirements(projectWorkDir(projectId, dataDir));
+  const requirementProjection = readRequirements(workDir, eventsOfSnapshot(opts.events, workDir));
   const requirements: RequirementRef[] = Object.values(requirementProjection.requirements)
     .map((r) => ({
       requirement_id: r.requirement_id,
@@ -2716,7 +2719,12 @@ export function archProvenanceModelOf(
 
   // 来源复算（唯一判据 `sourceRefLocateOf`）与状态投影（唯一派生 `projectWithReleases`）
   const ctx = blueprintContextOf(readBlueprintSources(projectId, opts.dataDir));
-  const projection = projectWithReleases({ projectId, dataDir, definitions: [] });
+  const projection = projectWithReleases({
+    projectId,
+    dataDir,
+    definitions: [],
+    ...(opts.events === undefined ? {} : { events: opts.events }),
+  });
   const projById: Record<string, StatusProjection> = {};
   for (const o of projection.objects) projById[o.object_id] = o;
 

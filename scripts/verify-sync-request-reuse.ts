@@ -181,10 +181,17 @@ async function main(): Promise<void> {
   const msA = performance.now() - tA;
   ok(reportA.batches.length === 6, "A-1 保留全部批次（含被取代的历史批次 r1）", { got: reportA.batches.length });
   ok(reportA.batches.find((b) => b.batch_id === "r1")?.active === false && reportA.batches.find((b) => b.batch_id === "r6")?.active === true, "A-2 被取代批次 active=false、后继 active=true");
+  const activeA = reportA.batches.filter((b) => b.active);
   ok(
-    reportA.batches.every((b) => b.items.length === 1 && typeof b.items[0].verdict === "string" && b.items[0].actual !== null),
-    "A-3 每个批次的检查都真跑过（逐项有 verdict 与 actual）",
-    reportA.batches.map((b) => [b.batch_id, b.items[0]?.verdict]),
+    activeA.every((b) => b.items.length === 1 && typeof b.items[0].verdict === "string" && b.items[0].actual !== null),
+    "A-3 每个**现行**批次的检查都真跑过（逐项有 verdict 与 actual）",
+    reportA.batches.map((b) => [b.batch_id, b.active, b.items[0]?.verdict]),
+  );
+  const r1Rep = reportA.batches.find((b) => b.batch_id === "r1");
+  ok(
+    r1Rep?.historical === true && r1Rep?.active === false && r1Rep.items.every((i) => i.actual === null) && r1Rep.verified_at === null,
+    "A-3b 被取代的历史批次改走账本回执（不实时求值；无回执即未核验、actual=null）",
+    { verdict: r1Rep?.verdict, verified_at: r1Rep?.verified_at },
   );
   ok(
     reportA.batches.find((b) => b.batch_id === "r3")?.items[0].expected !== null &&
@@ -208,12 +215,18 @@ async function main(): Promise<void> {
   const reportC = syncMod.readSyncStatus(PID, dataDir);
   afterBuild = null;
   ok(graphCalls === 2, "C-1 调用内图输入文件变化 → 缓存失效、重算", { graphCalls });
+  const c2 = reportC.batches.find((b) => b.batch_id === "r2")?.items[0].actual as { graph_inputs?: { modules?: string } } | undefined;
+  const c3 = reportC.batches.find((b) => b.batch_id === "r3")?.items[0].actual as { graph_inputs?: { modules?: string } } | undefined;
   ok(
-    reportC.batches[0].items[0].actual !== null &&
-      reportC.batches[1].items[0].actual !== null &&
-      (reportC.batches[0].items[0].actual as { graph_inputs?: { modules?: string } }).graph_inputs?.modules !==
-        (reportC.batches[1].items[0].actual as { graph_inputs?: { modules?: string } }).graph_inputs?.modules,
-    "C-2 变化前/后批次的 actual 各反映自己的真实输入（不把旧图贴新指纹）",
+    c2 != null && c3 != null && c2.graph_inputs?.modules !== c3.graph_inputs?.modules,
+    "C-2 变化前/后**现行**批次的 actual 各反映自己的真实输入（不把旧图贴新指纹）",
+    { before: c2?.graph_inputs?.modules, after: c3?.graph_inputs?.modules },
+  );
+  const r2C = reportC.batches.find((b) => b.batch_id === "r2");
+  ok(
+    r2C?.verdict !== "passed" && (r2C?.items[0]?.reasons ?? []).some((r) => /构建期间/.test(r)),
+    "C-3 构建期间图输入改变 → 该批次**明确过期**（不是只 miss 缓存仍照常返回旧结果）",
+    { verdict: r2C?.verdict, reasons: r2C?.items[0]?.reasons },
   );
   write(MODULES_ABS, modulesBefore);
 
@@ -224,10 +237,12 @@ async function main(): Promise<void> {
   const reportD = syncMod.readSyncStatus(PID, dataDir);
   afterBuild = null;
   ok(graphCalls === 2, "D-1 调用内设计文档（基线来源）变化 → 缓存失效、重算", { graphCalls });
+  const d2 = reportD.batches.find((b) => b.batch_id === "r2")?.items[0].actual as { design_revision?: string | null } | undefined;
+  const d3 = reportD.batches.find((b) => b.batch_id === "r3")?.items[0].actual as { design_revision?: string | null } | undefined;
   ok(
-    (reportD.batches[0].items[0].actual as { design_revision?: string | null }).design_revision !==
-      (reportD.batches[1].items[0].actual as { design_revision?: string | null }).design_revision,
-    "D-2 变化前/后批次的 design_revision 不同",
+    d2 != null && d3 != null && d2.design_revision !== d3.design_revision,
+    "D-2 变化前/后**现行**批次的 design_revision 不同",
+    { before: d2?.design_revision, after: d3?.design_revision },
   );
   write(DESIGN_ABS, designBefore);
 
@@ -242,6 +257,12 @@ async function main(): Promise<void> {
   afterBuild = null;
   ok(graphCalls === 2, "E-1 调用内业务事件账本变化 → 缓存失效、重算", { graphCalls });
   ok(reportE.batches.length === 6, "E-2 变化后仍逐批保留全部检查", { got: reportE.batches.length });
+  const r2E = reportE.batches.find((b) => b.batch_id === "r2");
+  ok(
+    r2E?.verdict !== "passed" && (r2E?.items[0]?.reasons ?? []).some((r) => /构建期间/.test(r)),
+    "E-5 构建期间业务事件账本变化 → 该批次**明确过期**（不把旧事件快照配新身份判 passed）",
+    { verdict: r2E?.verdict, reasons: r2E?.items[0]?.reasons },
+  );
   restoreEvents();
 
   // 复审反例：同长度改写并恢复 mtime，仍须按内容失效。
@@ -262,11 +283,12 @@ async function main(): Promise<void> {
   fs.mkdirSync(MODULES_ABS, { recursive: true });
   graphCalls = 0;
   const reportF = syncMod.readSyncStatus(PID, dataDir);
-  ok(graphCalls === 6, "F-1 源身份不可核实（图输入非常规文件）→ 不复用，逐批真建", { graphCalls });
+  const activeF = reportF.batches.filter((b) => b.active).length;
+  ok(graphCalls === activeF, "F-1 源身份不可核实（图输入非常规文件）→ 不复用，逐现行批次真建（历史批次不走实时求值）", { graphCalls, activeF });
   ok(
-    reportF.batches.every((b) => b.items[0].verdict !== "passed"),
+    reportF.batches.filter((b) => b.active).every((b) => b.items[0].verdict !== "passed"),
     "F-2 图输入读取异常绝不当通过",
-    reportF.batches.map((b) => [b.batch_id, b.items[0].verdict]),
+    reportF.batches.map((b) => [b.batch_id, b.active, b.items[0].verdict]),
   );
   fs.rmdirSync(MODULES_ABS);
   write(MODULES_ABS, modulesBefore);
@@ -284,14 +306,14 @@ async function main(): Promise<void> {
     graphSourceOnly: true,
     byteBudget: { limit: contractMod.SYNC_LOCK_REVIEW_MAX_BYTES, used: 0 },
   };
-  const r1Contract = frozen.get("r1");
-  if (r1Contract === undefined) throw new Error("夹具缺 r1 契约");
-  const sourceOnlyEval = checksMod.evaluateBatch(r1Contract, regSeq.get("r1") ?? 1, { path: `.工作台/work/sync-inbox/r1.evidence.json`, abs: path.join(inbox, "r1.evidence.json") }, lockCtx as never);
+  const r2Contract = frozen.get("r2");
+  if (r2Contract === undefined) throw new Error("夹具缺 r2 契约");
+  const sourceOnlyEval = checksMod.evaluateBatch(r2Contract, regSeq.get("r2") ?? 1, { path: `.工作台/work/sync-inbox/r2.evidence.json`, abs: path.join(inbox, "r2.evidence.json") }, lockCtx as never);
   ok(graphCalls === 0, "G-1 graphSourceOnly 不调用全量 sixGraphsOf", { graphCalls });
   ok(
-    eq(sourceOnlyEval.items[0].actual, reportA.batches.find((b) => b.batch_id === "r1")?.items[0].actual),
-    "G-2 锁内有界图项 actual 与全量模式逐字段一致",
-    { sourceOnly: sourceOnlyEval.items[0].actual, full: reportA.batches.find((b) => b.batch_id === "r1")?.items[0].actual },
+    eq(sourceOnlyEval.items[0].actual, reportA.batches.find((b) => b.batch_id === "r2")?.items[0].actual),
+    "G-2 锁内有界图项 actual 与全量模式逐字段一致（现行批次）",
+    { sourceOnly: sourceOnlyEval.items[0].actual, full: reportA.batches.find((b) => b.batch_id === "r2")?.items[0].actual },
   );
 
   // ═══ H hostSyncView 不可达分支：已配置 fail-closed 且只构造一次；未配置保持 not_configured ═══

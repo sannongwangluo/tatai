@@ -57,6 +57,7 @@ import {
   commandFingerprint,
   isWorkError,
   registeredEventTypes,
+  WORK_ERROR_CODES,
   validateWorkCommand,
   type WorkCommand,
   type WorkErrorCode,
@@ -96,7 +97,9 @@ import {
   type SyncEvidencePreparation,
 } from "./sync";
 import "./syncGraph";
-import { runSyncScanForRequest } from "./syncDiscovery";
+import { runSyncScanForRequest } from "./syncDiscovery"; import { runReadJob, readWorkerPoolStatus, describeReadJobError, ReadJobFailed } from "./readWorkerPool";
+import type { SyncPrepArgs } from "./readJobs";
+import { runWithHostHealth, HealthUnstable } from "./syncRuntimeHealth";
 // V09-27（DESIGN.md §2.6/§5.4；契约 F3）：上报域宿主操作（不可变证据正文的存/读）与
 // `task.blocked`/`task.status_changed` 上报命令的写边界核实——与 MCP 工具层同一份判据。
 import { handleReportingRequest, isReportingRoute } from "./reportingHost";
@@ -506,6 +509,43 @@ export class WorkService {
    * （独立的项目级实体、幂等键去重、投影照常跟上）——拒绝永不静默（见 ②′ 注释，C-017 补修）。
    */
   submit(rawCommand: unknown): WorkReceipt {
+    return this.submitWithPrep(rawCommand, null);
+  }
+
+  /**
+   * **异步适配**（V09-31/37 目标二）：与 `submit` 同一套判据与同一临界区；唯一差别是
+   * `sync.evidence_checked` / 非续约 `task.claimed` 的**锁外 preparation** 在**受信 worker** 里跑
+   * （不占主线程；写仍在本服务文件锁内——锁内的 ownership/source_fingerprint/revision/幂等/fsync 判据一分不减）。
+   * 命令跨 await 前先深冻结（有效输入固定，防传参原地变）；客户端不能提供已备好的 preparation
+   * （准备只能由本服务按自己的 `cmd`/`dataDir`/`workDir` 派发得到）。
+   */
+  async submitAsync(rawCommand: unknown): Promise<WorkReceipt> {
+    const cmd = freezeDeep(validateWorkCommand(rawCommand));
+    const workDir = resolveWorkDir(cmd.project_id, this.dataDir);
+    const needEvidence = cmd.type === "sync.evidence_checked";
+    const needClaim = cmd.type === "task.claimed" && cmd.payload?.claim_action !== "renew";
+    if (!needEvidence && !needClaim) return this.submitWithPrep(cmd, null);
+    const kind: SyncPrepArgs["kind"] = needEvidence ? "sync_evidence" : "claim_gate";
+    let prep: SyncEvidencePreparation | SyncClaimGatePrep;
+    try {
+      // 受信 worker 里跑锁外准备；worker 不可用 → 明确抛（不静默回退主线程重算）。
+      prep = (await runReadJob("sync_prep", { kind, cmd, dataDir: this.dataDir, workDir })) as SyncEvidencePreparation | SyncClaimGatePrep;
+    } catch (e) {
+      if (e instanceof ReadJobFailed) throw new WorkError(narrowWorkErrorCode(e.code), e.message, e.detail);
+      throw e;
+    }
+    const injection =
+      needEvidence
+        ? { syncEvidencePrep: prep as SyncEvidencePreparation, claimSyncPrep: null }
+        : { syncEvidencePrep: null, claimSyncPrep: prep as SyncClaimGatePrep };
+    return this.submitWithPrep(cmd, injection);
+  }
+
+  /**
+   * 唯一临界区（同步/异步两路共用）：`prep` 为锁外准备结果（null＝按同步路径在本进程现算）。
+   * 锁内判据一分不减：ownership / source_fingerprint / revision / 幂等 / fsync 全在此。
+   */
+  private submitWithPrep(rawCommand: unknown, prep: { syncEvidencePrep: SyncEvidencePreparation | null; claimSyncPrep: SyncClaimGatePrep | null } | null): WorkReceipt {
     const cmd = validateWorkCommand(rawCommand);
     // 补修第二轮裁定（3）：运行入口的非法值要在**两条写入路径统一拒绝**。
     // 成果登记（`audit.submission_submitted`）与 Agent 结果回报（`task.result_submitted`）都经本服务的
@@ -531,13 +571,13 @@ export class WorkService {
     // V09-23／DESIGN §2.10 锁边界：`sync.evidence_checked` 由唯一服务在**锁外**按当前实际目标做**独立全量评估**
     // （含六图 canonical builder），与命令声称的 overall/逐项 verdict/目标指纹逐项比对——不符在进锁前就拒（零字节），
     // 不信任调用方摘要。锁内只做**有界**真实目标指纹复核（不跑 sixGraphsOf 全量；见 assertSyncEvidenceWriteCommand）。
-    const syncEvidencePrep: SyncEvidencePreparation | null =
-      cmd.type === "sync.evidence_checked" ? prepareSyncEvidenceCheck({ cmd, dataDir: this.dataDir, workDir }) : null;
+    const syncEvidencePrep: SyncEvidencePreparation | null = prep !== null ? prep.syncEvidencePrep : (
+      cmd.type === "sync.evidence_checked" ? prepareSyncEvidenceCheck({ cmd, dataDir: this.dataDir, workDir }) : null);
 
     // V09-23 返工C（Codex 反例14 后半）：非续约 `task.claimed` 的同步门禁同样**锁外独立评估 + 锁内有界快照校验**——
     // 锁内不再跑 computeSyncBlock 全量六图；锁内只用有界图源探针/文件字节重算指纹比对（见 assertClaimSyncGate）。
-    const claimSyncPrep: SyncClaimGatePrep | null =
-      cmd.type === "task.claimed" && cmd.payload?.claim_action !== "renew" ? prepareClaimSyncGate({ cmd, dataDir: this.dataDir, workDir }) : null;
+    const claimSyncPrep: SyncClaimGatePrep | null = prep !== null ? prep.claimSyncPrep : (
+      cmd.type === "task.claimed" && cmd.payload?.claim_action !== "renew" ? prepareClaimSyncGate({ cmd, dataDir: this.dataDir, workDir }) : null);
 
     return withFileLock(eventsPath(workDir), () => {
       // V09-29 慢 body 竞态：进锁后、任何读取/写入之前**再查一次所有权**——请求头到达时宿主有效，
@@ -925,6 +965,20 @@ export class WorkService {
   }
 }
 
+/** 深冻结：异步路径跨 await 前把已校验命令固定下来（防调用方传参在原地被改）。 */
+function freezeDeep<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const v of Object.values(value as Record<string, unknown>)) freezeDeep(v);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/** 把 worker 带回的错误码收窄成 `WorkErrorCode`（认不出的一律按 INVALID_COMMAND，不假装是别的码）。 */
+function narrowWorkErrorCode(code: string): WorkErrorCode {
+  return (WORK_ERROR_CODES as readonly string[]).includes(code) ? (code as WorkErrorCode) : "INVALID_COMMAND";
+}
+
 /** 幂等的内容口径：同键必须"调用方意图"完全相同才返回原回执（服务端产出的 seq/时间戳不参与） */
 function sameIntent(c: WorkCommand, e: WorkEvent): boolean {
   return (
@@ -1023,6 +1077,8 @@ const HTTP_STATUS: Record<WorkErrorCode, number> = {
   PROJECTION_FAILED: 500,
   TAIL_QUARANTINED: 500,
   MIDDLE_CORRUPT: 500,
+  // 读取期间账本一直在变：可重试的瞬时态（V09-38 复审登记；与 projectIndexHost.ts 同值）
+  LEDGER_UNSTABLE: 503,
   EVENT_INVALID: 500,
   // V06-09：证据引用不合法（不存在/哈希对不上/试图改写不可变证据）——调用方改了命令就能修
   EVIDENCE_INVALID: 400,
@@ -1087,7 +1143,7 @@ export async function handleWorkRequest(
       });
     }
     if (method === "GET" && ctx.pathname === "/api/work/health") {
-      sendJson(res, 200, { ok: true, ...ctx.service.info() });
+      sendJson(res, 200, { ok: true, ...ctx.service.info(), read_workers: readWorkerPoolStatus() });
       return true;
     }
     if (method === "GET" && ctx.pathname === "/api/work/snapshot") {
@@ -1107,7 +1163,77 @@ export async function handleWorkRequest(
         return true;
       }
       const dataDir = ctx.service.info().data_dir;
-      sendJson(res, 200, { ok: true, sync: readSyncStatus(projectId, dataDir), discovery_issues: readProjectDiscoveryIssues(projectId, dataDir) });
+      // V09-37：CPU 重的只读同步判据挪进有界 worker（主线程不被占住）；返回同一份 report 契约。
+      try {
+        // 复审 A：worker 有独立模块内存——宿主主线程读出真实错误随参数带入，回包后再读一次做**有界**健康对账；
+        // 作业期间健康持续变化 → HealthUnstable（503 明确不可用），绝不把新错误拼到旧 passed 报告上。
+        const reconciled = await runWithHostHealth(
+          () => readProjectDiscoveryIssues(projectId, dataDir),
+          (issues) => runReadJob("sync_status", { projectId, dataDir, discoveryIssues: issues }),
+        );
+        sendJson(res, 200, { ok: true, sync: reconciled.value, discovery_issues: reconciled.issues });
+      } catch (e) {
+        // 结构化作业错误（code/detail）原样沿 HTTP 带出；健康持续抖动 = HEALTH_UNSTABLE(503)。不压成通用码。
+        const d = e instanceof HealthUnstable
+          ? { code: "HEALTH_UNSTABLE", message: e.message, detail: { issues: e.issues }, httpStatus: 503 }
+          : describeReadJobError(e);
+        sendJson(res, d.httpStatus, { code: d.code, message: d.message, detail: d.detail });
+      }
+      return true;
+    }
+    // V09-31（DESIGN §6.8）：**唯一宿主只读入口**——一次返回入口 + 六图摘要（同一份现读快照贯通入口/图/同步），
+    // MCP `project_entry` 优先复用本端点，消除「远端 sync + 本地入口 + 第三次图」三次重派生。
+    if (method === "GET" && ctx.pathname === "/api/work/entry") {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      const projectId = (url.searchParams.get("project_id") ?? "").trim();
+      const role = (url.searchParams.get("role") ?? "").trim();
+      if (projectId === "" || role === "") {
+        sendJson(res, 400, { code: "INVALID_COMMAND", message: "work/entry 缺 project_id/role", detail: {} });
+        return true;
+      }
+      const knownRevision = (url.searchParams.get("known_revision") ?? "").trim();
+      const resumeHint = (url.searchParams.get("resume_hint") ?? "").trim();
+      const preconditions = url.searchParams.get("preconditions") === "true";
+      const rawCaps = url.searchParams.get("capabilities");
+      let capabilities: unknown = undefined;
+      if (rawCaps !== null) {
+        try {
+          capabilities = JSON.parse(rawCaps);
+        } catch {
+          capabilities = rawCaps;
+        }
+      }
+      const dataDir = ctx.service.info().data_dir;
+      const input = {
+        project_id: projectId,
+        role,
+        ...(knownRevision === "" ? {} : { known_revision: knownRevision }),
+        ...(resumeHint === "" ? {} : { resume_hint: resumeHint }),
+        ...(capabilities === undefined ? {} : { client_capabilities: capabilities }),
+      };
+      try {
+        // 同 sync/status：worker 有独立模块内存——宿主主线程读出真实错误随参数带入，回包后有界健康对账；
+        // 作业期间健康持续变化 → HealthUnstable（503 明确不可用），不把新错误拼到旧结论上（复审 A）。
+        const reconciled = await runWithHostHealth(
+          () => readProjectDiscoveryIssues(projectId, dataDir),
+          (issues) =>
+            runReadJob("entry", {
+              projectId,
+              dataDir,
+              input,
+              syncDiscoveryIssues: issues,
+              ...(preconditions ? { preconditions: true } : {}),
+            }),
+        );
+        sendJson(res, 200, reconciled.value);
+      } catch (e) {
+        // 入口必要输入持续变化 → worker 侧抛 SOURCE_CHANGED / 账本读不稳 → LEDGER_UNSTABLE，
+        // 经结构化 code/detail 原样带出（503 可重试），**不**回退本地绕过后再假装成功。
+        const d = e instanceof HealthUnstable
+          ? { code: "HEALTH_UNSTABLE", message: e.message, detail: { issues: e.issues }, httpStatus: 503 }
+          : describeReadJobError(e);
+        sendJson(res, d.httpStatus, { code: d.code, message: d.message, detail: d.detail });
+      }
       return true;
     }
     if (method === "POST" && ctx.pathname === "/api/work/command") {
@@ -1123,7 +1249,9 @@ export async function handleWorkRequest(
         });
         return true;
       }
-      const receipt = ctx.service.submit(parsed);
+      // V09-31/37：走**异步适配**——sync.evidence_checked / 非续约 task.claimed 的锁外准备在受信 worker 里跑，
+      // 写仍在本服务文件锁内（判据一分不减）；其余命令与同步路径等价。
+      const receipt = await ctx.service.submitAsync(parsed);
       sendJson(res, 200, receipt);
       return true;
     }
@@ -1145,14 +1273,21 @@ export async function handleWorkRequest(
       }
       const role = typeof parsed.role === "string" && parsed.role.trim() !== "" ? parsed.role.trim() : "coordinator";
       const actorId = typeof parsed.actor_id === "string" && parsed.actor_id.trim() !== "" ? parsed.actor_id.trim() : "sync-scan";
-      const outcome = await runSyncScanForRequest({
-        projectId,
-        dataDir: ctx.service.info().data_dir,
-        submitter: ctx.service,
-        role,
-        actorId,
-      });
-      sendJson(res, 200, outcome);
+      try {
+        const outcome = await runSyncScanForRequest({
+          projectId,
+          dataDir: ctx.service.info().data_dir,
+          submitter: ctx.service,
+          role,
+          actorId,
+        });
+        sendJson(res, 200, outcome);
+      } catch (e) {
+        // 扫描计划 worker 不可用/队列满/超时 → 明确可重试错误（不再偷偷回退主线程长算）；
+        // 必要输入持续变化 → SOURCE_CHANGED。结构化 code/detail 原样带出，不压成通用码。
+        const d = describeReadJobError(e);
+        sendJson(res, d.httpStatus, { code: d.code, message: d.message, detail: d.detail });
+      }
       return true;
     }
     sendJson(res, 405, {
@@ -1550,6 +1685,71 @@ export class WorkServiceClient {
       stale_reason: reason,
     };
   }
+}
+
+/**
+ * 宿主只读入口读取结果：**明确区分**「宿主不可达」与「宿主**明确报错**」——后者（SOURCE_CHANGED /
+ * LEDGER_UNSTABLE / HEALTH_UNSTABLE / READ_QUEUE_FULL…）必须原样上抛，**不得**被当成"不可达"而悄悄回退本地路径
+ * 绕过后再假装成功（复审根因一：MCP 对宿主明确错误不作本地回退）。
+ */
+export type HostEntryFetch =
+  | { kind: "ok"; view: import("./readJobs").EntryView }
+  | { kind: "unreachable"; reason: string }
+  | { kind: "error"; code: string; message: string; detail: Record<string, unknown>; httpStatus: number };
+
+/** 取唯一宿主只读入口（区分可达/不可达/明确报错）。纯只读（只用描述符，不 ensure/拉起写者）。 */
+export async function fetchHostEntryResult(
+  dataDir: string,
+  input: { project_id: string; role: string; known_revision?: string | null; resume_hint?: string | null; client_capabilities?: unknown },
+  opts: { timeoutMs?: number; preconditions?: boolean } = {},
+): Promise<HostEntryFetch> {
+  const desc = readServiceDescriptor(dataDir);
+  if (!desc) return { kind: "unreachable", reason: "唯一写服务描述符缺失（读口未发布）" };
+  const qs = new URLSearchParams({ project_id: input.project_id, role: input.role });
+  if (typeof input.known_revision === "string" && input.known_revision !== "") qs.set("known_revision", input.known_revision);
+  if (typeof input.resume_hint === "string" && input.resume_hint !== "") qs.set("resume_hint", input.resume_hint);
+  // 能力档必须随请求带到宿主（否则宿主按「仅可读取」算，next_action 会与调用方声明不一致）。
+  if (input.client_capabilities !== undefined) qs.set("capabilities", JSON.stringify(input.client_capabilities));
+  if (opts.preconditions === true) qs.set("preconditions", "true");
+  try {
+    const res = await fetch(`http://${desc.host}:${desc.port}/api/work/entry?${qs.toString()}`, {
+      headers: { [WORK_TOKEN_HEADER]: desc.token },
+      signal: AbortSignal.timeout(opts.timeoutMs ?? 8000),
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { code?: unknown; message?: unknown; detail?: unknown } | null;
+      const code = typeof body?.code === "string" && body.code !== "" ? body.code : `HTTP_${res.status}`;
+      return {
+        kind: "error",
+        code,
+        message: typeof body?.message === "string" && body.message !== "" ? body.message : `宿主只读入口返回 ${res.status}`,
+        detail: typeof body?.detail === "object" && body.detail !== null ? (body.detail as Record<string, unknown>) : {},
+        httpStatus: res.status,
+      };
+    }
+    const body = (await res.json().catch(() => null)) as import("./readJobs").EntryView | null;
+    if (body === null || body.ok !== true || body.entry === undefined || body.entry === null) {
+      return { kind: "unreachable", reason: "宿主只读入口响应不完整" };
+    }
+    return { kind: "ok", view: body };
+  } catch (e) {
+    return { kind: "unreachable", reason: `宿主只读入口不可达：${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/**
+ * V09-31：从唯一宿主只读读口取**一次**接续入口 + 六图摘要（宿主用同一份现读快照贯通入口/图/同步）。
+ * 纯只读（只用已有描述符，**不** ensure/拉起写者、不触发扫描、不写任何事件）；宿主不可达/端点缺失/
+ * 读口不完整 → `null`（调用方按既有 fail-closed 语义回退本地路径）。**明确报错的宿主响应也返回 null**——
+ * 需要区分"错误 vs 不可达"的调用方请用 `fetchHostEntryResult`。
+ */
+export async function fetchHostEntry(
+  dataDir: string,
+  input: { project_id: string; role: string; known_revision?: string | null; resume_hint?: string | null; client_capabilities?: unknown },
+  opts: { timeoutMs?: number; preconditions?: boolean } = {},
+): Promise<import("./readJobs").EntryView | null> {
+  const r = await fetchHostEntryResult(dataDir, input, opts);
+  return r.kind === "ok" ? r.view : null;
 }
 
 /** 落一行"服务启动/停止"到全局日志（排障用；不写进任何项目目录） */

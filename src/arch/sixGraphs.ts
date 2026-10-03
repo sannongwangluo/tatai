@@ -17,7 +17,8 @@
 // 只读：不写盘、不调模型、不给纳管项目加运行时埋点。
 import { getProject, resolveDataDir } from "../server/registry";
 import { projectWithReleases } from "../server/work/entry";
-import { WsError } from "../server/workstation";
+import { projectWorkDir, WsError } from "../server/workstation";
+import { eventsSnapshotOf, type EventsSnapshot } from "../server/work/statusProjection";
 import { graphUpdateOf } from "../server/work/graphRefresh";
 import { semanticStateOf, type SemanticStateView } from "./blueprintAuto";
 import {
@@ -470,6 +471,11 @@ export interface SixGraphOptions {
   limit?: number;
   /** 只算**摘要与计数**（接续入口用）：不给逐条对象，省掉逐对象标注映射的开销 */
   summary_only?: boolean;
+  /**
+   * V09-31：**本次请求已经现读的事件快照**（宿主只读入口一次取快照后同时喂入口/图摘要/同步判据，
+   * 三者同版）。来源 `work_dir` 与本项目不一致就不复用（回退本函数现读）；缺省＝自己现读，行为逐字不变。
+   */
+  events?: EventsSnapshot;
 }
 
 /** 计划层节点 id → 该节点在证据标注表里的键（与技术详情画布同一套口径 `planCodeNodeIdOf`） */
@@ -727,10 +733,33 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
   const bp: Blueprint | null = published ?? draft;
 
   // 状态投影（与 project_entry／get_arch 同一份：projectWithReleases）
+  //
+  // V09-30：本函数一次构建内 `projectWithReleases` 与 `archProvenanceModelOf` 会各自反复读同一份
+  // 事件账本（剖析实测 7 次），这里**现读一份快照**沿这两条链传下去共享——只在这一次调用栈里共享，
+  // 不是全局/跨请求缓存（每次调用现读，下一次调用立刻见到新事件；读不出来就不传，下游按既有路径
+  // 各自现读并如实报错，六图可读性结论不变）。
+  const resolvedDataDir = dataDir ?? resolveDataDir();
+  // V09-31：宿主只读入口可传入**整次请求现读的同一份快照**（入口/图摘要/同步判据同版）；
+  // 来源 workDir 与本项目不一致就不算数，回退本函数现读。缺省行为逐字不变。
+  let eventsSnapshot: EventsSnapshot | null = null;
+  if (opts.events !== undefined && opts.events.work_dir === projectWorkDir(projectId, resolvedDataDir)) {
+    eventsSnapshot = opts.events;
+  } else {
+    try {
+      eventsSnapshot = eventsSnapshotOf(projectId, resolvedDataDir);
+    } catch {
+      eventsSnapshot = null; // 账本损坏等：不沿用任何旧快照，下游现读时照常失败（不静默吞）
+    }
+  }
   const projection: Record<string, import("../server/work/statusProjection").StatusProjection> = {};
   let revisions: { design?: string | null; plan?: string | null; plan_definition?: string | null } = {};
   try {
-    const proj = projectWithReleases({ projectId, dataDir: dataDir ?? resolveDataDir(), definitions: [] });
+    const proj = projectWithReleases({
+      projectId,
+      dataDir: resolvedDataDir,
+      definitions: [],
+      ...(eventsSnapshot === null ? {} : { events: eventsSnapshot }),
+    });
     for (const o of proj.objects) projection[o.object_id] = o;
   } catch (e) {
     anomalies.push(`状态投影算不出来：${(e as Error).message}（逐对象状态按「无状态记录」如实表达，不涂色）`);
@@ -804,7 +833,10 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
 
   const provenance = (() => {
     try {
-      return archProvenanceModelOf(projectId, dataDir ? { dataDir } : {});
+      return archProvenanceModelOf(projectId, {
+        ...(dataDir === undefined ? {} : { dataDir }),
+        ...(eventsSnapshot === null ? {} : { events: eventsSnapshot }),
+      });
     } catch (e) {
       anomalies.push(`来源/证据标注算不出来：${(e as Error).message}（逐对象标注为空，不涂绿）`);
       return null;
@@ -1684,8 +1716,12 @@ export interface SixGraphSummary {
  * 取六图摘要（只读、不写盘、不调模型）。`project_entry` 用它把「六图现在各是什么、
  * 算到哪一版、哪里没验证、下一步读什么」放进接续入口，而**不内联整图**。
  */
-export function graphSummaryOf(projectId: string, opts: { dataDir?: string } = {}): SixGraphSummary {
-  const s = sixGraphsOf(projectId, { ...(opts.dataDir === undefined ? {} : { dataDir: opts.dataDir }), summary_only: true });
+export function graphSummaryOf(projectId: string, opts: { dataDir?: string; events?: EventsSnapshot } = {}): SixGraphSummary {
+  const s = sixGraphsOf(projectId, {
+    ...(opts.dataDir === undefined ? {} : { dataDir: opts.dataDir }),
+    ...(opts.events === undefined ? {} : { events: opts.events }),
+    summary_only: true,
+  });
   return {
     snapshot_id: s.snapshot_id,
     read_at: s.read_at,

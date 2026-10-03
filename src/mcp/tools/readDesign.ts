@@ -6,6 +6,11 @@
 // 按行序首尾相接拼回去与全文逐字节相同（切片自带 sha256，调用方可以自己核对）。
 // 章节口径直接复用 documents.ts 的章节索引（buildSectionIndex），不在这里另立一套切段规则。
 import { buildSectionIndex, sha256Hex, sliceDocumentLines, sliceDocumentSection } from "../../server/work/documents";
+import {
+  CONTINUATION_PAGE_MAX_CHARS,
+  continuationPayload,
+  readContinuationPage,
+} from "../../server/work/continuation";
 import { isWorkError, WorkError } from "../../server/work/types";
 import { readDesign, readDiscuss } from "../../server/workstation";
 import { errorResult, textResult, type McpTool } from "./types";
@@ -58,6 +63,12 @@ export const readDesignTool: McpTool = {
         additionalProperties: false,
       },
       index: { type: "boolean", description: "true = 只列章节索引（level/title/path/行范围），不返回正文" },
+      cursor: {
+        type: "string",
+        description:
+          "完整版本续读游标（`tcur1:<design|plan>:<绑定16位>:<完整sha64>:lines:<起始行>`）。" +
+            "游标绑定项目/文档与完整内容哈希：跨项目/跨文档/源变都会明确报错；旧 `tctx1` 短前缀游标只定位、不能当完整版本证明，会被拒绝并要求重取（DESIGN §6.8／契约 U3）",
+      },
     },
     required: ["project_id"],
     additionalProperties: false,
@@ -68,13 +79,20 @@ export const readDesignTool: McpTool = {
       return errorResult("read_design 缺入参 project_id");
     }
     const section = typeof args.section === "string" ? args.section.trim() : "";
+    const cursor = typeof args.cursor === "string" ? args.cursor.trim() : "";
     const wantsIndex = args.index === true;
     const hasRange = args.range !== undefined;
     if (section !== "" && hasRange) {
       return errorResult("read_design 的 section 与 range 只能给一个（给两个＝没说清读哪一段）");
     }
-    if (wantsIndex && (section !== "" || hasRange)) {
-      return errorResult("read_design 的 index=true 与 section/range 不能同时给（index 只列章节索引，不返回正文）");
+    const locators = [...(section === "" ? [] : ["section"]), ...(hasRange ? ["range"] : []), ...(cursor === "" ? [] : ["cursor"])];
+    if (locators.length > 1) {
+      return errorResult(
+        `read_design 的定位参数只能给一个（收到 ${locators.join("、")}）：section 按章节、range 按行范围、cursor 续读，多给＝没说清读哪一段`,
+      );
+    }
+    if (wantsIndex && locators.length > 0) {
+      return errorResult(`read_design 的 index=true 与 ${locators[0]} 不能同时给（index 只列章节索引，不返回正文）`);
     }
     const design = readDesign(projectId);
     const discuss = readDiscuss(projectId);
@@ -115,6 +133,47 @@ export const readDesignTool: McpTool = {
               },
               discuss: discussPayload,
               slice: null,
+            },
+            null,
+            2,
+          ),
+        );
+      }
+      if (cursor !== "") {
+        const outcome = readContinuationPage({
+          text,
+          projectId,
+          doc: "design",
+          sourceLabel: design.source ?? "design.md",
+          cursorRaw: cursor,
+          pageMaxChars: CONTINUATION_PAGE_MAX_CHARS,
+        });
+        if (!outcome.ok) {
+          const f = outcome.failure!;
+          return errorResult(JSON.stringify({ ok: false, code: f.code, message: f.message, detail: f.detail }, null, 2));
+        }
+        const page = outcome.page!;
+        return textResult(
+          JSON.stringify(
+            {
+              design: {
+                exists: true,
+                source: design.source,
+                lines: lineCount,
+                sha256: fullSha,
+                content: page.slice.content,
+              },
+              discuss: discussPayload,
+              slice: {
+                kind: "cursor",
+                selector: cursor,
+                line_start: page.slice.line_start,
+                line_end: page.slice.line_end,
+                chars: page.slice.content.length,
+                sha256: page.slice.sha256,
+                section: null,
+              },
+              continuation: continuationPayload(page, projectId, "design", fullSha),
             },
             null,
             2,

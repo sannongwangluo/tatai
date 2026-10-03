@@ -25,6 +25,7 @@
 //      ——多次快速切换不会堆积。`run` 收到一个 `AbortSignal`：透传给读口 + `signal.aborted`
 //      作落地前判据（旧项目/旧代回包一律丢弃，A→B→A 也不会回退）。
 import { useCallback, useEffect, useRef, useState } from "react";
+import { invalidateSharedReads } from "./sharedRead";
 
 /** 默认对账间隔：F2「默认可见页面 5 秒对账」（技术图的 4s 轮询保持原语义，不并入）。 */
 export const PROJECT_REFRESH_INTERVAL_MS = 5000;
@@ -58,9 +59,16 @@ export function useProjectRefresh(projectId: string, options?: ProjectRefreshOpt
       if (document.visibilityState === "visible") bump();
     }, intervalMs);
     const onVisibility = (): void => {
-      if (document.visibilityState === "visible") bump(); // 回前台立即补拉
+      if (document.visibilityState === "visible") {
+        // 已知失效（V09-38 复审）：回前台后重新取数，**不得**并入后台期间发出的旧在途请求。
+        invalidateSharedReads();
+        bump();
+      }
     };
-    const onOnline = (): void => bump(); // 在线恢复
+    const onOnline = (): void => {
+      invalidateSharedReads(); // 在线恢复同理：网络恢复前的在途读不算"当前版本"
+      bump();
+    };
     document.addEventListener("visibilitychange", onVisibility);
     window.addEventListener("online", onOnline);
     return () => {

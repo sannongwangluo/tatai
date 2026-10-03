@@ -13,7 +13,7 @@ import { evaluateProjectEntry } from "../../server/work/entry";
 import { graphSummaryOf } from "../../arch/sixGraphs";
 import { claimTask, releaseClaim, renewClaim, reopenTask, submitTaskResult, DEFAULT_LEASE_MS, LEASE_NOTE } from "../../server/work/claims";
 import { resolveDataDir } from "../../server/registry";
-import { hostSyncView } from "./syncHost";
+import { hostEntryView, hostSyncView } from "./syncHost";
 import { errorResult, textResult, type McpContext, type McpTool, type ToolResult } from "./types";
 
 /** 结构化拒绝：内容照原样给（含 code/failures/revision/read_again），isError 让客户端按失败处理 */
@@ -86,6 +86,12 @@ export const projectEntryTool: McpTool = {
         description: "调用方已知的版本（基线 id 或设计/施工图修订 sha256）；落后于当前有效版本时不派新任务",
       },
       resume_hint: { type: "string", description: "可选：接续提示（任务或交接 ID）；只是提示，不越权绕过角色/依赖/范围检查" },
+      preconditions: {
+        type: "boolean",
+        description:
+          "可选（V09-34，默认 false）：附一份**接续前置事实说明**（缺项/责任角色/下一步/补取入口，逐项 blocking:false，" +
+          "只解释不改门禁）。默认不附＝保持 §6.7 恰好九字段的既有契约；为 true 时结果多一个 `preconditions` 字段。",
+      },
     },
     required: ["project_id", "role"],
     additionalProperties: false,
@@ -98,6 +104,44 @@ export const projectEntryTool: McpTool = {
       const dataDir = resolveDataDir();
       // V09-23 返工C（Codex 反例12）：entry 的 sync_summary 必须在**响应层**用唯一宿主的**同一份**后台发现错误重算
       // （MCP 另一进程自己汇为空，不能冒充"后台无故障"）；宿主不可达且已配置时 fail-closed。
+      const wantPreconditions = args.preconditions === true;
+      // V09-31：优先唯一宿主只读入口——一次返回入口 + 六图摘要（同一份现读快照贯通入口/图/同步），
+      // 消除「远端 sync + 本地入口 + 第三次图」三次重派生。宿主不可达才回退下面的本地路径（不假装健康）。
+      const hostEntry = await hostEntryView(
+        projectId,
+        dataDir,
+        {
+          role,
+          known_revision: strOrNull(args, "known_revision"),
+          resume_hint: strOrNull(args, "resume_hint"),
+          client_capabilities: args.client_capabilities,
+        },
+        wantPreconditions ? { preconditions: true } : {},
+      );
+      if (hostEntry.view !== null) {
+        // 保持 project_entry 既有形状：入口字段在顶层 + `graph_summary`；再带兼容可选字段（版本/来源/口径）。
+        return jsonOk({
+          ...hostEntry.view.entry,
+          graph_summary: hostEntry.view.graph_summary,
+          versions: hostEntry.view.versions,
+          source: hostEntry.view.source,
+          contract: hostEntry.view.contract,
+        });
+      }
+      // 宿主**明确报错**（SOURCE_CHANGED / LEDGER_UNSTABLE / HEALTH_UNSTABLE / READ_QUEUE_FULL…）：
+      // 原样上抛，**不**悄悄回退本地路径绕过后假装成功（复审根因一）。宿主不可达才是下面 fail-closed 回退。
+      if (hostEntry.error !== null) {
+        return jsonError({
+          ok: false,
+          code: hostEntry.error.code,
+          message: hostEntry.error.message,
+          detail: hostEntry.error.detail,
+          source: "host",
+          note:
+            "唯一宿主只读入口明确报错：按结构化错误如实上抛（可重试的瞬时态），" +
+            "不静默回退本地路径绕过（宿主不可达才走 fail-closed 本地回退）",
+        });
+      }
       const view = await hostSyncView(projectId, dataDir, ctx?.work);
       const entry = evaluateProjectEntry(
         {
@@ -107,7 +151,7 @@ export const projectEntryTool: McpTool = {
           known_revision: strOrNull(args, "known_revision"),
           resume_hint: strOrNull(args, "resume_hint"),
         },
-        { dataDir, syncDiscoveryIssues: view.discovery_issues },
+        { dataDir, syncDiscoveryIssues: view.discovery_issues, ...(wantPreconditions ? { preconditions: true } : {}) },
       );
       // V09-19（§6.7）：入口另带**六图摘要**——六图各一行＋同一快照标识＋基线/更新时间＋更新中或过期状态与原因＋
       // 异常＋下一读取入口。摘要**不内联整图**（完整状态走 get_project_graphs），但必须与整图**同一份事实与判据**

@@ -17,6 +17,7 @@ import type { ChatSelection, ChatActionView } from "../server/work/chatActions";
 import type { ChangeLine } from "../server/watcher";
 import type { AgentRecord } from "../server/agents";
 import { apiBase } from "./tauri-env";
+import { sharedReadFetch, type RawFetch } from "./sharedRead";
 
 // ── P2：跨项目视图（DESIGN.md §11.2「多项目并行增强」）：GET /api/summary/projects ──
 // 汇总口径（行的字段 / 排序键 / 分桶 / 缺文件合成）全在服务端，见 src/server/projects-summary.ts（P1）
@@ -40,12 +41,15 @@ export interface ProjectsSummaryPayload {
   errors: { project_id: string; message: string }[];
 }
 
-// ── U1（三期）：桌面壳里的绝对基址 ────────────────────────────────────────────
-// 全前端只有这一个出口发 HTTP（调用点数随功能增长，以 verify:u1② 不变量断言为准——除 apiFetch 自身外零裸 fetch）；壳里没有 vite 代理，
-// 相对路径 `/api/...` 会打到 WebView 自己身上，所以统一加一层基址前缀。
+// ── U1（三期）：桌面壳里的绝对基址 + V09-36 在途只读请求共享 ────────────────────
+// 全前端只有这一个出口发 HTTP（调用点数随功能增长，以 verify:u1② 不变量断言为准——除 rawFetch 自身外零裸 fetch）；
+// `rawFetch` 是唯一裸 fetch，经 `sharedReadFetch` 做 GET/HEAD 在途合并后分发（同 URL/参数/权限只打一次网络，
+// 每个调用者各拿独立可消费的 Response；写请求不合并、无 TTL；AbortSignal 每订阅者独立）。
+// 壳里没有 vite 代理，相对路径 `/api/...` 会打到 WebView 自己身上，所以统一加一层基址前缀。
 // 非壳内/dev 态 apiBase() 返回空串，请求与 U1 之前逐字相同；探测口径见 src/ui/tauri-env.ts。
+export const rawFetch: RawFetch = (url, init) => fetch(url, init);
 function apiFetch(input: string, init?: RequestInit): Promise<Response> {
-  return fetch(`${apiBase()}${input}`, init);
+  return sharedReadFetch(`${apiBase()}${input}`, init, rawFetch);
 }
 
 /** V09-26（契约 F2）：只读读口可接收的中止信号——统一刷新机制在换项目/卸载时 abort 在途请求，
@@ -1414,9 +1418,14 @@ export interface GitStatusPayload {
  * V06-12：GET /api/projects/:id/git-status —— 只读 Git 探测 + 提醒派生。
  * 探测失败也会 200 返回（`git.error` / `reminder.probe_error` 如实带原因）：这是"结论是未知"，
  * 不是"接口坏了"，界面必须把两者分开显示（§3.15「只读探测失败不当作干净」）。
+ *
+ * V09-26/F2 补齐（2026-10-03）：读口统一收 `FetchOpts.signal`（与 getLive/getChanges/getProgress
+ * 等同一条 `fetchInit` 口径），`VersionReminder` 把 `useBoundedReloader` 的 signal 透传下来——
+ * 换项目/卸载时**真正中止在途网络**（不再只是靠调用方过滤旧回包）。不传 `opts` 时逐字等于旧行为，
+ * 旧调用点无需改动。
  */
-export async function getGitStatus(id: string): Promise<GitStatusPayload> {
-  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/git-status`);
+export async function getGitStatus(id: string, opts?: FetchOpts): Promise<GitStatusPayload> {
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/git-status`, fetchInit(opts));
   const body = (await res.json()) as ({ ok: true } & GitStatusPayload) | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return { git: body.git, reminder: body.reminder };
@@ -1625,6 +1634,10 @@ function batchShapeError(b: unknown, i: number): string | null {
   if (typeof b.batch_id !== "string") return `${at}.batch_id 不是字符串`;
   if (typeof b.title !== "string") return `${at}.title 不是字符串`;
   if (typeof b.active !== "boolean") return `${at}.active 不是布尔`;
+  if (typeof b.historical !== "boolean") return `${at}.historical 不是布尔（增量核验：历史批次以账本回执展示）`;
+  if (b.verified_at !== null && typeof b.verified_at !== "string") {
+    return `${at}.verified_at 既不是 null 也不是字符串`;
+  }
   if (typeof b.blocks_entry !== "boolean") return `${at}.blocks_entry 不是布尔`;
   if (!inValueSet(b.verdict, SYNC_VERDICTS)) {
     return `${at}.verdict 不是契约值集内的取值：${JSON.stringify(b.verdict)}`;

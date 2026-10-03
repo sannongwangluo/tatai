@@ -105,7 +105,10 @@
 
 ## 让 Agent 接进来（MCP）
 
-- 25 个 stdio MCP 工具：项目接续（`list_projects`／`select_project`／`project_entry`／`doctor`）、任务与进度、认领与回执、设计书与图纸、需求／变更、同步证据对账（`register_sync_contract`／`scan_sync_evidence`／`read_sync_status`）等。计数以 `src/mcp/tools/index.ts` 的注册表为唯一来源（`pnpm verify:v09-05` 对账，文档计数与注册表恒等）；完整清单见 [docs/capabilities.md](docs/capabilities.md)。
+以下 28 个工具与 2026-10-03 优化对应当前 `main` 源码（Unreleased）。现有 v0.2.0 Release 安装包尚未包含这些更新；使用新能力需先从当前源码构建并更新程序，再重连 MCP。
+
+- 28 个 stdio MCP 工具：项目接续（`list_projects`／`select_project`／`project_entry`／`doctor`）、任务与进度、认领与回执、设计书与图纸、施工图与结构（`read_plan`／`expand_module`／`project_index`）、需求／变更、同步证据对账（`register_sync_contract`／`scan_sync_evidence`／`read_sync_status`）等。计数以 `src/mcp/tools/index.ts` 的注册表为唯一来源（`pnpm verify:v09-05` 对账，文档计数与注册表恒等）；完整清单见 [docs/capabilities.md](docs/capabilities.md)。
+- **已经运行中的 MCP 连接保留旧内存代码**：更新程序后，要让**当前会话**用上新的接续逻辑与 3 个新工具，需重连塔台 MCP；新启动的连接使用配置路径下已更新的 `server/mcp.js`。
 - 桌面壳装好后，MCP 入口就是安装目录下的 `server/mcp.js`，例如 `C:/Users/<用户名>/AppData/Local/Tatai/server/mcp.js`。`%LOCALAPPDATA%` 这类变量不会被自动展开，配置里必须写实际绝对路径。
 - 从源码跑时先 `pnpm build:server`，再用产物的绝对路径；不要依赖 `node --import tsx …` 这种要客户端 cwd 才解析得开的写法。完整示例见 [docs/getting-started.md](docs/getting-started.md) 第 5 节与 [docs/agent-integration.md](docs/agent-integration.md)。
 
@@ -121,7 +124,11 @@
 
 ## 当前能力与边界
 
-**已经能用**：项目登记与跨项目概览；人工确认的七步 Gate 与 Agent 自报任务；六图（功能全景／系统架构／施工依赖／模块方框图／数据流向图／思维导图）与下钻；设计书展示与追加落稿；内置 AI 聊天；任务认领与执行回执；**私有事实**（`.工作台/`）的显式**备份**与**隔离目录**恢复——恢复只落在隔离目录并逐项核验，塔台**不会自动替换**你当前的数据；MCP 接续入口。
+**已经能用**：项目登记与跨项目概览；人工确认的七步 Gate 与 Agent 自报任务；六图（功能全景／系统架构／施工依赖／模块方框图／数据流向图／思维导图）与下钻；设计书展示与追加落稿；**施工图按卡/章节/行范围原读取材**（`read_plan`）与**深层结构下钻**（`expand_module`）；**持久项目说明索引**（`project_index`，职责/接口/来源/关系/影响覆盖，声明关系不冒充验证事实）；内置 AI 聊天；任务认领与执行回执；**私有事实**（`.工作台/`）的显式**备份**与**隔离目录**恢复——恢复只落在隔离目录并逐项核验，塔台**不会自动替换**你当前的数据；MCP 接续入口。
+
+**本轮统一优化（2026-10-03，未升版本、未打 tag、未发 Release）**：**按需接续与缓存 worker**——接续入口在一次请求内共享同一份账本快照与派生事实（不再重复读盘、不跨请求缓存旧绿）；只读重计算挪到**进程内有界工作线程池**（含**内容校验的解析缓存**），唯一写入宿主承担写；文件读取做**内容校验 + 前缀增量**（同长度改写/保留 mtime/截断/中段坏行均能识别，不拿 size/mtime 当身份）；界面**合并同条件在途只读请求、切项目真正取消旧请求**，并显示明确新鲜度与失败原因。**已经运行中的 MCP 连接保留旧内存代码，需重连才生效**（见上一节）。
+
+**性能（有条件样本，非普适倍数）**：在一份**冻结的真实项目镜像**（约 2146 文件、约 53 MB 事件账本、9200 事件、44 个批次）上，每种链路取 30 个暖样本，本轮相对"首轮提速后"的旧源码快照实测中位改善：真实 MCP 完整接续 p50 约 4709 ms → 1333 ms（约 3.5×），直接接续入口 p50 约 2736 ms → 872 ms（约 3.1×），唯一宿主 HTTP 同步读取 p50 约 1436 ms → 1021 ms（约 1.4×）。**这是该镜像/该现场下的样本结论，不是普适倍数、也不是"全链路秒回"**：完整同步报告与新增证据写入仍有百毫秒级尖峰，拟议的暖界面 300 ms／轻接续 1 s／小证据 2 s 目标未全面达标；不同项目规模与并发负载下读数会不同。
 
 **边界与如实限制**：
 
