@@ -30,6 +30,7 @@
 
 | 卡号 | 状态 | 交付目标 | 依赖 | 完成证据 |
 | --- | --- | --- | --- | --- |
+| V09-40 | todo | 已认可草图落地：统一小塔台标志、日夜主题、主界面层次与真实图说明 | 无 | docs/ui-redesign-20261004.md；类型/定向行为/界面/图标/正式安装验证 |
 | V08-01 | done | 欠账清理与迁移收口（①§11.1 十名表→稳定 ID 解析契约迁移；②状态区 v2 派生；③测试欠账 d2/s2/f3/v06-14③-8；④names.json 孤儿与 audit 模块色合法处置） | V07-01、V07-02、V07-03、V07-04 | 四范围全部收口：①声明模块身份改为**材料声明的编号**（`11.1-01`…，identity_basis=declared_number）＋审定材料索引（施工图 `§11.1 第 N 项` 交叉引用→落点章节→章节内点名路径∩代码模块），塔台自身对账 **matched 0→5**、模块节点 id 改 `plan:mod:<稳定 ID>`（改名/章节重排不换身份）；②任务状态读口径改 **v2 事件投影优先**（`readTaskLedger`；/live、/tasks、/summary 同源），新增 `task_source`/`task_counts_v2`/`result_submitted_ids`，界面明示「结果已提交（待验收/复核）」不显示成已验收；**（口径边界，V08-02 补记）**：②只覆盖**任务**状态；**模块**状态当时尚无 v2 对象，模块层（方框图/系统架构）仍读 v1 四色——模块层的 v2 派生与「无状态记录」诚实标签由 **V08-02** 收口，别再把这句读成「模块也已 v2」；③`verify:d2` 转全 PASS（证人改现存条目、"去掉新增行逐字节回到原文"）、`verify:s2` 长期既有红转全 PASS（代理参数补 direct:// ＋可达性预检显式 SKIP）、`f3` UI 段改动态取形与按数据自证、`v06-14 ③-8` 断言对齐 V07-01 按需拉起语义（接受码 SERVICE_UNAVAILABLE∥INVALID_COMMAND，保留"写被拒且不退化成自己写文件"）；④人话名缓存剪孤儿（`pruned`，活着的零改动）、已迁移项目模块四色如实拒绝（`WRITE_UPGRADE_REQUIRED`＋零字节，不绕闸门）。`pnpm verify:v08-01` **14 PASS / 0 FAIL**；门槛 typecheck/build/build:server exit 0；回归 62 项见证据 `.工作台/evidence/V08-01/1/SUMMARY.txt`；证据 `.工作台/evidence/V08-01/1/00-摘要.md`。**（2026-09-25 终审返工补登·实现路径声明）**：本卡模块级映射证据此前缺位（完成证据列只反引号引用了 `.工作台` 证据目录，属当年声明粒度问题，非交付缺失），按实际交付与证据包可追溯补登——`src/arch/reconcile.ts`＋`src/arch/blueprint.ts`＋`src/arch/name.ts`（范围①稳定 ID 迁移与④剪孤儿）、`src/server/workstation.ts`＋`src/server/live.ts`＋`src/server/summary.ts`＋`src/server/projects-summary.ts`＋`src/ui/components/LiveView.tsx`（范围②状态读口径 v2 派生）、`scripts/verify-d2.ts`＋`scripts/verify-s2.ts`＋`scripts/verify-f3.ts`＋`scripts/verify-v06-14.ts`（范围③测试欠账）＋新增 `scripts/verify-v08-01.ts`＋`package.json`；旧记录一字未改、仅追加声明（依据 `.工作台/evidence/V08-01/1/00-摘要.md` 与交付 commit `32eb102`） |
 | V08-02 | done | 图面色块与事实对齐（①功能全景成员口径（B1）；②系统架构/B-M-H-J 模块层状态改 v2 派生或如实标签（B2/B3/B4）；③「未映射」分因文案与集成端点去强调（C1/C2）；④对账置信度与契约缺口口径（C3）；⑤V08-01 卡面「任务状态 v2 派生」与模块状态区分写清（C4）） | V08-01 | **B 类 4 处缺陷全部修掉**：**B1** 功能全景的成员口径从「`node_kinds` 当成员过滤器」（功能视图 `node_kinds=['capability']` ⇒ 成员恒空 ⇒ 能力恒判「未映射」）改为**显式 `member_kinds`**（功能＝模块＋任务、架构＝模块、施工＝无），成员改由蓝图边派生（`design_interface` 能力→模块、`task_design_ref` 任务→能力）；三项目实测能力节点由 **0 着色** 变 tatai 9/12、brain-memory 5/15、huojia-camou 7/12 着色（封顶「结果待验证」）。**B2/B3/B4** 新增纯视图派生 `taskDerivedModuleStatus`（按蓝图既有 `implementation_map` 把任务状态汇总到模块，§4.2 优先级序、**封顶「结果待验证」不给绿**）＋「无状态记录」中性虚线样式：`archStatus` 由「投影里没有 `module:*` ⇒ 空表 ⇒ 画布回落 v1 四色」改为 ①投影对象→②任务派生→③如实「无状态记录」三档；tatai `audit` 模块从 v1「未开始」变「无状态记录」（B4）、BM/HJ 模块图不再恒灰（B3）、模块方框图与系统架构不再自相矛盾（B2）。**C 类 4 处**：**C1** `NodeStatus` 新增 `unmapped_reason`（`no_status_source`／`object_unmapped`／`no_members`／`members_without_status`／`no_task_evidence`／`endpoint`），四种原因文案各自点名、不再一刀切「未映射」；**C2** 施工依赖的集成端点标签改「（集成端点·不表示进度）」、口径句写明不表示进度、仍不进概览计数；**C3** 对账面板新增**配对依据**分解（审定材料索引＝显式引用 vs **名字信号＝文本匹配·待核实**）与「契约缺口 ≠ 设计过时/代码跑偏」提示，并给 huojia-camou 补跑了一次真实对账（原先 `exists:false`；现设计侧 0 项／代码侧 7 项 ⇒ 如实显示"材料没被识别成模块声明"的契约缺口，不当作代码跑偏）；**C4** 本表 V08-01 行补一句区分（任务状态 v2 派生 ≠ 模块状态已 v2）。新增 `scripts/verify:v08-02`（20 PASS / 0 FAIL，纯视图口径断言）＋ `verify:v06-06` 一处期望定向更新（判据**收紧**：从"必须出现「未映射」四字"改为"display=null ＋ `unmapped_reason` 显式枚举 ＋ 文案点名"，并在文件里留点名留痕）＋ `verify:v06-02` 点名登记行数 21→22 定向更新（顺带清掉自 v0.7 起的既有红）；红线守住：**A 类真 todo 原色未动**（实测 tatai V06-14 仍橙、BM-11/12 与 HJ-05/06/07 仍灰）、**不发明任何事件类型**；门槛 `pnpm typecheck`/`build`/`build:server` exit 0；回归与三项目前后对比见证据 `.工作台/evidence/V08-02/1/`。**（2026-09-25 终审返工补登·实现路径声明）**：本卡模块级映射证据此前缺位（同 V08-01，属当年声明粒度问题，非交付缺失），按实际交付与证据包可追溯补登——`src/ui/arch/projectGraph.ts`（B1 `member_kinds`／B2-B4 `taskDerivedModuleStatus`／C1 `unmapped_reason`）、`src/ui/arch/statusColor.ts`（`no_status_record` 样式）、`src/ui/arch/ArchCanvas.tsx`（徽标／端点文案／对账面板）、`src/ui/arch/ProjectGraphView.tsx`（`moduleDerived`＋`archStatus` 三档）＋新增 `scripts/verify-v08-02.ts`＋`scripts/verify-v06-06.ts` 与 `scripts/verify-v06-02.ts` 定向更新＋`package.json`；旧记录一字未改、仅追加声明（依据 `.工作台/evidence/V08-02/1/00-摘要.md`／`HANDOFF-V08-02.md` 与交付 commit `f2c6357`）。 |
 | V08-03 | done | 模块级验证口径与图面配色补全（①声明真实路径∩代码模块的映射增强；②模块/能力「验证通过」派生按附录 D（替换 V08-02 的封顶）；③展示层文案人话化；④三项目实测前后对照；⑤门槛与回归＋基线重激活/蓝图重建/重打重启） | V08-02 | 口径＝**DESIGN.md 附录 D**（用户 2026-09-23 裁定后追加，正文一字未动）：**①映射增强**：`src/arch/blueprint.ts` 实现映射改由卡面「文件责任 ∪ 完成证据/交付」里的**真实路径** ∩ 代码模块（路径相交、目录边界对齐、根模块只在没有更具体命中时生效、同边只记一次、认不出的不硬凑）；塔台自身实现映射边 170（含大量重复与"一律归根"）→ **39 条**、10 个模块节点里 10 个状态有变化。**②状态派生**：`taskDerivedModuleStatus` 改为——模块验证通过＝**映射非空且成员卡全部 verified**（不再封顶在「结果待验证」）；不是全部通过按 §4.2 取最前、不给绿；无映射如实「无状态记录」；声明模块按 §4.5 对账配对继承代码模块状态（塔台 §11.1 对上 4 项→绿，其余 6 项如实「无状态记录」）；能力不另设验证、由本视图成员派生。**③文案**：模块验证通过短标「已存在·已验证通过」，六态 `full` 仍与服务端 `DISPLAY_STATUS_LABELS` 逐字一致。**④三项目实测**（前后对照见证据）：塔台 src/scripts/docs/templates/root 由「结果待验证」→ **已验证通过**、audit/src-tauri 如实「无状态记录」；BM config/docs/scripts/src/tests 由「无状态记录」→ **已验证通过**（BM-11/12 为真 todo ⇒ root 仍停在待验证、**不染绿**）；HJ src/public/scripts → **已验证通过**（HJ-05/06/07 为真 todo ⇒ root 不染绿）。**⑤验证**：新增 `scripts/verify-v08-03.ts`（**31 PASS / 0 FAIL**）＋`package.json`；`typecheck`/`build`/`build:server` exit 0；受影响回归全绿；基线按 §2.9 保留＋技术审定重激活、蓝图重建、app 重打重启＋doctor 五段自检。证据 `.工作台/evidence/V08-03/1/` |
@@ -2834,3 +2835,26 @@ U3 + S3 ──► L1 LICENSE 逐条核对 ──► L4 仓库打磨 + release ta
 
 - [ ] 本卡正常与失败行为验证通过，原始证据可取回。
 - [ ] 非作者复核完成；未测项如实记录，不代签用户验收。
+
+### V09-40 界面与品牌统一（2026-10-04 当前授权批次）
+
+**目标**：将用户认可草图落实到现有真实塔台，统一小塔台标志、浅深主题、阅读层次和真实说明。
+
+**状态**：执行中；本地实现与定向回归已完成，独立界面复审、正式构建和安装结论以仓外 `<维护者核验目录>/tatai-ui-20261004/ACCEPTANCE.md` 为最终记录。用户接受待本人表达。
+
+**设计依据**：DESIGN §3.1；docs/ui-redesign-20261004.md。
+
+**责任角色**：executor
+
+**需求**：req-tatai-ui-20261004。
+
+**依赖**：无。
+
+**契约**：上述界面契约；不重建调度、不伪造理由或进度、不代签验收、保留五导航六图、既有项目数据与未提交现场。
+
+**文件责任**：src/ui、public/tatai-mark.svg、index.html、src-tauri/icons、scripts/generate-brand-icons.mjs 与定向验证脚本、必要文档。
+
+**交付**：真实UI、可复现品牌资产、主题持久化和图/导航/证据回归、正式打包绑定与安装验证，证据根 <维护者核验目录>/tatai-ui-20261004。
+
+- [ ] 实施契约各验收项完成并有原始证据。
+- [ ] 非作者复审及安装验证完成；用户接受待本人表达。

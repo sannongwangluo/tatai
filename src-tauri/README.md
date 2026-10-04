@@ -75,7 +75,7 @@ windows-gnu 下 `tauri-build` 专门把这个 DLL 复制到 `target/<profile>/`�
 | 入口 | 谁拉起 | 用途 |
 | --- | --- | --- |
 | `index.js` | **壳自己**（`backend.rs`，release 分支） | 本地 HTTP 服务（8787）：注册表 / 门禁 / 终端 / 架构图 / 变更流 |
-| `mcp.js` | **外部 agent 的 MCP 客户端**（stdio，DESIGN.md §6.1「agent → 工作台」） | MCP 工具集（U2 时为 8 个；**当前 22 个**，计数以 `src/mcp/tools/index.ts` 注册表为唯一来源），与 `index.js` 读写同一份注册表与 `.工作台/` |
+| `mcp.js` | **外部 agent 的 MCP 客户端**（stdio，DESIGN.md §6.1「agent → 工作台」） | MCP 工具集（U2 时为 8 个；**v0.3.0 为 28 个**，计数以 `src/mcp/tools/index.ts` 注册表为唯一来源），与 `index.js` 读写同一份注册表与 `.工作台/` |
 
 ### node 运行时口径（U2 明确选择，不是静默假设）
 
@@ -255,8 +255,8 @@ document 捕获段拦下站外 http(s) 点击（`preventDefault` + `openUrl`）�
 
 ## 图标
 
-`icons/` 是 U1 的**占位图标**（蓝环雷达图，`pnpm tauri icon <1024png>` 生成），正式视觉待设计；
-`tauri.conf.json` 的 `bundle.icon` 与目录内容一一对应。
+`icons/` 是 **v0.3.0 起启用的线条小塔台品牌图标**：几何只在 `public/tatai-mark.svg`（唯一 SVG 形状，`viewBox 0 0 28 32`），由 `scripts/generate-brand-icons.mjs` 调本机 Tauri CLI 从这一份源生成各平台尺寸（含 Windows `.ico`、macOS `.icns` 与各规格 PNG），**无栅格工具、无新依赖**。界面标志、网页图标、EXE／安装包与桌面快捷方式同源。
+`tauri.conf.json` 的 `bundle.icon` 与目录内容一一对应；改品牌源后重跑生成脚本，不要手改各尺寸文件。
 
 ## 桌面壳工具链（Windows：Rust + mingw）
 

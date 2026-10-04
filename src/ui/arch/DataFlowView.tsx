@@ -120,18 +120,13 @@ export function DataFlowTargetPanel({
   loads?: number;
 }) {
   return (
-    // **定高**（不是 max-h）：这一层是异步取数的，若高度随"加载中→有数据"变化，画布会在 fitView
-    // 之后被挤矮、把边缘节点挤出视口（F4 ④ 的"节点全在视口内"断言正是量这个）。定高 + 内部滚动，
-    // 画布高度自始至终不变，口径两句话始终看得见。
+    // 默认只给资料入口；失败与缺声明常显，完整资料在有界滚动区，不让技术说明挤没画布。
     <div
-      className="mt-1 h-40 space-y-1 overflow-auto border-t border-neutral-800 pt-1"
+      className="mt-1 space-y-1 border-t border-neutral-800 pt-1"
       data-flow-target-layer
       data-flow-target-stale={error !== null ? "1" : "0"}
       {...(loads === undefined ? {} : { "data-flow-target-loads": loads })}
     >
-      <p className="text-neutral-400" data-flow-target-semantics>
-        {DATA_FLOW_TARGET_SEMANTICS_NOTE}
-      </p>
       {error !== null && (
         <p className="text-rose-400" data-flow-state="load_failed">
           目标语义层读不到（不是「本项目没有数据流」）：{error}
@@ -147,7 +142,13 @@ export function DataFlowTargetPanel({
           {model.coverage.note}
         </p>
       )}
-      {model !== null && model.coverage.declared_total > 0 && <DataFlowModelView model={model} />}
+      <details className="tt-graph-tech-notes" data-flow-material-details>
+        <summary>业务数据路径与求证资料{model === null ? "" : `（${model.chains.length} 条数据链，需逐条核对）`}</summary>
+        <div className="tt-graph-tech-content">
+          <p className="text-neutral-400" data-flow-target-semantics>{DATA_FLOW_TARGET_SEMANTICS_NOTE}</p>
+          {model !== null && model.coverage.declared_total > 0 && <DataFlowModelView model={model} />}
+        </div>
+      </details>
     </div>
   );
 }
@@ -312,9 +313,13 @@ export function FlowLegend({ info, projectId }: { info: CanvasInfo; projectId: s
         : info.colors.uncolored;
   return (
     <div
-      className="max-h-72 shrink-0 space-y-1 overflow-auto border-b border-neutral-800 px-3 py-1.5 text-[11px]"
+      className="max-h-48 shrink-0 space-y-1 overflow-auto border-b border-neutral-800 px-3 py-1.5 text-[12px]"
       data-flow-legend
     >
+      <p className="text-amber-400" data-flow-current-implementation>当前画布展示代码之间的引用关系，不代表业务数据已经流通。</p>
+      <details className="tt-graph-tech-notes" data-flow-display-details>
+        <summary>连线含义与技术说明</summary>
+        <div className="tt-graph-tech-content">
       <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-neutral-400">
         <span className="text-neutral-300">数据流向图</span>
         <span className="text-neutral-600">数据从哪来、到哪去、谁依赖谁</span>
@@ -360,12 +365,14 @@ export function FlowLegend({ info, projectId }: { info: CanvasInfo; projectId: s
         （`positions.DATA_FLOW`，F4 起与方框图互不覆盖——两图 dagre 分层方向相反，共用一份坐标会切视图跳位）。
       </p>
       {/* V09-11 ①：两句话同时可见、互相区分——上面这段说的是「画布画的是什么」，下面两行分开说清 */}
-      <p className="text-amber-400" data-flow-current-implementation>
+      <p className="text-amber-400">
         {DATA_FLOW_CURRENT_IMPLEMENTATION_NOTE}
       </p>
       <p className="text-neutral-500" data-flow-not-business-flow>
-        本画布上的线与节点**都不是**业务数据流：它画的是代码依赖方向；**不得**把它读成/显示成数据流向。
+        本画布上的线与节点不是业务数据流，它画的是代码依赖方向。
       </p>
+        </div>
+      </details>
       <TargetSemanticsPanel projectId={projectId} />
     </div>
   );

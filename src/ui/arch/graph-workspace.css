@@ -1,0 +1,71 @@
+/* V09-40: 图工作面消费全局主题；不改变状态判据或图布局坐标。 */
+.tt-graph-workspace { min-width:0; background:var(--tt-surface); color:var(--tt-text); }
+.tt-graph-workspace button,.tt-graph-workspace summary { touch-action:manipulation; }
+.tt-graph-workspace :is(button,input,summary):focus-visible { outline:2px solid var(--tt-focus); outline-offset:3px; }
+.tt-graph-view-switch { padding:12px 18px; gap:12px; background:var(--tt-surface); }
+.tt-graph-view-switch nav { flex-wrap:wrap; gap:4px; }
+.tt-graph-view-switch button { min-height:34px; padding:7px 12px; font-size:13px; border-radius:7px; }
+.tt-graph-view-switch button[aria-pressed="true"] { color:var(--tt-accent); background:var(--tt-accent-soft); border-color:var(--tt-border); font-weight:600; }
+.tt-graph-view-switch>span { font-size:12px; }
+.tt-project-graph { overflow:hidden; }
+.tt-graph-toolbar { padding:10px 16px; gap:7px; }
+.tt-graph-toolbar button { min-height:30px; font-size:12px; }
+.tt-graph-toolbar input { min-height:34px; font-size:13px; width:190px; }
+.tt-graph-toolbar [data-project-filter-switch] { flex-wrap:wrap; }
+.tt-graph-toolbar [data-project-scope] { font-size:12px; }
+.tt-graph-guide { flex-shrink:0; border-bottom:1px solid var(--tt-border); background:var(--tt-surface); }
+.tt-graph-guide>summary { color:var(--tt-muted); padding:7px 17px; font-size:12px; cursor:pointer; }
+.tt-graph-guide[open] { max-height:180px; overflow:auto; }
+.tt-graph-guide p,.tt-graph-guide span,.tt-graph-guide summary { line-height:1.6; }
+.tt-graph-and-detail { min-width:0; overflow:hidden; }
+.tt-graph-and-detail [data-project-canvas-host] { min-width:0; background:var(--tt-bg); }
+.tt-project-detail { width:350px; max-width:38%; padding:22px 21px; background:var(--tt-surface); overscroll-behavior:contain; overflow-wrap:anywhere; }
+.tt-detail-heading { margin-bottom:22px; }
+.tt-detail-heading>span { color:var(--tt-muted); font-size:12px; }
+.tt-detail-heading>h2 { color:var(--tt-text); margin:6px 0 0; font-size:23px; font-weight:650; line-height:1.45; }
+.tt-project-detail [data-detail-section] { padding:0 0 17px; border-bottom:1px solid var(--tt-border); }
+.tt-project-detail h3 { margin-bottom:8px; font-size:13px; font-weight:650; color:var(--tt-text); }
+.tt-project-detail p,.tt-project-detail li { font-size:14px; line-height:1.75; }
+.tt-project-detail li+li { margin-top:6px; }
+.tt-project-detail details { margin-top:10px; font-size:12px; color:var(--tt-muted); }
+.tt-project-detail details>summary { cursor:pointer; font-size:12px; padding:4px 0; }
+.tt-project-detail details>ul { margin-top:8px; padding:10px 12px; background:var(--tt-surface-muted); border-radius:7px; }
+.tt-project-detail details>ul li { font-size:12px; }
+.tt-project-detail [data-detail-technical] { margin-top:0; }
+.tt-related-parts { margin-top:18px; }
+.tt-related-row { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:6px; padding:7px 0; border-bottom:1px solid var(--tt-border); }
+.tt-related-row button { font-size:12px; text-align:left; color:var(--tt-accent); }
+.tt-relation-detail { position:relative; padding:15px; border:1px solid var(--tt-border); border-radius:10px; background:var(--tt-accent-soft); margin-bottom:18px; }
+.tt-relation-detail h3 { padding-right:16px; }
+.tt-detail-close { position:absolute; right:10px; top:6px; width:26px; height:26px; font-size:20px; }
+.tt-detail-muted { color:var(--tt-muted); }
+.tt-object-discussion { margin-top:22px; padding-top:16px; border-top:1px solid var(--tt-border); }
+.tt-object-discussion>button { width:100%; min-height:39px; padding:9px 12px; border-radius:7px; background:var(--tt-accent); color:var(--tt-surface); font-size:13px; font-weight:600; }
+.tt-object-discussion>p { color:var(--tt-muted); font-size:12px; margin-top:8px; }
+.tt-project-node { box-shadow:0 2px 9px #172a3410; }
+.tt-project-node>div>p { font-size:16px; }
+.tt-project-node>p { font-size:14px; line-height:1.4; }
+.tt-project-node>p:has([data-project-source-badge]) { font-size:11px; }
+.tt-project-node [data-project-source-badge],.tt-project-node [data-project-evidence-badge] { font-size:10px; }
+.tt-intra-chips { flex-wrap:nowrap; max-width:100%; overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; }
+.tt-intra-chips button { flex-shrink:0; white-space:nowrap; }
+.tt-graph-notice { font-size:12px; line-height:1.65; }
+.tt-graph-notice>summary { cursor:pointer; padding:3px 0; }
+.tt-graph-notice>p { max-height:100px; overflow:auto; margin:7px 0; overflow-wrap:anywhere; }
+.tt-graph-tech-notes>summary { cursor:pointer; font-size:12px; padding:3px 0; color:var(--tt-muted); }
+.tt-graph-tech-content { max-height:150px; overflow:auto; padding:9px 10px; background:var(--tt-surface-muted); border-radius:6px; font-size:12px; line-height:1.65; }
+.tt-graph-tech-content p { margin:5px 0; }
+.tt-graph-workspace .react-flow { --xy-background-color:var(--tt-bg); --xy-controls-button-background-color:var(--tt-surface); --xy-controls-button-background-color-hover:var(--tt-surface-muted); --xy-controls-button-color:var(--tt-text); --xy-controls-button-border-color:var(--tt-border); }
+.tt-graph-workspace .react-flow__controls { box-shadow:0 2px 12px #172a3410; border:1px solid var(--tt-border); border-radius:7px; overflow:hidden; }
+.tt-graph-workspace .react-flow__controls-button { background:var(--tt-surface); color:var(--tt-text); border-color:var(--tt-border); width:29px; height:29px; }
+.tt-graph-workspace .react-flow__controls-button svg { fill:currentColor; }
+.tt-graph-workspace .react-flow__edge-text { font-family:inherit; }
+.tt-graph-workspace [data-mindmap-canvas] { background:var(--tt-bg); }
+.tt-graph-workspace .markmap { color:var(--tt-text); --markmap-text-color:var(--tt-text); }
+.tt-graph-workspace .markmap-foreign { color:var(--tt-text); }
+.tt-graph-workspace [data-arch-hidden-drawer],.tt-graph-workspace [data-flow-detail] { max-width:calc(100% - 16px); }
+.tt-graph-workspace [data-graph-mode-switch] button { font-size:13px; min-height:32px; }
+.tt-graph-workspace [data-mindmap-view]>div:first-child { font-size:12px; }
+.tt-graph-workspace [data-reconcile-panel] { font-size:12px; }
+@media(max-width:1100px) { .tt-project-detail { width:310px; max-width:42%; padding:17px 15px; } .tt-graph-toolbar { padding:8px 12px; } .tt-graph-view-switch { padding:9px 12px; } }
+@media(max-width:760px) { .tt-graph-and-detail { flex-direction:column; overflow:auto; } .tt-graph-and-detail [data-project-canvas-host] { min-height:320px; flex-shrink:0; } .tt-project-detail { width:100%; max-width:none; border-left:0; border-top:1px solid var(--tt-border); overflow:visible; } .tt-graph-workspace .tt-graph-view-switch>span { display:none; } }

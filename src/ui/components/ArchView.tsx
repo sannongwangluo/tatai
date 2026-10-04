@@ -20,13 +20,15 @@
 // 会让 `verify-f3/f4/n2` 断言的 `.react-flow__node` 计数、`verify-n3` 的 elementFromPoint 归属
 // 跟着多出一份隐藏节点——那是改既有断言强度，不是本卡该动的。折叠/坐标在本页内的维护照旧。
 import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
+import "../arch/graph-workspace.css";
+import { getScope, useProjectScope } from "../projectScope";
 import { useBoundedReloader, useProjectRefresh } from "../useProjectRefresh";
 import { GRAPH_MODES, type GraphMode } from "../../arch/graph-mode";
 import type { ProjectItem } from "../api";
 import { ArchCanvas, type ArchViewDecl } from "../arch/ArchCanvas";
 import { DATA_FLOW_VIEW } from "../arch/DataFlowView";
 import { ProjectGraphView } from "../arch/ProjectGraphView";
-import { PROJECT_VIEWS, type ProjectViewKind } from "../arch/projectGraph";
+import { PROJECT_VIEWS, appendObjectQuestionDraft, type ViewNode, type ProjectViewKind } from "../arch/projectGraph";
 import type { ProjectLocateRequest } from "../arch/locate";
 import type { LocateRequest, ViewKey } from "../arch/locate";
 import { declaredLinksFromMatched } from "../../shared/reconcileLinks";
@@ -55,6 +57,11 @@ type ArchTab = ProjectViewKind | "tech";
 const MAIN_VIEWS: ProjectViewKind[] = ["functional", "architecture", "construction"];
 
 export function ArchView({ project }: { project: ProjectItem }) {
+  const { patch } = useProjectScope(project.id);
+  const discussObject = useCallback((node: ViewNode) => {
+    // 点击时读取该项目最新草稿，避免用旧渲染快照覆盖用户刚输入的内容。
+    patch({ view: "chat", chatDraft: appendObjectQuestionDraft(getScope(project.id).chatDraft, project, node) });
+  }, [project, patch]);
   /** 页面级页签：默认停在**三个主视图的第一个（功能全景）**——§3.1「项目图默认展示功能全景」（V06-08 切过来） */
   const [tab, setTab] = useState<ArchTab>("functional");
   /** 上一次看过的主视图（从技术详情切回来时接着看它，不重置到第一个页签） */
@@ -184,20 +191,21 @@ export function ArchView({ project }: { project: ProjectItem }) {
 
   if (tab !== "tech") {
     return (
-      <div className="flex min-h-0 flex-1 flex-col" data-arch-tab={tab} {...statusAttrs}>
+      <div className="tt-graph-workspace flex min-h-0 flex-1 flex-col" data-arch-tab={tab} {...statusAttrs}>
         <ViewSwitch tab={tab} onPick={(t) => (t === "tech" ? setTab("tech") : (setProjectView(t), setTab(t)))} />
         <ProjectGraphView
           project={project}
           view={projectView}
           locate={projectLocate}
           onLocate={requestProjectLocate}
+          onDiscuss={discussObject}
         />
       </div>
     );
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col" data-arch-tab="tech" {...statusAttrs}>
+    <div className="tt-graph-workspace flex min-h-0 flex-1 flex-col" data-arch-tab="tech" {...statusAttrs}>
       {/* §3.2：三个主视图与技术详情并列可切换；技术详情内部再切它的三种渲染（下一行） */}
       <ViewSwitch
         tab={tab}
@@ -224,7 +232,7 @@ export function ArchView({ project }: { project: ProjectItem }) {
           {spec.question}
         </span>
         <span className="text-[11px] text-neutral-600">
-          技术详情 = 基于代码关系的实现分析（§3.2）；需求/能力/任务的图看上面三个主视图
+          深入查看代码结构；项目能力、模块协作和工作安排在上方三个视图中。
         </span>
       </div>
       <div className={mode === "MIND_MAP" ? "hidden" : "flex min-h-[120px] flex-1 flex-col"} data-arch-canvas-host>
@@ -271,13 +279,14 @@ export function ArchView({ project }: { project: ProjectItem }) {
 /** 三个主视图 + 技术详情的切换条（页签唯一出处；`data-project-view-switch` 是验证脚本的锚点） */
 function ViewSwitch({ tab, onPick }: { tab: ArchTab; onPick: (t: ArchTab) => void }) {
   return (
-    <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-800 px-3 py-1.5">
+    <div className="tt-graph-view-switch flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-800 px-3 py-1.5">
       <nav className="flex gap-1" data-project-view-switch>
         {MAIN_VIEWS.map((v) => (
           <button
             key={v}
             data-project-view-tab={v}
             onClick={() => onPick(v)}
+            aria-pressed={tab === v}
             title={`${PROJECT_VIEWS[v].question}（${PROJECT_VIEWS[v].projection_kind}）`}
             className={`rounded px-2.5 py-1 text-xs ${
               tab === v
@@ -291,6 +300,7 @@ function ViewSwitch({ tab, onPick }: { tab: ArchTab; onPick: (t: ArchTab) => voi
         <button
           data-project-view-tab="tech"
           onClick={() => onPick("tech")}
+          aria-pressed={tab === "tech"}
           title="基于代码关系的实现分析详情（模块方框图 / 数据流向图 / 思维导图）"
           className={`rounded px-2.5 py-1 text-xs ${
             tab === "tech"
@@ -303,8 +313,8 @@ function ViewSwitch({ tab, onPick }: { tab: ArchTab; onPick: (t: ArchTab) => voi
       </nav>
       <span className="text-[11px] text-neutral-600">
         {tab === "tech"
-          ? "技术详情：模块方框图 / 数据流向图 / 思维导图（旧三图原样保留）"
-          : `${PROJECT_VIEWS[tab as ProjectViewKind].question} · projection_kind=${PROJECT_VIEWS[tab as ProjectViewKind].projection_kind}`}
+          ? "模块方框图 / 数据流向图 / 思维导图"
+          : PROJECT_VIEWS[tab as ProjectViewKind].question}
       </span>
     </div>
   );

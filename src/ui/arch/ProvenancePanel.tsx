@@ -33,6 +33,11 @@ const MODEL_LEAD_DISPOSITION_LABEL: Record<ModelLeadInfo["disposition"], string>
   lead_pending_review: "待审线索：不进成员/绿态/交付读数",
 };
 
+/** 只用于默认界面文案；原始标签与机器读数保持原样。 */
+export function readableGraphLabel(label: string): string {
+  return ({ "未映射": "尚无对应资料", "缺证": "缺少验证依据", "缺标注": "尚无验证记录", "不可判定项目可交付": "还不能确认已做好" } as Record<string, string>)[label] ?? label;
+}
+
 /** 一个对象的完整标注（详情面板用；逐条列出来源、映射与证据，不省略标注） */
 export function ObjectProvenanceLines({ annotation }: { annotation: ProvenanceAnnotation }) {
   const st = EVIDENCE_STATE_PALETTE[annotation.evidence_state];
@@ -150,7 +155,7 @@ export function GraphAttentionBar({
   const blocked = attn.blocking.total > 0 || delivery.verdict === "blocked";
   // 默认行上的「简短原因」：各档阻断的构成（条数按档，逐条原因在浮层里）
   const composition = (
-    [["未映射", attn.blocking.unmapped], ["未验证", attn.blocking.unverified], ["缺证", attn.blocking.missing], ["证据失效", attn.blocking.invalidated]] as const
+    [["来源未对应", attn.blocking.unmapped], ["未验证", attn.blocking.unverified], ["缺少验证依据", attn.blocking.missing], ["证据失效", attn.blocking.invalidated]] as const
   )
     .filter(([, n]) => n > 0)
     .map(([label, n]) => `${label} ${n}`)
@@ -195,7 +200,7 @@ export function GraphAttentionBar({
             }`}
             data-delivery-conclusion-badge={delivery.conclusion}
           >
-            {delivery.conclusion}
+            {readableGraphLabel(delivery.conclusion)}
           </span>
           {blocked ? (
             <>
@@ -448,6 +453,11 @@ function ModelLeadsLines({
  * 同组关系逐条可点开追来源（§3.2）。**这是 ④ 的落点**：每条带稳定 ID 与可点锚点，
  * 展开即显示出处行（`trace_lines`）；只在文字里解释 ⇒ 不合格（判据见 `validateIntraGroupRelations`）。
  */
+/** 只翻译展示名称，未知类型保留原值供追溯，不推断关系含义。 */
+export function relationKindLabel(kind: string): string {
+  return ({ task_design_ref: "设计依据", design_interface: "模块协作", implementation_map: "实现对应", task_dependency: "工作先后", model_inference: "待核实关系", static_import: "代码引用" } as Record<string, string>)[kind] ?? "关联（类型待说明）";
+}
+
 export function IntraRelationPanel({
   relations,
   title = "同组关系（同一分组内，图上逐条可点开追来源）",
@@ -510,7 +520,7 @@ export function IntraRelationPanel({
                       className="rounded border border-neutral-800 px-1.5 py-0.5"
                     >
                       <summary className="cursor-pointer text-neutral-300" data-intra-relation-summary={r.edge_id}>
-                        {r.kind}：{r.source} → {r.target}
+                        {relationKindLabel(r.kind)}：{r.source} → {r.target}
                       </summary>
                       <ul className="mt-0.5 space-y-0.5">
                         {r.trace_lines.map((l, i) => (
@@ -559,21 +569,21 @@ export function IntraRelationChips({
 }) {
   if (relations.length === 0) return null;
   return (
-    <span className="mt-0.5 flex flex-wrap gap-1" data-intra-chips={anchor} data-intra-chips-count={relations.length}>
+    <span className="tt-intra-chips mt-0.5 flex gap-1" data-intra-chips={anchor} data-intra-chips-count={relations.length}>
       {relations.map((r) => (
         <button
           key={r.id}
           type="button"
           data-intra-chip={r.id}
           data-intra-chip-kind={r.kind}
-          title="同组关系：点开追来源（§3.2）"
+          title={`${relationKindLabel(r.kind)}：点开查看来源（原始类型 ${r.kind}）`}
           onClick={(e) => {
             e.stopPropagation();
             onOpen(r.id);
           }}
           className="rounded border border-purple-700/60 bg-purple-900/30 px-1 py-0.5 text-[9px] text-purple-200 hover:bg-purple-800/40"
         >
-          {r.kind === "design_interface" ? "设计接口" : r.kind}
+          {relationKindLabel(r.kind)}
         </button>
       ))}
     </span>

@@ -46,6 +46,8 @@ import { useProjectScope, type ViewKey } from "./projectScope";
 import { useBoundedReloader, useProjectRefresh } from "./useProjectRefresh";
 // 版本号与 package.json 同源（src/shared/version.ts，构建期内联）——页脚别再写死字面量
 import { APP_VERSION } from "../shared/version";
+import { useTheme } from "./theme";
+import { TowerMark } from "./brand/TowerMark";
 
 /** 选中态存 URL hash：#p/<id>；空 hash = 未选中。
  *  Q65（2026-09-18 审计）：手改/外链 hash 成畸形编码（`#p/%`）时 decodeURIComponent 抛 URIError，
@@ -87,6 +89,8 @@ const AUX_NAV: readonly [ViewKey, string][] = [
 const FULL_HEIGHT_VIEWS: readonly ViewKey[] = ["chat", "terminal", "arch", "live"];
 
 export default function App() {
+  const { theme, toggleTheme } = useTheme();
+  const [agentError, setAgentError] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectItem[]>([]);
   /** 首次拉取还没落地（2026-09-19 试用反馈：这期间渲染空列表＝「暂无项目」，看着像坏了） */
   const [loading, setLoading] = useState(true);
@@ -204,20 +208,13 @@ export default function App() {
   const selected = projects.find((p) => p.id === selectedId) ?? null;
 
   return (
-    <div className="flex h-screen bg-neutral-950 text-neutral-100">
+    <div className="tt-app flex h-screen bg-neutral-950 text-neutral-100">
       {/* ── 左栏（DESIGN.md §3.1）：上半 Agent 管理，下半 项目管理 ── */}
-      <aside className="flex w-64 shrink-0 flex-col border-r border-neutral-800">
-        <header className="border-b border-neutral-800 px-3 py-2.5">
-          <h1 className="text-sm font-bold">塔台 Tatai</h1>
-        </header>
+      <aside className="tt-sidebar flex shrink-0 flex-col border-r border-neutral-800">
+        <header className="tt-brand"><TowerMark className="tt-brand-mark" /><div><h1>塔台</h1><p>项目始终有迹可循</p></div></header>
 
         {/* 上半：Agent 管理（M4：经 MCP 接入的 agent 列表 + 最近活跃时间） */}
-        <section className="border-b border-neutral-800">
-          <h2 className="px-3 pt-2.5 pb-1 text-xs font-semibold text-neutral-400">
-            Agent 管理
-          </h2>
-          <AgentList />
-        </section>
+        <details className="tt-agent-disclosure" open={agentError !== null || undefined}><summary>{agentError === null ? "已接入的 Agent" : "Agent 信息暂时读不到"}</summary><AgentList onErrorChange={setAgentError} /></details>
 
         {/* 下半：项目管理（项目列表 + 添加入口）；P2 在列表上方加「跨项目视图」入口 */}
         <section className="flex min-h-0 flex-1 flex-col">
@@ -289,16 +286,16 @@ export default function App() {
         </section>
         {/* 品牌印记：出品方与版本常驻左栏底部（开源 AGPL-3.0，标识归属见 README） */}
         <div
-          className="border-t border-neutral-800 px-3 py-1.5 text-[9px] text-neutral-700"
+          className="tt-brand-footer border-t border-neutral-800"
           data-brand-footer="tatai"
           title="塔台 Tatai · 杭州三农网络科技有限公司 · GNU AGPL-3.0"
         >
-          Tatai v{APP_VERSION} · 杭州三农网络科技有限公司 · AGPL-3.0
+          <div className="tt-footer-top"><span>Tatai v{APP_VERSION}</span><button data-theme-toggle onClick={toggleTheme} aria-label={theme === "light" ? "切换夜间外观" : "切换浅色外观"} title={theme === "light" ? "切换夜间外观" : "切换浅色外观"} className="tt-theme-toggle"><span aria-hidden="true">{theme === "light" ? "◐" : "◑"}</span><span>{theme === "light" ? "夜间" : "浅色"}</span></button></div><span>杭州三农网络科技有限公司</span><span>GNU AGPL-3.0</span>
         </div>
       </aside>
 
       {/* ── 右栏主区：跨项目视图 / 选中项目 → 顶栏（当前项目·目标·有效版本·保存状态）+ 主导航 ── */}
-      <main className="flex flex-1 flex-col overflow-hidden">
+      <main className="tt-main flex min-w-0 flex-1 flex-col overflow-hidden">
         <ErrorBoundary>
         {crossView ? (
           <CrossProjectView
@@ -310,68 +307,34 @@ export default function App() {
           />
         ) : selected ? (
           <>
-            {/* §3.1 顶部一行：左侧「最近变更 · N 条新」与「版本提醒」两个辅助入口，右侧主导航（五页） */}
-            <div className="flex shrink-0 flex-wrap items-end gap-3 border-b border-neutral-800 px-3 pt-2">
-              <ChangesEntry project={selected} />
-              {/* V06-12：辅助入口「版本提醒」（§3.1）——轻量提醒卡，只读探测；不占主导航、不加 Tab */}
-              <VersionReminder project={selected} />
-              {watchError && (
-                <span
-                  className="pb-1.5 text-[10px] text-red-400"
-                  title={watchError}
-                  data-watch-error="1"
-                >
-                  文件监听未起：{watchError}
-                </span>
-              )}
-              <nav data-main-nav className="ml-auto flex gap-1">
-                {MAIN_NAV.map(([key, label]) => (
-                  <button
-                    key={key}
-                    data-view={key}
-                    onClick={() => patch({ view: key })}
-                    className={`rounded-t px-3 py-1.5 text-xs ${
-                      view === key
-                        ? "border border-b-0 border-neutral-800 bg-neutral-900 text-neutral-100"
-                        : "text-neutral-500 hover:text-neutral-300"
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </nav>
-            </div>
-
-            {/* 辅助入口（§3.1）：终端移到这里，明确标「维护诊断」；不占主导航 */}
-            <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-800 bg-neutral-900/40 px-3 py-1">
-              <span className="text-[10px] text-neutral-500">辅助入口</span>
-              <nav data-aux-nav className="flex gap-1">
-                {AUX_NAV.map(([key, label]) => (
-                  <button
-                    key={key}
-                    data-view={key}
-                    onClick={() => patch({ view: key })}
-                    className={`rounded px-2 py-0.5 text-[11px] ${
-                      view === key
-                        ? "bg-neutral-800 text-neutral-100 ring-1 ring-neutral-600"
-                        : "text-neutral-400 hover:bg-neutral-800"
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </nav>
-              {/* §3.11：必要待决事项在主工作面可见（数量 + 一键跳去处理），不打断工作 */}
-              <PendingDecisions project={selected} onOpen={() => patch({ view: "design" })} />
-              <span className="text-[10px] text-neutral-600">
-                终端仅供维护诊断（用户主导航已移除，§3.1/§3.7）；xterm.js / node-pty 与后端 PTY 通道保留
-              </span>
-            </div>
-
             <ProjectStatusBar project={selected} />
-
-            {/* V09-24（§2.10）：同步证据状态**小摘要入口**——只占状态条下面一行，详情是浮层；
-                不加大页签、不遮图、不挤画布。点开逐项看期望/实际/原因/证据路径。 */}
+            <div className="tt-navigation-row">
+              <nav data-main-nav className="tt-main-nav" aria-label="项目主导航">
+                {MAIN_NAV.map(([key, label]) => (
+                  <button key={key} data-view={key} aria-current={view === key ? "page" : undefined}
+                    onClick={() => patch({ view: key })} className={view === key ? "is-active" : ""}>
+                    {label}
+                  </button>
+                ))}
+              </nav>
+              <div className="tt-project-tools">
+                <ChangesEntry project={selected} />
+                <VersionReminder project={selected} />
+                <PendingDecisions project={selected} onOpen={() => patch({ view: "design" })} />
+                <details className="tt-tools-disclosure">
+                  <summary>更多</summary>
+                  <nav data-aux-nav aria-label="项目辅助入口">
+                    {AUX_NAV.map(([key, label]) => (
+                      <button key={key} data-view={key} aria-current={view === key ? "page" : undefined}
+                        onClick={(event) => { patch({ view: key }); event.currentTarget.closest("details")?.removeAttribute("open"); }}>
+                        {label}
+                      </button>
+                    ))}
+                  </nav>
+                </details>
+              </div>
+            </div>
+            {watchError && <p className="tt-watch-error" title={watchError} data-watch-error="1">项目变化暂未连接：{watchError}</p>}
             <SyncEvidenceStatus project={selected} />
 
             <div
@@ -407,9 +370,9 @@ export default function App() {
         ) : (
           <div className="flex flex-1 items-center justify-center">
             <div className="space-y-2 text-center">
-              <p className="text-lg text-neutral-300">选择一个项目开始</p>
+              <TowerMark className="tt-empty-mark" /><p className="text-lg text-neutral-300">查看你的项目</p>
               <p className="text-xs text-neutral-600">
-                在左侧「项目管理」选择项目，或用「+ 添加项目」登记新目录
+                从左侧选一个项目，了解它的组成、进展和依据。也可以添加已有项目。
               </p>
             </div>
           </div>
@@ -547,52 +510,31 @@ function ProjectStatusBar({ project }: { project: ProjectItem }) {
   }, [error]);
 
   return (
-    <div
-      data-project-status-bar
-      data-connection={error === null ? "ok" : "failed"}
+    <header data-project-status-bar data-connection={error === null ? "ok" : "failed"}
       data-status-stale={error !== null ? "1" : "0"}
       {...(observedAt === null ? {} : { "data-observed-at": observedAt })}
-      className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 border-b border-neutral-800 bg-neutral-900/30 px-3 py-1.5 text-[11px]"
-    >
-      <span data-status-project>
-        当前项目：<span className="text-neutral-200">{project.name}</span>
-      </span>
-      <span data-status-goal>
-        当前目标：
-        <span className="text-neutral-200">
-          {currentTask ?? stage ?? (error === null ? "（读取中…）" : "（上次成功读到的目标仍在上方，连接恢复后更新）")}
-        </span>
-      </span>
-      <span data-status-version>
-        有效版本：
-        <span className="text-neutral-200">
-          {!baselineKnown ? "（读取中…）" : baselineId === null ? "尚未激活基线" : baselineId}
-        </span>
-      </span>
-      <span
-        data-status-save
-        className={error === null ? "text-neutral-400" : "text-amber-300"}
-      >
-        {error === null ? "保存/连接：已连接" : `保存/连接：连接失败（自动重连中）`}
-      </span>
-      <span data-status-observed className="text-neutral-500">
-        观测时间：{observedAt ?? "（还没有成功观测）"}
-      </span>
-      {error !== null && (
-        <span title={error} data-status-error className="min-w-0 flex-1 truncate text-red-400">
-          {error}
-        </span>
-      )}
-      {error !== null && (
-        <button
-          data-status-retry
-          onClick={() => setTick((t) => t + 1)}
-          className="shrink-0 rounded border border-amber-600/50 px-2 py-0.5 text-amber-200 hover:bg-amber-500/20"
-        >
-          重试
-        </button>
-      )}
-    </div>
+      className="tt-project-header">
+      <div className="tt-project-identity">
+        <h2 data-status-project>{project.name}</h2>
+        <p data-status-goal><span>正在推进：</span>{currentTask ?? stage ?? (error === null ? "正在读取项目情况…" : "暂时读不到项目情况")}</p>
+      </div>
+      <details className="tt-status-disclosure">
+        <summary data-status-save className={error === null ? "" : "tt-status-warning"}>
+          <span className="tt-connection-dot" aria-hidden="true" />
+          {error !== null ? "连接失败 · 自动重连中" : observedAt === null ? "连接中…" : "已连接"}
+          <span className="tt-status-chevron" aria-hidden="true">⌄</span>
+        </summary>
+        <div className="tt-status-popover">
+          <p data-status-version>有效版本：{!baselineKnown ? "正在读取…" : baselineId === null ? "尚未激活基线" : baselineId}</p>
+          <p data-status-observed>最近读取：{observedAt ?? "还没有成功读取"}</p>
+          <p>连接正常仅表示读取成功，不代表项目已经验收。</p>
+        </div>
+      </details>
+      {error !== null && <div className="tt-status-error-row">
+        <span title={error} data-status-error>{observedAt === null ? "尚未成功读取项目情况。" : "当前显示上次成功读取的信息。"}{error}</span>
+        <button data-status-retry onClick={() => setTick((t) => t + 1)}>重新读取</button>
+      </div>}
+    </header>
   );
 }
 

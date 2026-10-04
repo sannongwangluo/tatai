@@ -652,7 +652,15 @@ async function main(): Promise<void> {
     );
     const mmByOrigin = mm.counts.by_origin;
     const recount = { code: 0, plan: 0, chat: 0 };
-    for (const n of mm.nodes) recount[(n.origin_layer ?? "code") as "code" | "plan" | "chat"] += 1;
+    // 沿革（2026-10-04 test-repair 定向修正）：既有 F4 契约（src/arch/sixGraphs.ts byOriginOf）明确
+    // 「__more__ 聚合占位不冒充实体」，counts.by_origin 不计聚合占位，本脚本 R-F4 也严格钉住该口径。
+    // 本段旧复算却按 origin_layer 静态相加，一旦代码层 >15（如合成夹具 synth-alpha 240 模块，概览
+    // 14 真实＋1 聚合）就会把聚合占位当成代码模块数进去，与 R-F4 自相矛盾。此处按同一 F4 口径过滤
+    // aggregate===true；每个来源层的精确相等断言与其余检查一律保留，不缩强度。
+    for (const n of mm.nodes) {
+      if (n.aggregate === true) continue;
+      recount[(n.origin_layer ?? "code") as "code" | "plan" | "chat"] += 1;
+    }
     ok(
       mmByOrigin !== undefined && mmByOrigin.code === recount.code && mmByOrigin.plan === recount.plan && mmByOrigin.chat === recount.chat,
       `D 概览 module_map counts.by_origin 逐节点可复算（code=${mmByOrigin?.code}/${recount.code}、plan=${mmByOrigin?.plan}/${recount.plan}、chat=${mmByOrigin?.chat}/${recount.chat}）`,

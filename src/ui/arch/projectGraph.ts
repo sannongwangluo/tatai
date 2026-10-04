@@ -1755,6 +1755,8 @@ export interface DetailSection {
   /** 段名（§3.2 原文顺序，一个字不改） */
   title: string;
   lines: string[];
+  /** 面向人的摘要；原始字段留在 lines，按需展开，不改变证据判据。 */
+  summary?: string[];
 }
 
 /** §3.2 的详情顺序，**顺序即契约**（验证脚本按此断言） */
@@ -1770,6 +1772,12 @@ export const DETAIL_SECTION_ORDER: readonly DetailSectionKey[] = DETAIL_SECTION_
 
 const short = (s: string, n = 12): string => (s.length > n ? `${s.slice(0, n)}…` : s);
 
+/** 仅组成可编辑草稿，保留原话；发送仍由现有聊天入口与用户操作负责。 */
+export function appendObjectQuestionDraft(draft: string, project: { id: string; name: string }, node: Pick<ViewNode, "id" | "label" | "sources">): string {
+  const references = node.sources.map((s) => `- ${s.path} · ${s.locator}${s.sha256 ? `（引用版本 ${s.sha256}）` : ""}`);
+  return `${draft}${draft.length > 0 ? "\n\n" : ""}【围绕项目中的这部分讨论】\n项目：${project.name}（${project.id}）\n对象：${node.label}（${node.id}）\n来源：\n${references.length > 0 ? references.join("\n") : "当前没有可定位的来源，请先核对，勿推测。"}\n\n我想了解这部分的作用、关联和设计依据。请以当前有效资料回答，并明确尚未查清的地方。`;
+}
+
 /**
  * 点击节点的详情五段（§3.2 顺序：作用 → 当前情况与原因 → 设计/施工出处 → 验证结果 → 技术资料）。
  * 状态与原因全部来自 V06-09 的投影（`display_status` / `reasons` / required/passed/missing 计数与缺口），
@@ -1783,7 +1791,7 @@ export function detailSectionsOf(input: {
   /** 状态投影的读取时间（浏览器拿到的这份数据的观测时间，标注清楚是本机读取） */
   received_at?: string;
   /** 证据/缺口引用的文件是否在项目内可读（不给就不说） */
-  merged_nodes?: readonly { id: string; plan_refs?: string[] }[];
+  merged_nodes?: readonly { id: string; plan_refs?: string[]; blurb?: string }[];
 }): DetailSection[] {
   const { node, blueprint: bp } = input;
   const st = node.status;
@@ -1849,11 +1857,37 @@ export function detailSectionsOf(input: {
   if (codeRefs.length > 0) tech.push(`实测模块出处：${codeRefs.map((s) => `${s.path} · ${s.locator}`).join("；")}（静态解析，不是运行时数据流）`);
   tech.push("技术资料口径：静态 import 是代码依赖，不称为运行时业务流（§3.2）；文件级明细进「技术详情」按需下钻");
 
+  const explanation = refs?.blurb?.trim();
+  const roleSummary = [
+    explanation ? `现有图资料说明（自动整理，需核对原文）：${explanation}` : "当前图资料未提供可核对的用途说明。可从下方设计出处继续了解。",
+    "为什么这样设计：当前图资料未提供独立的设计理由，请查阅原始设计，不能用推测补齐。",
+  ];
+  if (node.members.length > 0) roleSummary.push(`这里汇集了 ${node.members.length} 个相关部分，展开原始记录可看完整定位。`);
+  const executionWords: Record<string, string> = { not_started: "尚未开始", in_progress: "正在处理", result_submitted: "已提交制作结果", blocked: "目前受阻", cancelled: "已取消" };
+  const qualityWords: Record<string, string> = { unverified: "尚未检查", mechanical_passed: "自动检查已通过", auditing: "正在复审", has_findings: "检查发现问题", audit_passed: "复审已通过", evidence_invalid: "检查依据已失效" };
+  const acceptanceWords: Record<string, string> = { pending: "等待用户验收", accepted: "用户已接受", rejected: "用户已退回", accepted_known_limit: "用户已接受，并保留已知限制" };
+  const freshnessWords: Record<string, string> = { fresh: "当前记录适用", verification_stale: "内容改过，原检查需复核", impact_unknown: "改动影响尚未查清", unreadable: "当前材料无法读取" };
+  const situationSummary = p === null
+    ? [st.basis, "这里没有可用的独立状态记录，不能据此认为已经完成。"]
+    : [
+        `制作：${executionWords[p.execution] ?? "状态待核对"}；检查：${qualityWords[p.quality] ?? "状态待核对"}。`,
+        `验收：${acceptanceWords[p.acceptance] ?? "状态待核对"}。${freshnessWords[p.freshness] ?? "资料适用性待核对"}。`,
+        ...p.reasons.map((r) => r.text),
+      ];
+  const originSummary = node.sources.length === 0 ? ["当前没有可定位的出处。"] : node.sources.map((s) => `${s.kind === "design_section" ? "设计说明" : s.kind === "plan_task" ? "工作安排" : "代码位置"}：${s.locator} · ${s.path}`);
+  const verificationSummary = p === null ? ["当前没有足够记录可以给出验证结论。"] : [
+    `本对象要求 ${p.required_count} 项检查，通过 ${p.passed_count} 项，仍缺 ${p.missing_count} 项。`,
+    `已检查范围：${p.scope.verified_scope.length === 0 ? "尚无通过记录" : p.scope.verified_scope.join("；")}`,
+    ...(p.scope.uncovered.length > 0 ? [`未覆盖：${p.scope.uncovered.join("、")}`] : []),
+    ...p.missing.map((m) => `还缺：${m.label}。${m.why}`),
+    `用户验收：${acceptanceWords[p.acceptance] ?? "状态待核对"}。`,
+  ];
+
   return [
-    { key: "role", title: "它的作用", lines: role.filter((l) => l !== "") },
-    { key: "situation", title: "当前情况与原因", lines: situation },
-    { key: "origin", title: "设计/施工出处", lines: origin },
-    { key: "verification", title: "验证结果", lines: verification },
+    { key: "role", title: "它的作用", lines: role.filter((l) => l !== ""), summary: roleSummary },
+    { key: "situation", title: "当前情况与原因", lines: situation, summary: situationSummary },
+    { key: "origin", title: "设计/施工出处", lines: origin, summary: originSummary },
+    { key: "verification", title: "验证结果", lines: verification, summary: verificationSummary },
     { key: "tech", title: "技术资料", lines: tech },
   ];
 }

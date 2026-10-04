@@ -198,7 +198,7 @@ function svgEl<K extends keyof SVGElementTagNameMap>(
 
 /** 入口图标：方框图 = 两个小方块 + 连线；流向图 = 一支箭头（都不带文字） */
 function locateGlyph(to: LocateTo, x: number): SVGElement[] {
-  const s = { fill: "none", stroke: "#9ca3af", "stroke-width": 1 } as const;
+  const s = { fill: "none", stroke: "var(--tt-muted)", "stroke-width": 1 } as const;
   const inner =
     to === "MODULE_BOX"
       ? [
@@ -210,7 +210,7 @@ function locateGlyph(to: LocateTo, x: number): SVGElement[] {
           svgEl("path", {
             d: `M${x + 3} 7 H${x + 15} M${x + 12} 4 L${x + 15} 7 L${x + 12} 10`,
             fill: "none",
-            stroke: "#9ca3af",
+            stroke: "var(--tt-muted)",
             "stroke-width": 1.4,
             "stroke-linecap": "round",
             "stroke-linejoin": "round",
@@ -249,7 +249,7 @@ function locateEntry(
   tip.textContent = `${title}（按 module_id 对齐：${id}）`;
   g.append(
     tip,
-    svgEl("rect", { width: 20, height: 14, rx: 3, fill: "#171717", stroke: "#404040", "stroke-width": 1 }),
+    svgEl("rect", { width: 20, height: 14, rx: 3, fill: "var(--tt-surface)", stroke: "var(--tt-border)", "stroke-width": 1 }),
     ...locateGlyph(to, 0),
   );
   g.addEventListener("mousedown", (ev) => ev.stopPropagation());
@@ -1019,6 +1019,10 @@ export function MindMapView({
             </button>
           )}
         </p>
+        {(graph?.budget_exhausted === true || graph?.budget_exhausted === null) && <p className="text-amber-300">{graph?.budget_exhausted === true ? "本次只取得部分模块，未显示的部分不代表不存在。" : "这份旧资料是否完整尚不确定。"}</p>}
+        <details className="tt-graph-tech-notes" data-mindmap-technical-details>
+          <summary>展开与保存说明、来源和技术记录</summary>
+          <div className="tt-graph-tech-content">
         <p
           className="text-neutral-600"
           data-mindmap-budget={
@@ -1085,6 +1089,8 @@ export function MindMapView({
           </span>
           ，刷新/重进按它补回上次展开的那几枝（只补那几枝，不是全量解析）。
         </p>
+          </div>
+        </details>
         {/* V09-13＋V09-20 回归修复（§3.11／§4.2，附录 E.20）：六图共用的「来源与证据」信息栏——
             交付阻断读数与待审线索**合成一条**（健康态不占常驻行，有可行动异常时恰一条，详情为浮层）。
             判据与另五图同一份（`attentionCountsOf`＋`provenance.ts`）：存在未映射/未验证/证据失效时

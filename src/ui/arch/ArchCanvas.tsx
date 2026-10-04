@@ -34,6 +34,7 @@
 //   ⑤ 定位**不改落点**：不写 `layout.json`、不改折叠记忆——已加载但折叠着的枝只把祖先链
 //      就地展开（§3.3 规则 2），子级数据本就在内存里，零新解析请求。
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useTheme } from "../theme";
 import {
   Background,
   Controls,
@@ -96,7 +97,7 @@ import {
   type EvidenceState,
   type ProvenanceModel,
 } from "./provenance";
-import { GraphAttentionBar } from "./ProvenancePanel";
+import { GraphAttentionBar, readableGraphLabel } from "./ProvenancePanel";
 import { planCodeNodeIdOf } from "./projectGraph";
 import {
   ONLY_IN_CODE_CATEGORY_BADGE,
@@ -400,7 +401,7 @@ function ArchNode({ id, data }: NodeProps<ArchFlowNode>) {
           </span>
         )}
         <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${badge.badge}`}>
-          {badge.label}
+          {readableGraphLabel(badge.label)}
         </span>
       </div>
       {/* 第二行放路径/文件数 + 定位入口：第一行是状态徽标行（N3 的入口放那儿会把模块名挤没） */}
@@ -433,7 +434,7 @@ function ArchNode({ id, data }: NodeProps<ArchFlowNode>) {
             </span>
           )}
           <span className="rounded border border-neutral-700 px-1 text-neutral-400" data-arch-source-badge={id}>
-            {data.provenance.source_kind}
+            {readableGraphLabel(data.provenance.source_kind)}
           </span>
           <span
             className={`rounded border px-1 ${
@@ -444,7 +445,7 @@ function ArchNode({ id, data }: NodeProps<ArchFlowNode>) {
             data-arch-evidence-badge={id}
             title="来源与证据标注（§3.2／§4.2）：未映射/未验证/证据失效不给绿，也不省略标注"
           >
-            {data.provenance.evidence_label}
+            {readableGraphLabel(data.provenance.evidence_label)}
           </span>
         </p>
       )}
@@ -611,6 +612,7 @@ export function ArchCanvas({
   provenance,
   showDeliveryReadout = true,
 }: ArchCanvasProps) {
+  const { theme } = useTheme();
   /** V06-06：被喂了共用数据层就走"外部数据"路径（不拉 arch/render、不显示 A5 对账面板） */
   const usingOverride = graphOverride !== null && graphOverride !== undefined;
   /** V09-21 R3：主视图（override）的补 fit 带可读下限（OVERRIDE_FIT_MIN_ZOOM），技术详情维持原口径 */
@@ -1549,8 +1551,8 @@ export function ArchCanvas({
         source: e.from,
         target: e.to,
         label: v.bidirectional ? `↔${e.weight}` : String(e.weight),
-        labelStyle: { fill: "#a3a3a3", fontSize: 11 },
-        labelBgStyle: { fill: "#171717", fillOpacity: 0.85 },
+        labelStyle: { fill: "var(--tt-text)", fontSize: 11 },
+        labelBgStyle: { fill: "var(--tt-surface)", fillOpacity: 0.94 },
         style: {
           stroke: v.color,
           strokeWidth: v.strokeWidth,
@@ -2376,9 +2378,9 @@ export function ArchCanvas({
             const d = node.data as ArchNodeData;
             onNodeClickRef.current?.({ id: node.id, label: d.label, path: d.path });
           }}
-          colorMode="dark"
+          colorMode={theme}
         >
-          <Background gap={20} color="#262626" />
+          <Background gap={24} color="var(--tt-canvas-dot)" />
           <Controls showInteractive={false} />
         </ReactFlow>
       </div>

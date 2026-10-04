@@ -14,6 +14,7 @@
 //   · **布局增量更新不跳动**（§3.3）：坐标走 `layout.mergeIncrementalLayout`——已有节点坐标原样保留。
 //   · **不提供涂色入口**：本文件里没有任何写状态/写颜色的调用（只有读口 + 筛选 + 选中）。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTheme } from "../theme";
 import {
   Background,
   Controls,
@@ -65,6 +66,7 @@ import {
   type ViewFilter,
   type ViewFilterKind,
   type ViewNode,
+  type ViewEdge,
   type SemanticStatusView,
   type GraphUpdateView,
 } from "./projectGraph";
@@ -81,7 +83,7 @@ import {
   type ProvenanceAnnotation,
   type ProvenanceModel,
 } from "./provenance";
-import { GraphAttentionBar, IntraRelationChips, IntraRelationPanel, ObjectProvenanceLines } from "./ProvenancePanel";
+import { GraphAttentionBar, IntraRelationChips, IntraRelationPanel, ObjectProvenanceLines, relationKindLabel, readableGraphLabel } from "./ProvenancePanel";
 import {
   projectMatchedNote,
   projectUnmatchedNote,
@@ -180,7 +182,7 @@ const NodeCard = ({ id, data }: NodeProps<Node<ProjectNodeData, "projectNode">>)
         e.stopPropagation();
         if (!dim) data.onOpen?.(id);
       }}
-      className={`px-3 py-2 ${
+      className={`tt-project-node px-3 py-2 ${
         dim ? "rounded-lg border-2 border-dashed border-neutral-600 bg-neutral-900/70" : "rounded-lg border-2 bg-neutral-900"
       } ${
         data.selected
@@ -228,20 +230,19 @@ const NodeCard = ({ id, data }: NodeProps<Node<ProjectNodeData, "projectNode">>)
           </span>
         )}
         <span className={`shrink-0 rounded border px-1 py-0.5 text-[10px] ${st.text}`}>
-          {data.status === null ? "未映射" : st.short}
+          {readableGraphLabel(data.status === null ? "未映射" : st.short)}
         </span>
       </div>
       <p className="mt-1 text-[10px] text-neutral-500">
-        {data.kind}
+        {{ capability: "项目能力", module: "组成部分", task: "工作安排", concept: "待核实概念", aggregate: "更多部分" }[data.kind] ?? "项目对象"}
         {data.members > 0 ? ` · 代表 ${data.members} 个成员` : ""}
         {data.hidden_members > 0 ? ` · 另有 ${data.hidden_members} 个未显示（聚合，隐藏≠已完成）` : ""}
         {data.endpoint ? " · 关系的端点（非本视图主体）" : ""}
       </p>
-      <p className="mt-1 line-clamp-2 text-[10px] text-neutral-500">{data.status_basis}</p>
       {/* V09-13：来源种类 + 证据状态（同组关系在下面逐条可点开） */}
       <p className="mt-0.5 flex flex-wrap items-center gap-1 text-[9px]">
         <span className="rounded border border-neutral-700 px-1 text-neutral-400" data-project-source-badge={id}>
-          {data.source_kind}
+          {readableGraphLabel(data.source_kind)}
         </span>
         <span
           className={`rounded border px-1 ${
@@ -252,7 +253,7 @@ const NodeCard = ({ id, data }: NodeProps<Node<ProjectNodeData, "projectNode">>)
           data-project-evidence-badge={id}
           title="证据状态由来源与证据判据给出（provenance.ts）：绿＝该对象当前全部必需验证证据有效；用户待验由用户本人记录，Agent 不代签"
         >
-          {data.evidence_label}
+          {readableGraphLabel(data.evidence_label)}
         </span>
       </p>
       {data.intra.length > 0 && data.onOpenRelation !== undefined && (
@@ -276,9 +277,14 @@ export interface ProjectGraphViewProps {
   onLocate?: (req: { id: string; label: string; to: ProjectViewKind | "tech"; from: ProjectViewKind | "tech" }) => void;
   /** 选中变化（页签容器用它记"上次位置"） */
   onSelect?: (node: { id: string; label: string } | null) => void;
+  /** 只生成对象讨论草稿，发送由现有聊天页负责。 */
+  onDiscuss?: (node: ViewNode) => void;
 }
 
-export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: ProjectGraphViewProps) {
+export function ProjectGraphView({ project, view, locate, onLocate, onSelect, onDiscuss }: ProjectGraphViewProps) {
+  const { theme } = useTheme();
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
+  useEffect(() => { setSelectedEdgeId(null); }, [project.id, view]);
   const [blueprint, setBlueprint] = useState<Blueprint | null>(null);
   /** §3.2 草稿图预览：没有已发布规划图时，画的是**未审定草稿**（`blueprint` state 装的是它） */
   const [draft, setDraft] = useState<ArchBlueprintDraft | null>(null);
@@ -598,6 +604,7 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
 
   const openDetail = useCallback(
     (id: string) => {
+      setSelectedEdgeId(null);
       setSelected((prev) => ({ ...prev, [view]: id }));
       setFocused(id);
       const label = modelNodeById.get(id)?.label ?? id;
@@ -634,12 +641,15 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
     // 节点就停在视口外的原始坐标上——"进视图什么都没看到"）
     if (inst === null || !flowReady || empty.state === "loading" || !layoutReady) return;
     if (fitPendingRef.current[view] !== true) return;
-    fitPendingRef.current[view] = false;
     // 两次：第一次趁坐标已写进节点，第二次等尺寸测量完（与 F4 补 fit 同一口径）
     let second = 0;
     const t = requestAnimationFrame(() => {
-      void inst.fitView({ padding: 0.2, maxZoom: 1 });
-      second = requestAnimationFrame(() => void inst.fitView({ padding: 0.2, maxZoom: 1 }));
+      void inst.fitView({ padding: 0.2, minZoom: 0.85, maxZoom: 1 });
+      second = requestAnimationFrame(() => {
+        void inst.fitView({ padding: 0.2, minZoom: 0.85, maxZoom: 1 });
+        // 只有真正执行过才消费首次定位，避免渲染清理取消 rAF 后永久停在 (0, 0)。
+        fitPendingRef.current[view] = false;
+      });
     });
     return () => {
       cancelAnimationFrame(t);
@@ -679,9 +689,11 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
           blueprint,
           view_notes: model?.notes,
           received_at: receivedAt,
-          merged_nodes: (merged?.nodes ?? []).map((n) => ({ id: n.id, plan_refs: n.plan_refs })),
+          merged_nodes: (merged?.nodes ?? []).map((n) => ({ id: n.id, plan_refs: n.plan_refs, blurb: n.blurb })),
         })
       : null;
+  const selectedEdge: ViewEdge | null = model?.edges.find((edge) => edge.id === selectedEdgeId) ?? null;
+  const relatedEdges = selectedNode === null ? [] : (model?.edges ?? []).filter((edge) => edge.from === selectedNode.id || edge.to === selectedNode.id);
 
   // ── 画布数据（三个主视图共用一份构造；架构视图交给 ArchCanvas 画实测模块层）──
   const ownCanvas = useMemo(() => {
@@ -742,8 +754,8 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
         target: e.to,
         className: `te-edge te-edge-${e.semantics}`,
         label: e.semantics === "dependency" ? (e.status === null ? "前置未判" : statusStyle!.short) : spec.label,
-        labelStyle: { fill: "#a3a3a3", fontSize: 10 },
-        labelBgStyle: { fill: "#171717", fillOpacity: 0.85 },
+        labelStyle: { fill: "var(--tt-text)", fontSize: 11 },
+        labelBgStyle: { fill: "var(--tt-surface)", fillOpacity: 0.94 },
         style: {
           stroke: color,
           strokeWidth: 2,
@@ -842,7 +854,7 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
 
   return (
     <div
-      className="flex min-h-0 flex-1 flex-col"
+      className="tt-project-graph flex min-h-0 flex-1 flex-col"
       data-project-view={view}
       data-project-view-kind={PROJECT_VIEWS[view].projection_kind}
       // V09-22：概览/全量（显示全部）模式状态常驻可读
@@ -871,13 +883,16 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
       )}
       {/* §3.2 草稿图：没有已发布的有效图时，画的是未审定草稿——必须一眼看清"这不是有效图" */}
       {draft !== null && (
-        <p
+        <details
           data-project-draft={draft.label ?? "draft_unaudited"}
-          className="shrink-0 border-b border-sky-500/40 bg-sky-500/10 px-3 py-1 text-[11px] text-sky-300"
+          className="tt-graph-notice shrink-0 border-b border-sky-500/40 bg-sky-500/10 px-3 py-1 text-[11px] text-sky-300"
         >
+          <summary>这是尚未审定的草稿图，不能作为施工依据。查看说明</summary>
+          <p>
           {draft.note ?? "草稿图（未审定）：不能当施工依据"}（§3.2）
           {draft.reason != null && draft.reason !== "" ? `；未发布原因：${draft.reason}` : ""}
-        </p>
+          </p>
+        </details>
       )}
 
       {/* V09-12（§3.3 末段 / §4.4）：源变化发现链的更新状态——正在更新时显示**有依据的预计用时**
@@ -899,22 +914,24 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
 
       {/* 图正在更新 / 图已过期：源更新了但新图没就位时**继续显示上次有效图**并标出来（§3.3 / §4.4） */}
       {fresh.banners.map((b) => (
-        <p
+        <details
           key={b}
           data-project-freshness={b.startsWith("图已过期") ? "stale" : "updating"}
-          className="shrink-0 border-b border-amber-500/40 bg-amber-500/10 px-3 py-1 text-[11px] text-amber-300"
+          className="tt-graph-notice shrink-0 border-b border-amber-500/40 bg-amber-500/10 px-3 py-1 text-[11px] text-amber-300"
         >
-          {b}
-        </p>
+          <summary>{b.startsWith("图已过期") ? "图已过期：设计或工作安排改过，新图尚未生成。" : b.startsWith("图内容是") ? "图是当前版本，但自动整理的补充说明尚未生效。" : "新图还未就位，暂时显示上一次有效图。"} 查看原因</summary>
+          <p>{b.replace(/\*\*/g, "")}</p>
+        </details>
       ))}
 
       {/* 工具条：搜索 / 筛选 / 回到全图 / 返回上次位置 / 刷新 + 当前范围 */}
-      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-800 px-3 py-1.5">
+      <div className="tt-graph-toolbar flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-800 px-3 py-1.5">
         <input
           data-project-search
           value={filter.query}
           onChange={(e) => setFilter((f) => ({ ...f, query: e.target.value }))}
-          placeholder="搜索节点名或稳定 ID…"
+          placeholder="查找项目中的部分…"
+          aria-label="搜索节点名称或稳定标识"
           className="w-52 rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-[11px] text-neutral-200"
         />
         <nav className="flex gap-1" data-project-filter-switch>
@@ -936,6 +953,7 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
         </nav>
         <button
           data-project-fit
+          title="首次按可读比例展示，可拖动查看；点此缩放到完整项目图"
           onClick={goFull}
           className="rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-300 hover:bg-neutral-800"
         >
@@ -955,7 +973,6 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
         >
           刷新
         </button>
-        <span className="text-[11px] text-neutral-500">{PROJECT_VIEWS[view].question}</span>
         {scope !== null && (
           <span data-project-scope={scope.note} className="text-[11px] text-neutral-400">
             {scope.note}
@@ -989,11 +1006,13 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
           文字一条不删、DOM 结构不变（读数锚点 `data-project-notes` 原样），超出部分滚动看。
           2026-09-27 用户指令：与同组关系面板（ProvenancePanel.IntraRelationPanel）一样，默认**收起成一行**，
           点开 summary 才回到上面的限高内滚视图；收起≠删内容，`<p>` 逐段一条不少全在 DOM 里。 */}
+      <details className="tt-graph-guide">
+        <summary>图中的数量、连线与分组说明</summary>
       {model !== null && (
         <div data-project-notes={model.notes.join(" | ")} className="shrink-0 border-b border-neutral-800 px-3 py-1">
           <details data-project-notes-fold="1">
             <summary className="cursor-pointer text-[11px] text-neutral-500" data-project-notes-summary="1">
-              口径说明 {model.notes.length} 段 —— 默认收起，点开全文
+              数量与分组说明（{model.notes.length} 段）
             </summary>
             <div className="mt-0.5 max-h-20 space-y-0.5 overflow-y-auto">
               {model.notes.map((n) => (
@@ -1037,8 +1056,9 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
           emptyNote="本视图当前没有同组关系（没有两端落在同一分组的关系）"
         />
       )}
+      </details>
 
-      <div className="flex min-h-0 flex-1">
+      <div className="tt-graph-and-detail flex min-h-0 flex-1">
         {/* V09-20（§3.11）：画布宿主保有**最小可操作高度**——详情浮层已经不占纵向排版（不会再把画布压成 0），
             这一条是兜底：任何上方面板变高的情形下，画布也不至于被挤到点不着。 */}
         <div className="relative flex min-h-[120px] flex-1 flex-col" data-project-canvas-host>
@@ -1118,10 +1138,11 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
                 setFlowReady(true);
               }}
               onPaneClick={() => undefined}
-              colorMode="dark"
+              colorMode={theme}
+              onEdgeClick={(_, edge) => setSelectedEdgeId(edge.id)}
               proOptions={{ hideAttribution: true }}
             >
-              <Background gap={20} color="#262626" />
+              <Background gap={24} color="var(--tt-canvas-dot)" />
               <Controls showInteractive={false} />
             </ReactFlow>
           )}
@@ -1129,12 +1150,26 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
 
         {/* 详情：§3.2 的五段顺序（作用 → 当前情况与原因 → 设计/施工出处 → 验证结果 → 技术资料）
             ＋ V09-13 的「来源与证据」段（来源种类／映射／证据状态／交付阻断与人工待验）。 */}
-        <aside className="w-[380px] shrink-0 overflow-y-auto border-l border-neutral-800 p-3" data-project-detail>
+        <aside className="tt-project-detail shrink-0 overflow-y-auto border-l border-neutral-800 p-3" data-project-detail>
+          <div className="tt-detail-heading">
+            <span>了解项目中的这部分</span>
+            <h2>{selectedNode?.label ?? "从一个方块开始"}</h2>
+          </div>
+          {selectedEdge !== null && (
+            <section className="tt-relation-detail" data-project-edge-detail={selectedEdge.id}>
+              <button className="tt-detail-close" onClick={() => setSelectedEdgeId(null)} aria-label="关闭关系说明">×</button>
+              <h3>{modelNodeById.get(selectedEdge.from)?.label ?? selectedEdge.from} → {modelNodeById.get(selectedEdge.to)?.label ?? selectedEdge.to}</h3>
+              <p>{EDGE_SEMANTICS[selectedEdge.semantics].label}：{selectedEdge.note}</p>
+              <p className="tt-detail-muted">{EDGE_SEMANTICS[selectedEdge.semantics].means}</p>
+              {selectedEdge.sources.length === 0 ? <p>这条关系尚无可定位出处。</p> : selectedEdge.sources.map((source, index) => <p className="tt-detail-muted" key={index}>{source.path} · {source.locator}</p>)}
+              {annotationOf(selectedEdge.id) !== null && <ObjectProvenanceLines annotation={annotationOf(selectedEdge.id)!} />}
+            </section>
+          )}
           {/* V09-13（§3.2 同组关系可点开追来源）：点开一条同组关系 ⇒ 这里显示它的出处行 */}
           {openRelation !== null && relationOf(openRelation) !== null && (
             <section className="mb-3 rounded border border-purple-800/60 bg-purple-950/30 p-2" data-project-relation={openRelation}>
               <h3 className="text-xs font-bold text-purple-200">
-                同组关系（{relationOf(openRelation)!.kind}）
+                {relationKindLabel(relationOf(openRelation)!.kind)}
                 <button
                   data-project-relation-close
                   onClick={() => setOpenRelation(null)}
@@ -1157,20 +1192,40 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
           )}
           {sections === null ? (
             <p className="text-xs text-neutral-500">
-              点一个节点（鼠标点击或键盘 Enter/空格）按「作用 → 当前情况与原因 → 设计/施工出处 → 验证结果 → 技术资料」展开详情。
+              点选方块，了解它的作用、当前情况与依据。你也可以点选连线，查看双方如何关联。
             </p>
           ) : (
             <div className="space-y-3">
               {sections.map((s) => (
-                <section key={s.key} data-detail-section={s.key}>
+                <section key={`${selectedNode?.id}:${s.key}`} data-detail-section={s.key}>
+                  {s.key === "tech" ? (
+                    <details data-detail-technical>
+                      <summary>{s.title}与原始定位</summary>
+                      <ul>{s.lines.map((line, index) => <li key={index}>{line}</li>)}</ul>
+                    </details>
+                  ) : <>
                   <h3 className="text-xs font-bold text-neutral-200">{s.title}</h3>
                   <ul className="mt-1 space-y-0.5">
-                    {s.lines.map((l, i) => (
+                    {(s.summary ?? s.lines).map((l, i) => (
                       <li key={i} className="text-[11px] leading-relaxed text-neutral-400">
                         {l}
                       </li>
                     ))}
                   </ul>
+                  {s.summary !== undefined && <details data-detail-original={s.key}><summary>查看原始记录与定位</summary><ul>{s.lines.map((line, index) => <li key={index}>{line}</li>)}</ul></details>}
+                  </>}
+                  {s.key === "role" && selectedNode !== null && (
+                    <div className="tt-related-parts" data-project-related>
+                      <h3>与哪些部分有关</h3>
+                      {relatedEdges.length === 0 ? <p>当前视图没有跨方块的直接关系；组内关系可在方块上的关系标记中查看。</p> : relatedEdges.map((edge) => {
+                        const otherId = edge.from === selectedNode.id ? edge.to : edge.from;
+                        return <div className="tt-related-row" key={edge.id}>
+                          <button onClick={() => openDetail(otherId)}>{modelNodeById.get(otherId)?.label ?? otherId}</button>
+                          <button data-project-related-edge={edge.id} onClick={() => setSelectedEdgeId(edge.id)}>{EDGE_SEMANTICS[edge.semantics].label} ↗</button>
+                        </div>;
+                      })}
+                    </div>
+                  )}
                 </section>
               ))}
               {/* §3.2／裁定 6：共享模块所属的**全部分组**可查——分组节点详情里，把同属多个分组的成员
@@ -1201,14 +1256,16 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
               {/* V09-13：来源与证据标注段（逐条列出来源种类、映射、证据状态与阻断；取不到标注如实写"没有标注"） */}
               {selectedNode !== null && (
                 <section data-detail-section="provenance" data-detail-provenance={selectedNode.id}>
-                  <h3 className="text-xs font-bold text-neutral-200">来源与证据（V09-13）</h3>
+                  <h3 className="text-xs font-bold text-neutral-200">来源与证据</h3>
                   {annotationOf(selectedNode.id) === null ? (
                     <p className="mt-1 text-[11px] text-neutral-500" data-provenance-missing={selectedNode.id}>
-                      服务端这一版还没给这个对象的来源/证据标注（**不猜**：没有标注就不写"已验证"）
+                      当前没有这个对象的来源与证据记录，尚不能确认已验证。
                     </p>
                   ) : (
                     <div className="mt-1">
-                      <ObjectProvenanceLines annotation={annotationOf(selectedNode.id)!} />
+                      <p>{annotationOf(selectedNode.id)!.evidence_state_label}</p>
+                      {annotationOf(selectedNode.id)!.blockers.map((reason, index) => <p key={index}>{reason}</p>)}
+                      <details><summary>展开来源、检查证据与原始定位</summary><ObjectProvenanceLines annotation={annotationOf(selectedNode.id)!} /></details>
                     </div>
                   )}
                 </section>
@@ -1251,6 +1308,12 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect }: 
                         在{PROJECT_VIEWS[v].label}定位
                       </button>
                     ))}
+                </div>
+              )}
+              {selectedNode !== null && onDiscuss !== undefined && (
+                <div className="tt-object-discussion">
+                  <button data-project-discuss onClick={() => onDiscuss(selectedNode)}>围绕这部分提问 →</button>
+                  <p>带上当前对象和来源，追加到已有草稿。进入聊天后可编辑并发送。</p>
                 </div>
               )}
             </div>

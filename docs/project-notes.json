@@ -1,0 +1,880 @@
+{
+  "schema_version": 1,
+  "doc": "project-notes",
+  "notes": [
+    {
+      "id": "tatai:project-entry",
+      "responsibility": "只读接续入口：给出有效基线、上下文清单、当前变更、未结束 run、下一动作与理由、必读原文；不认领、不写事件、不调模型。",
+      "paths": [
+        "src/server/work/entry.ts",
+        "src/mcp/tools/projectEntry.ts"
+      ],
+      "interfaces": [
+        "evaluateProjectEntry(input, opts)（entry.ts:1855）",
+        "MCP project_entry（projectEntry.ts:65）",
+        "MCP claim_task（projectEntry.ts:182）",
+        "MCP submit_task_result（projectEntry.ts:334）",
+        "capabilityOf / roleClassOf / roleMatches（entry.ts:210/298/311）"
+      ],
+      "constraints": [
+        "只读：不提交事件、不写文件、不认领、零模型调用（entry.ts:3-9）",
+        "next_action 恰好七个枚举 resume_task/claim_task/review_result/await_role/await_decision/blocked/complete；『没有就绪任务不等于项目完成』（entry.ts:73-115）",
+        "client_capabilities 未声明一律按『仅可读取』处理，只读客户端只拿读取与接续指令（entry.ts:28-29,163-172）",
+        "不读历史七步 Gate 当门禁；有效性由有效基线/执行授权/依赖质量/角色能力/现场安全共同决定（entry.ts:117-120）",
+        "现场读不出、基线绑定的图纸修订失效、未审定基线、同步阻断或依赖未满足 → blocked/await_decision，不派活、不报假 complete（entry.ts:11-24,619-658）。设计书比较内容哈希，施工图优先比较定义哈希（派生状态、时间与执行日志不计入定义）；不是任意源码变化都使基线失效"
+      ],
+      "relations": [
+        {
+          "to": "tatai:task-claim",
+          "kind": "separates",
+          "note": "入口只读，认领是另一条原子写"
+        },
+        {
+          "to": "tatai:context-package",
+          "kind": "uses",
+          "note": "context_manifest 取 context.ts 的包"
+        },
+        {
+          "to": "tatai:six-graphs",
+          "kind": "uses",
+          "note": "MCP 入口另带 graph_summary（projectEntry.ts:161/173 调 sixGraphs.graphSummaryOf）；完整状态走 get_project_graphs"
+        },
+        {
+          "to": "tatai:sync-evidence",
+          "kind": "gated_by",
+          "note": "sync_summary 与 claim/写口同一份 computeSyncBlock 判据"
+        },
+        {
+          "to": "tatai:task-state-projection",
+          "kind": "uses",
+          "note": "任务状态来自 tasks.ts 投影"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/entry.ts",
+          "sha256": "8d51d9fea52fcfc94c68b86a6fdb67caea38400cae9109a436813c7df9e0a4d4"
+        },
+        {
+          "path": "src/mcp/tools/projectEntry.ts",
+          "sha256": "1f4416f0551b1127d0ced878634641ec0c5d00753f748060bc673d990cd09fcb"
+        }
+      ],
+      "task_ids": [
+        "V06-10",
+        "V09-31",
+        "V09-34"
+      ],
+      "tests": [
+        "scripts/verify-v06-10.ts",
+        "scripts/verify-unified-entry.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:context-package",
+      "responsibility": "分层上下文包：按 项目简报→相关任务/章节→按需原文 取回，带可信覆盖账本、陈旧/增量失效与检查点续接。",
+      "paths": [
+        "src/server/work/context.ts"
+      ],
+      "interfaces": [
+        "buildContextPackage(projectId, opts)（context.ts:921）",
+        "refreshContextPackage / packageStaleness / getContextPackage（context.ts:1364/1328/783）",
+        "CoverageLedger（context.ts:202）",
+        "buildResumeCheckpoint / saveCheckpoint / loadCheckpoint / resolveCheckpoint（context.ts:1488/1536/1550/1586）"
+      ],
+      "constraints": [
+        "覆盖账本只认真实回执：请求过 ≠ 读到、读了一段 ≠ 读完全文件、清单 ≠ 理解（context.ts:6-8）",
+        "包是派生物不进事实源；进程内包注册表上限 50，超出按最早建淘汰（context.ts:58-59,779-781）",
+        "检查点落 <项目根>/.工作台/work/context-resume.json；已确认来源按当前内容哈希重新核对——未变不重读、变了明确作废（SOURCE_CHANGED）；续接位置区分旧 tctx1（read_file 消费）与新 tcur1（read_design/read_plan 消费），指对工具（context.ts:13-15,1479-1485,1586-1638）",
+        "task_state 来源的内容身份是真实字节 sha256，不拿 last_seq 冒充（context.ts:766-771）",
+        "来源状态只认 ok/truncated/failed/binary_excluded/not_read，未取到的范围不宣称 covered（context.ts:109-110）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:continuation-cursor",
+          "kind": "uses",
+          "note": "分页/续读游标用共享 tcur1 编解码"
+        },
+        {
+          "to": "tatai:project-entry",
+          "kind": "used_by",
+          "note": "入口的 context_manifest 来自本包"
+        },
+        {
+          "to": "tatai:project-notes-index",
+          "kind": "uses",
+          "note": "说明索引存在时作为可选来源纳入来源清单（context.ts:989-1008）"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/context.ts",
+          "sha256": "0031ce3db4b3504d97cb5aeeeb2ffafa5244155b7eda83aa1d1ed4b18d519d7f"
+        },
+        {
+          "path": "src/shared/continuationCursor.ts",
+          "sha256": "70017fe5da73edd7b5a7226bef05f67d504e96a3314c5a60b6e8aa4538b5af3d"
+        }
+      ],
+      "task_ids": [
+        "V06-04",
+        "V09-33",
+        "V09-39"
+      ],
+      "tests": [
+        "scripts/verify-v06-04.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:continuation-cursor",
+      "responsibility": "续读游标的纯编解码与校验：完整来源内容 sha256 + 项目/文档绑定，并实现按游标取下一页。",
+      "paths": [
+        "src/shared/continuationCursor.ts",
+        "src/server/work/continuation.ts"
+      ],
+      "interfaces": [
+        "makeProjectCursor / parseProjectCursor / verifyProjectCursor / isLegacyCursor（continuationCursor.ts:56/79/110/95）",
+        "readContinuationPage(input)（continuation.ts:107）",
+        "continuationPayload / findContinuationCursors（continuation.ts:196/217）",
+        "CONTINUATION_PERSISTENCE（continuation.ts:34；restart_safe=true）"
+      ],
+      "constraints": [
+        "游标形态 tcur1:<doc>:<bind16>:<fullsha64>:<unit>:<start>，带完整 64 位内容 sha 与项目/文档绑定；旧 tctx1 短前缀只定位、明确失效并要求重取（continuationCursor.ts:4-9,95-97）",
+        "纯编解码模块（**仅 src/shared/continuationCursor.ts**）：不读盘、不写盘、不 import 服务端模块（continuationCursor.ts:23）；消费端 src/server/work/continuation.ts 另 import ./documents 的 sha256Hex/sliceDocumentLines，不属该纯模块范围",
+        "游标无状态、由调用当刻现读的完整内容哈希派生，不引用服务端内存包注册表：**重启后只要源未变，旧游标依然可续读**（persistence.restart_safe=true），只有源变（完整 64 位 sha 不符）才报 SOURCE_CHANGED；旧 tctx1 短前缀另按 LEGACY_CURSOR 明确拒绝（continuation.ts:34-43,111-122；continuationCursor.ts:110-146）",
+        "绝不返回空页成功：起点超末行或落在末尾空行 → RANGE_EXHAUSTED 明确失败（continuation.ts:104-106,169-178）",
+        "unit=bytes 在解析层保留（UNITS 含 bytes），消费端明确拒绝而非近似处理（continuationCursor.ts:87；continuation.ts:134-140）",
+        "校验顺序固定：跨文档 → 完整内容哈希不同 → 跨项目绑定不符（continuationCursor.ts:105-146）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:context-package",
+          "kind": "shared_contract",
+          "note": "两侧各自 import 同一份 shared/continuationCursor.ts 常量 CONTINUATION_PAGE_MAX_CHARS（在此定义），彼此不 import（continuation 不依赖 context，共享件即为此设、避免成环）（continuationCursor.ts:34-43）"
+        },
+        {
+          "to": "tatai:project-entry",
+          "kind": "used_by",
+          "note": "入口的 context_manifest 带续读游标（由 context.ts 用共享 tcur1 编解码生成，源变后按当前原文重建）"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/shared/continuationCursor.ts",
+          "sha256": "70017fe5da73edd7b5a7226bef05f67d504e96a3314c5a60b6e8aa4538b5af3d"
+        },
+        {
+          "path": "src/server/work/continuation.ts",
+          "sha256": "473485052f6c44f6978f7cafa8c63c33c6e849d3276fcc7f8ec9278a5a6a81d9"
+        }
+      ],
+      "task_ids": [
+        "V09-32",
+        "V09-33"
+      ],
+      "tests": [
+        "scripts/verify-unified-materials.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:task-claim",
+      "responsibility": "任务认领、续约、释放：带 expected_revision 的原子领取、租约判定与隔离工作目录口径。",
+      "paths": [
+        "src/server/work/claims.ts"
+      ],
+      "interfaces": [
+        "claimTask / renewClaim / releaseClaim（claims.ts:488/754/854）",
+        "leaseStateOf / DEFAULT_LEASE_MS / LEASE_NOTE（claims.ts:102/62/59）",
+        "WORKSPACE_ROOT_REL / defaultWorkspace / RESUME_PRECONDITIONS（claims.ts:65/116/68）",
+        "TaskClaim / ClaimRecord（claims.ts:75/124）"
+      ],
+      "constraints": [
+        "领取是带预期版本的单独一次原子写；版本不符由唯一写入服务拒绝，失败者重新读状态、不重复开工（claims.ts:3-6）",
+        "租约到期只表示『当前所有权需核实』，不证明旧进程已停止；重派/续写要核实依据 takeover_basis/ownership_basis（claims.ts:7-9,58-59）",
+        "本模块不自己追加事件，一律走 ClaimSubmitter（进程内唯一写入服务或 MCP 转接客户端）（claims.ts:6）",
+        "不承诺 exactly-once：目录隔离与进程终止由执行器落实，不靠 token 自动保护（claims.ts:11）",
+        "只读入口不认领：认领写口只有本模块（claims.ts:12）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:task-result-submission",
+          "kind": "feeds",
+          "note": "认领 token 供后续提交校验"
+        },
+        {
+          "to": "tatai:project-entry",
+          "kind": "used_by",
+          "note": "入口给 expected_revision 与候选，认领单独走写口"
+        },
+        {
+          "to": "tatai:work-service-writer",
+          "kind": "depends_on",
+          "note": "事件只经唯一写入服务提交"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/claims.ts",
+          "sha256": "0090e05f7f2e6021f71f79ecd9ff68d1c693302ed28d531aee4594f4715a2e67"
+        }
+      ],
+      "task_ids": [
+        "V06-10"
+      ],
+      "tests": [
+        "scripts/verify-v06-10.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:task-result-submission",
+      "responsibility": "结果提交的五查（版本/依赖/认领/租约/证据）与幂等重试；受控重开与阶段自报的写边界核实。",
+      "paths": [
+        "src/server/work/claims.ts",
+        "src/mcp/tools/projectEntry.ts"
+      ],
+      "interfaces": [
+        "submitTaskResult(input, deps)（claims.ts:998）",
+        "SubmitResultInput / SubmitResultSuccess（claims.ts:908/946）",
+        "reopenTask / reopenIdempotencyKey（claims.ts:1443/1434）",
+        "reportTaskPhase / verifyTaskPhaseCommand（claims.ts:1757/1649）",
+        "MCP submit_task_result（projectEntry.ts:334）"
+      ],
+      "constraints": [
+        "任何一查不过即明确拒绝并给重新读状态的入口；查过才写 task.result_submitted（claims.ts:994-997）",
+        "响应丢失后同一结果请求重发必须拿回原回执 duplicate，不因状态已推进先报 VERSION_CONFLICT（claims.ts:1013-1014）",
+        "evidence_refs 必须 ≥1：无证据的『完成』不收（claims.ts:920-921）",
+        "runtime_entries 形状复用 runtimeEntries.ts；非法登记读侧按 EVENT_INVALID，不静默丢一条入口（claims.ts:931-939）",
+        "reopen 为协调器专用，必须带可取回 reopen_basis，重开不产生执行事实、不恢复旧绿（claims.ts:1443；projectEntry.ts:187-189）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:task-claim",
+          "kind": "depends_on",
+          "note": "复用认领 token/租约现场"
+        },
+        {
+          "to": "tatai:task-state-projection",
+          "kind": "writes",
+          "note": "提交产生 task.result_submitted，由投影折叠"
+        },
+        {
+          "to": "tatai:work-evidence",
+          "kind": "references",
+          "note": "evidence_refs 指向不可变证据"
+        },
+        {
+          "to": "tatai:work-service-writer",
+          "kind": "depends_on",
+          "note": "事件经唯一写入服务提交"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/claims.ts",
+          "sha256": "0090e05f7f2e6021f71f79ecd9ff68d1c693302ed28d531aee4594f4715a2e67"
+        },
+        {
+          "path": "src/mcp/tools/projectEntry.ts",
+          "sha256": "1f4416f0551b1127d0ced878634641ec0c5d00753f748060bc673d990cd09fcb"
+        }
+      ],
+      "task_ids": [
+        "V06-10",
+        "V09-27",
+        "V09-10"
+      ],
+      "tests": [
+        "scripts/verify-v06-10.ts",
+        "scripts/verify-progress-reporting.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:task-state-projection",
+      "responsibility": "任务运行状态投影：从已提交事件折出状态，并派生 v1 兼容投影 tasks.json 与施工图状态区。",
+      "paths": [
+        "src/server/work/tasks.ts"
+      ],
+      "interfaces": [
+        "foldTaskStates / readTaskStates（tasks.ts:263/432）",
+        "alignDefinitionsAndStates / alignPlanWithWork（tasks.ts:533/597）",
+        "buildCompatTasksProjection / hasV2ProjectionMarker（tasks.ts:886/847）",
+        "renderPlanStatusRegion / writePlanStatusProjection（tasks.ts:971/1015）",
+        "RESULT_SUBMITTED_MEANING / TASK_EVENT_TYPES（tasks.ts:62/65）"
+      ],
+      "constraints": [
+        "events.jsonl 是唯一事实源；work/state.json 是可重建快照（canonical 投影，由 WorkService 从已提交事件重放）——本模块只折事件、不自己写 state（tasks.ts:3-6）",
+        "定义与状态严格分离：状态变化不修改定义哈希，绑定换了要产生 task.rebound，不静默换输入（tasks.ts:15-17）",
+        "result_submitted 只表示执行者已交结果，不等于审计通过、不等于人工验收接受（tasks.ts:57-62）",
+        "tasks.json 是兼容投影（带 projection_of: work/events.jsonl）；旧 v1 写工具看到标记必须拒写（tasks.ts:7-10,847）",
+        "施工图状态区写回默认关闭，必须显式 allowRealDocuments 才落盘（tasks.ts:11-13）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:event-ledger-store",
+          "kind": "depends_on",
+          "note": "状态投影输入来自事件账本"
+        },
+        {
+          "to": "tatai:task-result-submission",
+          "kind": "derived_from",
+          "note": "折出 result_submitted 状态"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/tasks.ts",
+          "sha256": "d73fdae22297756fece92562b79abd214df84d2b3b739d90f8099ab7d42801db"
+        }
+      ],
+      "task_ids": [
+        "V06-03",
+        "V07-02"
+      ],
+      "tests": [
+        "scripts/verify-v06-03.ts",
+        "scripts/verify-definition-align.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:event-ledger-store",
+      "responsibility": "v2 事件账本的落盘、重放与增量读取：events.jsonl 是唯一事实源，state.json 是可重建快照。",
+      "paths": [
+        "src/server/work/eventStore.ts",
+        "src/server/work/ledgerRead.ts"
+      ],
+      "interfaces": [
+        "loadEvents / loadEventsFull（eventStore.ts:103/115）",
+        "appendEventDurable（eventStore.ts:231）",
+        "buildSnapshot / replayEvents（eventStore.ts:319/309）",
+        "recoverTail / writeProjectionError / readSnapshotFromDisk（eventStore.ts:161/694/499）",
+        "readLedger / peekLedgerEntry / setLedgerFoldBase（ledgerRead.ts:334/498/534）"
+      ],
+      "constraints": [
+        "落盘顺序：校验→追加完整事件并 fsync→返回提交序号→更新投影；投影失败只记 projection-error.json，绝不回删事件（eventStore.ts:7-10）",
+        "中段损坏任何读路径直接抛 MIDDLE_CORRUPT（带行号）；残缺尾行只在写入路径/显式 recover 时隔离到 quarantine/ 并截回，绝不粘行（eventStore.ts:12-15）",
+        "判『内容未变』只看本次现读的真实字节摘要，不看 mtime/size/seq/监听/TTL（ledgerRead.ts:7-9）",
+        "重放三项结构不变量任一不成立即抛：seq 严格 +1、同实体 revision 严格 +1、幂等键唯一（eventStore.ts:244-307）",
+        "缓存有界（条目/总字节/单条字节/事件条数/单行字节），超限正确退化为每次全量且不落新缓存文件（ledgerRead.ts:13-19,44-57）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:work-service-writer",
+          "kind": "written_by",
+          "note": "唯一写口调用 appendEventDurable 后再投影"
+        },
+        {
+          "to": "tatai:event-snapshot-cache",
+          "kind": "feeds",
+          "note": "增量折叠以本层现读内容为证明"
+        },
+        {
+          "to": "tatai:task-state-projection",
+          "kind": "feeds",
+          "note": "状态投影的输入"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/eventStore.ts",
+          "sha256": "8f602c132bd6b02c041a275fd28960b4ec8d89e9ec4f77200dab5074ecb39b77"
+        },
+        {
+          "path": "src/server/work/ledgerRead.ts",
+          "sha256": "728808b1548cd4e4ec378d6af7564bfa28cb42019268f25e614eb76b85200690"
+        }
+      ],
+      "task_ids": [
+        "V06-01",
+        "V09-38"
+      ],
+      "tests": [
+        "scripts/verify-v06-01.ts",
+        "scripts/verify-unified-incremental.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:event-snapshot-cache",
+      "responsibility": "可验证的快照增量复用：按已证明的前缀只折新增后缀，并按本次现读账本核验磁盘 state.json 基线。",
+      "paths": [
+        "src/server/work/eventReadCache.ts"
+      ],
+      "interfaces": [
+        "snapshotFromLedger(workDir, projectId, opts)（eventReadCache.ts:68）",
+        "snapshotBaseFromDisk(workDir, read, projectId)（eventReadCache.ts:129）",
+        "cachedLedgerKey(workDir)（eventReadCache.ts:177）"
+      ],
+      "constraints": [
+        "只有本次现读前缀摘要与基线一致、且边界 seq+event_id 双重指认成立时才只折新增后缀，否则全量重折（eventReadCache.ts:61-67）",
+        "磁盘 state.json 必须带 source_fp 且做 canonical replay 核验派生实体；来源指纹只证明账本字节没变，证不了派生被篡改（eventReadCache.ts:10-14,111-127）",
+        "**磁盘基线核验路径**（snapshotBaseFromDisk）不省解析、不省 fold——它是『能不能信这份磁盘派生』的正确性闸门，不是提速手段，通不过明确回退全量（eventReadCache.ts:111-127）；**省工作量的真实路径是进程内前缀复用**（snapshotFromLedger 的 parse 缓存＋增量 fold，eventReadCache.ts:3-5,61-98）",
+        "返给折叠层的实体是规范重放的结果而非磁盘原件，seen_keys 按现读事件重建（eventReadCache.ts:121-123,152-166）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:event-ledger-store",
+          "kind": "depends_on",
+          "note": "建立在同一现读账本与解析缓存之上"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/eventReadCache.ts",
+          "sha256": "6532be796f75def215ce75bd4a315577f25a9442076491edacb7667ddfe4f4b1"
+        }
+      ],
+      "task_ids": [
+        "V09-38"
+      ],
+      "tests": [
+        "scripts/verify-unified-incremental.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:work-service-writer",
+      "responsibility": "唯一写入服务与写所有权仲裁：v2 事实只有一条写入路径，stdio MCP 只转接；宿主冷启动/退出按描述符 pid+token 仲裁。",
+      "paths": [
+        "src/server/work/service.ts",
+        "src/server/work/serviceOwnership.ts"
+      ],
+      "interfaces": [
+        "WorkService.submit / WorkService.assertWriteOwner（service.ts:511/497）",
+        "WorkServiceClient / ensureWorkService（service.ts:1406/1541）",
+        "readDescriptorState / readOwnership（serviceOwnership.ts:52/104）",
+        "descriptorBelongsTo / publishUnderOwnershipLock（serviceOwnership.ts:124/160）",
+        "removeDescriptorIfOwned / removeDescriptorIfDead（serviceOwnership.ts:235/212）"
+      ],
+      "constraints": [
+        "v2 事实只有一条写入路径；stdio MCP 不自己追加事件，只做转接（service.ts:1-11）",
+        "submit()/repair() 在各自实际锁内提交前调 assertWriteOwnership，覆盖慢 body 竞态（service.ts:475-478,582-587）",
+        "服务不可达 → 写报 SERVICE_UNAVAILABLE 零字节；读取退化为磁盘最后一份快照并标 stale（service.ts:7-8）",
+        "探活超时 ≠ 进程已停：描述符 pid 仍活（含权限未知）只能报不可达/所有权待核实，绝不另起写者（serviceOwnership.ts:9-13）",
+        "描述符『坏/读不了』是所有权未知，不是无人拥有：既不发布也不删除（serviceOwnership.ts:16-19,148-158）",
+        "发布与撤描述符共用同一把跨进程锁，锁内比对 pid+token 后再删，避免删掉刚被接管的新描述符（serviceOwnership.ts:19,225-234）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:event-ledger-store",
+          "kind": "writes",
+          "note": "唯一写出口落事件并投影"
+        },
+        {
+          "to": "tatai:project-notes-host",
+          "kind": "hosts",
+          "note": "project_index 写路由挂在同一宿主的 workHost"
+        },
+        {
+          "to": "tatai:task-claim",
+          "kind": "gates",
+          "note": "认领等写命令在锁内校验"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/service.ts",
+          "sha256": "b8fa8cdecfc76996e27fdaf1e51077bbd7d11323b3849be14ae41819f7d265e1"
+        },
+        {
+          "path": "src/server/work/serviceOwnership.ts",
+          "sha256": "9ccecd706e4f20fed14119e291230c00bd0ef47261b1fbb013607a293f3816ea"
+        }
+      ],
+      "task_ids": [
+        "V06-01",
+        "V09-29",
+        "V09-14"
+      ],
+      "tests": [
+        "scripts/verify-host-ownership.ts",
+        "scripts/verify-v06-01.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:work-evidence",
+      "responsibility": "证据正文内容寻址落盘、有限源文件清单（source_manifest）与缺陷台账；以及它们在 MCP 的受控上报入口。",
+      "paths": [
+        "src/server/work/evidence.ts",
+        "src/server/work/sourceEvidence.ts",
+        "src/mcp/tools/recordWorkEvidence.ts"
+      ],
+      "interfaces": [
+        "putEvidence / readEvidence / evidenceBlobPath（evidence.ts:146/224/109）",
+        "findingFingerprint / foldFindings / openFinding / transitionFinding（evidence.ts:487/542/884/983）",
+        "buildSourceManifest / verifySourceManifest / readManifestCarrier（sourceEvidence.ts:315/418/564）",
+        "MCP record_work_evidence（recordWorkEvidence.ts:234）"
+      ],
+      "constraints": [
+        "证据正文按 sha256 内容寻址一次性写入；同内容重复提交返回原记录 duplicate、不改写（evidence.ts:4-6,142-145）",
+        "事件里只引用 id/哈希/恢复位置，不把正文塞进事件（evidence.ts:5-6）",
+        "sha256 必须严格 64 位小写十六进制才拼文件名，防路径穿越（evidence.ts:105-113）",
+        "源清单有界、项目内、拒软链/junction 逃逸与凭据/忽略目录；登记时由服务端现读算哈希，客户端给的哈希对不上即拒（sourceEvidence.ts:10-15,46-55）",
+        "作者自检 ≠ 独立审计（审计者须≠作者）；不暴露 human_acceptance/accepted_risk，不接受 role=user 代签用户 Gate（recordWorkEvidence.ts:8-13,43-44）",
+        "没有复现条件的风险标 unverified + risk_not_excluded；关闭必须有独立复测或独立复核误报，修复自述不关闭缺陷（evidence.ts:18-22）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:work-service-writer",
+          "kind": "depends_on",
+          "note": "证据正文落盘走唯一宿主，事件经唯一写入服务"
+        },
+        {
+          "to": "tatai:task-result-submission",
+          "kind": "referenced_by",
+          "note": "提交的 evidence_refs 指向本层不可变证据"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/evidence.ts",
+          "sha256": "fe2edc8b4fe619181162b269c25d111c7954ee07cc50fe17fcfaaae1aa7a0d9c"
+        },
+        {
+          "path": "src/server/work/sourceEvidence.ts",
+          "sha256": "54ce75dc209446b7afb81320822b3eeb9861835cb767513096b50049f659446b"
+        },
+        {
+          "path": "src/mcp/tools/recordWorkEvidence.ts",
+          "sha256": "a501db0c18e9907dae18c76d357417c9852151cb3690ba86f8190b8bbcf2dfaa"
+        }
+      ],
+      "task_ids": [
+        "V06-09",
+        "V09-27",
+        "V09-29"
+      ],
+      "tests": [
+        "scripts/verify-v06-09.ts",
+        "scripts/verify-source-freshness.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:six-graphs",
+      "responsibility": "六图完整当前状态的只读读口与入口摘要：复用既有唯一实现取数，逐对象带状态/证据与来源。",
+      "paths": [
+        "src/arch/sixGraphs.ts",
+        "src/mcp/tools/getProjectGraphs.ts"
+      ],
+      "interfaces": [
+        "sixGraphsOf(projectId, opts)（sixGraphs.ts:708）",
+        "graphSummaryOf(projectId, opts)（sixGraphs.ts:1719）",
+        "SIX_GRAPH_KEYS / SIX_GRAPH_META（sixGraphs.ts:66/85）",
+        "parseSixGraphCursor（sixGraphs.ts:666）",
+        "MCP get_project_graphs（getProjectGraphs.ts:31 tool/95 handler；返回体额外带 graphs_available 清单）"
+      ],
+      "constraints": [
+        "同源：图面与状态复用 blueprint + buildViewModel + render/dataflow/mindmap + provenance/statusColor，界面/HTTP/MCP 同一份（sixGraphs.ts:7-11）",
+        "完整：超安全上限必须给 total/returned/cursor/incomplete 并允许续取，不静默截断后仍称全图（sixGraphs.ts:12-13,138-145）",
+        "complete 只指**本次请求返回的对象**已取完（不含概览聚合隐藏对象，需 mode=full）；顶层 collection（采集完整性 status/budget_exhausted/legacy_other_bucket/reasons/ignored_dir_segments）与分页 complete 语义独立、可同时成立（sixGraphs.ts:384-392,415-434；getProjectGraphs.ts:44-45）",
+        "技术层三图用 origin_layer（code/plan/chat）与 counts.by_origin / by_origin_underlying 区分代码模块与规划层对象——『节点总数』不是『代码模块数』（sixGraphs.ts:280-283,327-336,1156）",
+        "如实：更新中/失败/过期给真实状态与原因；模型待审线索单列；交付读数、next_action、用户 Gate 三事分开（sixGraphs.ts:14-15）",
+        "数据流向图必须分 current_implementation 与 target_semantics 两层；静态 import 只作线索，不得称为已验证业务数据流（sixGraphs.ts:118-127）",
+        "只读：不写盘、不调模型、不给纳管项目加运行时埋点（sixGraphs.ts:17）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:graph-refresh",
+          "kind": "reads_state_from",
+          "note": "更新状态/ETA 来自 graph-update.json"
+        },
+        {
+          "to": "tatai:task-state-projection",
+          "kind": "uses",
+          "note": "节点状态经 statusProjection（eventsSnapshotOf）从 v2 事件证据派生，与 project_entry 同一份 projectWithReleases（sixGraphs.ts:19-21,735-757）"
+        },
+        {
+          "to": "tatai:project-entry",
+          "kind": "used_by",
+          "note": "入口只带摘要，完整状态走本读口"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/arch/sixGraphs.ts",
+          "sha256": "b6c1d09b2bfb9ffc2509f4870d8c34a50bf6757b9c9530730b1ecd8006408258"
+        },
+        {
+          "path": "src/mcp/tools/getProjectGraphs.ts",
+          "sha256": "a4e9763729e909f0aaf5318f6663303f7e52d3ce98c1f463a6289535a3e6d500"
+        }
+      ],
+      "task_ids": [
+        "V09-19"
+      ],
+      "tests": [
+        "scripts/verify-v09-19.ts",
+        "scripts/verify-unified-host.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:graph-refresh",
+      "responsibility": "源变化发现链与图更新状态机：文档源只重算草稿、代码结构变化走安全防抖重解析，并如实报更新状态与有依据的 ETA。",
+      "paths": [
+        "src/server/work/graphRefresh.ts",
+        "src/server/work/graphUpdate.ts"
+      ],
+      "interfaces": [
+        "graphRefreshDispatch / startGraphRefresh / stopGraphRefresh（graphRefresh.ts:792/839/904）",
+        "changeVerdict（graphRefresh.ts:424）",
+        "estimateEta / medianOf（graphUpdate.ts:124/108）",
+        "readGraphUpdate / writeGraphUpdate / markInterrupted（graphUpdate.ts:204/228/241）"
+      ],
+      "constraints": [
+        "文档源变化只重算草稿并标『源已变』；正式图一个字节不动，发布门禁仍只属基线激活链（graphRefresh.ts:7-11）",
+        "代码结构变化走安全防抖（静默窗合批 + 最小间隔 + 滚动窗口轮数预算），run 失败/取消保留旧图并如实写原因（graphRefresh.ts:12-25,29-35）",
+        "触发范围含深层目录/接口文件/跨模块依赖变化，不只顶层目录（graphRefresh.ts:15-24）",
+        "`.工作台/**` 生成物绝不进发现链，防自触死循环（graphRefresh.ts:26-27,800-802）",
+        "ETA 只用可追的实测量（历史中位/阶段外推/等待窗口）；依据不足输出『无法估计』不给数字（graphUpdate.ts:53-54,124-174）",
+        "进程重启/监听被关时把遗留 updating 标 stale 并给原因，不把旧图当新图（graphUpdate.ts:236-256）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:six-graphs",
+          "kind": "feeds",
+          "note": "图更新状态供六图读口"
+        },
+        {
+          "to": "tatai:project-entry",
+          "kind": "feeds",
+          "note": "摘要里的更新中/过期状态"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/graphRefresh.ts",
+          "sha256": "2acb772cdf8f59b247b253190bd1cc625e3c41127a06e20481b7e9b23a08fe54"
+        },
+        {
+          "path": "src/server/work/graphUpdate.ts",
+          "sha256": "503126c4c40399f8b20e46efa0b504fdd84c01132bd4cf376692a7ced0f7823b"
+        }
+      ],
+      "task_ids": [
+        "V09-07",
+        "V09-12"
+      ],
+      "tests": [
+        "scripts/verify-v09-12.ts",
+        "scripts/verify-v09-07.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:project-notes-index",
+      "responsibility": "持久项目说明索引（docs/project-notes.json）的读口（read/impact/coverage）与增量维护实现（upsert/remove）。",
+      "paths": [
+        "src/server/work/projectIndex.ts",
+        "src/mcp/tools/projectIndex.ts"
+      ],
+      "interfaces": [
+        "readProjectNotesIndex / projectIndexImpact / projectIndexCoverage（projectIndex.ts:668/736/828）",
+        "upsertProjectNotes / removeProjectNotes（projectIndex.ts:942/1010）",
+        "validateProjectNotesDocument / normalizeNoteRelPath（projectIndex.ts:337/223）",
+        "projectNotesFileInfo（projectIndex.ts:451）",
+        "MCP project_index（projectIndex.ts tool:33/handler:69）"
+      ],
+      "constraints": [
+        "待审说明层：不是设计、不是事件、不是验收事实；不改六图颜色/状态/Gate，不新增用户 Gate（projectIndex.ts:3-5,588-592）",
+        "read/impact/coverage 只读零副作用：本地读，不 ensure 宿主、不拉 writer、不调模型（projectIndex.ts:7-8；mcp/tools/projectIndex.ts:9）",
+        "增量 upsert/remove 只改指定项、其它条目语义不重写；完整文件 hash 做 CAS（withFileLock 锁内核对）＋临时文件 rename 原子写（projectIndex.ts:9,949-1007）",
+        "写下时现读每个 sources[].path 的当前内容核对完整 sha256，不符即拒，不许编造当前哈希（projectIndex.ts:11,898-916）",
+        "未知字段/重复 id/超条目·字节/路径 `..`·绝对·盘符·UNC·NUL/最终＋中间 junction 逃逸/凭据与忽略目录一律拒（projectIndex.ts:10,48-53,223-240,282-367）",
+        "Agent 声明默认待审：条目自带 evidence 也不能升格为 verified（verification 恒为 declared）（projectIndex.ts:15,588-592）",
+        "未声明 ≠ 无影响：impact 命中不到任何条目时 coverage=unknown，不推断『没有影响』（projectIndex.ts:18-19,782-787）",
+        "同 schema 文档不存在＝明确空索引；同名异 schema 文档明确冲突、不可覆盖也不按本 schema 解析（projectIndex.ts:13-14,413-437）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:project-notes-host",
+          "kind": "written_by",
+          "note": "写经唯一宿主，本模块是宿主内同一份实现"
+        },
+        {
+          "to": "tatai:context-package",
+          "kind": "used_by",
+          "note": "存在时纳入上下文来源清单（projectIndex.ts:451）"
+        },
+        {
+          "to": "tatai:work-service-writer",
+          "kind": "depends_on",
+          "note": "写命令经唯一写入服务宿主"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/projectIndex.ts",
+          "sha256": "5706e34014d14610da378345a8103f038d0a74a70dc5e122594a504d7dfe086a"
+        },
+        {
+          "path": "src/mcp/tools/projectIndex.ts",
+          "sha256": "eb0ec6184b438a52e5df6d316132102f1c5ad4ce29caa4052ab5db038453ff87"
+        }
+      ],
+      "task_ids": [
+        "V09-39"
+      ],
+      "tests": [
+        "scripts/verify-unified-index.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:project-notes-host",
+      "responsibility": "project_index 的唯一宿主写面（HTTP 路由 + token 鉴权 + 写所有权复核）与 MCP 侧转接客户端。",
+      "paths": [
+        "src/server/work/projectIndexHost.ts",
+        "src/server/workHost.ts"
+      ],
+      "interfaces": [
+        "handleProjectIndexRequest(req,res,ctx)（projectIndexHost.ts:160）",
+        "callProjectIndexHost(work, projectId, op, payload)（projectIndexHost.ts:245）",
+        "PROJECT_INDEX_ROUTE_PREFIX（projectIndexHost.ts:22）",
+        "POST /api/work/project-index/upsert|remove（workHost.ts:100-103 委派；桌面宿主逐条登记 index.ts:864-871；两条同登 remote-routes.ts）"
+      ],
+      "constraints": [
+        "读不走本模块：MCP read/impact/coverage 直接本地读，不 ensure 宿主（projectIndexHost.ts:10-11）",
+        "写只经唯一宿主；stdio 进程不自己写 docs/project-notes.json，也不另建写者（projectIndexHost.ts:12）",
+        "token 鉴权必须匹配描述符令牌；body 到达后、实际落盘前再查一次写者身份 assertWriteOwnership（V09-29 慢 body 竞态）（projectIndexHost.ts:13-14,167-174,183,202）",
+        "请求体超 max_file_bytes+256KiB 直接 413 拒绝，不进解析（projectIndexHost.ts:15,24,219）",
+        "宿主不可达 → SERVICE_UNAVAILABLE，绝不在本进程本地代写（projectIndexHost.ts:240-243,253-255）"
+      ],
+      "relations": [
+        {
+          "to": "tatai:project-notes-index",
+          "kind": "hosts",
+          "note": "调用的就是 projectIndex.ts 同一份 upsert/remove"
+        },
+        {
+          "to": "tatai:work-service-writer",
+          "kind": "depends_on",
+          "note": "路由挂在唯一写入服务宿主"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/projectIndexHost.ts",
+          "sha256": "e850857a62b3434f643a4cb66bd8fc9e381597288a81d41152c58a43ae84d565"
+        },
+        {
+          "path": "src/server/workHost.ts",
+          "sha256": "baa52dd4f17f94a53559f069bb425fae5dcb8cc5132f6acb62601d423f687729"
+        },
+        {
+          "path": "src/server/index.ts",
+          "sha256": "c2b3ff76ac3a27a85b319e26de4deae323de002f566abc54670e31fbd737fa5c"
+        }
+      ],
+      "task_ids": [
+        "V09-39"
+      ],
+      "tests": [
+        "scripts/verify-unified-index.ts",
+        "scripts/verify-unified-host-scan.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    },
+    {
+      "id": "tatai:sync-evidence",
+      "responsibility": "同步证据对账：登记应同步清单契约、后台/按需逐项读当前实际目标裁决、按同一判据阻断接续与认领。",
+      "paths": [
+        "src/server/work/sync.ts",
+        "src/server/work/syncChecks.ts",
+        "src/server/work/syncContract.ts",
+        "src/shared/syncEvidence.ts",
+        "src/mcp/tools/syncEvidence.ts"
+      ],
+      "interfaces": [
+        "readSyncStatus（sync.ts:661）",
+        "computeSyncBlock / assertClaimSyncGate（sync.ts:854/886）",
+        "evaluateBatch（syncChecks.ts:404）",
+        "validateSyncContract / contractSourceProblems / supersedeProblems（syncContract.ts:215/392/401）",
+        "MCP register_sync_contract / scan_sync_evidence / read_sync_status（syncEvidence.ts:91/158/74）"
+      ],
+      "constraints": [
+        "证据包的 passed 只是声明；程序必须再按契约读当前实际目标逐项核对（syncChecks.ts:5-7,61-113）",
+        "at_registration 截点＝登记事件 seq−1（由服务确定），历史断言不被未来合法推进阻塞（sync.ts:7；syncEvidence.ts:98-108）",
+        "坏领域事实 fail-closed：不可读/损坏的同步事件当 invalid，不当 not_configured（sync.ts:9）",
+        "不引 sixGraphs（只经注册探针），避免 sync→sixGraphs→entry→sync 环；collectProjectFacts 不读同步态（sync.ts:10）",
+        "直连写口伪造 sync.evidence_checked 在文件锁内按当前实际目标重算并逐项比对，假 passed 零字节（sync.ts:11,886-897）",
+        "来源与目标共用同一锁内读取预算 SYNC_LOCK_REVIEW_MAX_BYTES，超预算明确失败、不静默截断后当通过（syncContract.ts:49-56）",
+        "blocks_entry 批次未当前通过时阻断接续与认领，补证后自动解阻；同步通过只表示登记范围对账通过，不等于业务实现/独立审计/用户 Gate"
+      ],
+      "relations": [
+        {
+          "to": "tatai:work-service-writer",
+          "kind": "depends_on",
+          "note": "扫描写 sync.evidence_checked 只在唯一写服务宿主"
+        },
+        {
+          "to": "tatai:project-entry",
+          "kind": "gates",
+          "note": "sync_summary 与 next_action=blocked 用同一份判据"
+        },
+        {
+          "to": "tatai:task-claim",
+          "kind": "gates",
+          "note": "claim 与直连写口同判据拒绝"
+        },
+        {
+          "to": "tatai:event-ledger-store",
+          "kind": "reads",
+          "note": "折叠同步域事件与业务事件指纹"
+        }
+      ],
+      "sources": [
+        {
+          "path": "src/server/work/sync.ts",
+          "sha256": "e7df0fe264ba05812f07621f5519d21807ef2728277a13f3ed9df647e779a8fd"
+        },
+        {
+          "path": "src/server/work/syncChecks.ts",
+          "sha256": "30144f31d4cf073516475f119aeaa876b5ba4718969c030f6094adccf19ec343"
+        },
+        {
+          "path": "src/server/work/syncContract.ts",
+          "sha256": "7cb7ec8dafd6fee537bcab632bf632f9728a0ba768803f93204df1adb8236140"
+        },
+        {
+          "path": "src/shared/syncEvidence.ts",
+          "sha256": "b1ece9fc0335f9253eb09078ce0c200a1eb65fb74673d6d759c9a5b9bf1486e8"
+        },
+        {
+          "path": "src/mcp/tools/syncEvidence.ts",
+          "sha256": "218d00c74aeb308b0c6bf289a5bb6ed8f198cdd7caef790117be4f8a9e99ad22"
+        }
+      ],
+      "task_ids": [
+        "V09-23"
+      ],
+      "tests": [
+        "scripts/verify-sync-evidence.ts",
+        "scripts/verify-sync-lock-budget.ts"
+      ],
+      "evidence_refs": [],
+      "declared_by": "flash-notes-20261004"
+    }
+  ]
+}

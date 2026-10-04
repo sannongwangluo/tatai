@@ -28,11 +28,12 @@ function relativeTime(iso: string): string {
   return iso.slice(0, 10);
 }
 
-export function AgentList() {
+export function AgentList({ onErrorChange }: { onErrorChange?: (error: string | null) => void } = {}) {
   const [agents, setAgents] = useState<AgentRecord[]>([]);
   /** 首拉落地前 true：渲染「加载中」而不是误导性的「暂无接入 agent」 */
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => { onErrorChange?.(error); }, [error, onErrorChange]);
 
   const load = useCallback(() => {
     return listAgents()

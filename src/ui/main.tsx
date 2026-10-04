@@ -4,6 +4,7 @@ import App from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { installExternalLinkOpener } from "./external-link";
 import "./index.css";
+import { ThemeProvider } from "./theme";
 
 // Q224（2026-09-19 二轮审计）：壳内站外链接交系统浏览器打开，窗口自己不发导航——装在挂载之前，
 // 一次覆盖设计书/聊天/架构图所有 markdown 与第三方渲染的 <a>（口径见 src/ui/external-link.ts）。
@@ -16,10 +17,10 @@ installExternalLinkOpener();
 // 外层这层 div 只为给 fallback（flex flex-1）一个满屏容器；App 自己仍是 h-screen 的布局根。
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <div className="flex h-screen flex-col bg-neutral-950 text-neutral-100">
+    <ThemeProvider><div className="tt-root flex h-screen flex-col bg-neutral-950 text-neutral-100">
       <ErrorBoundary>
         <App />
       </ErrorBoundary>
-    </div>
+    </div></ThemeProvider>
   </StrictMode>,
 );
