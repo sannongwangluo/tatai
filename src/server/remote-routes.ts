@@ -162,6 +162,23 @@ export const REMOTE_ROUTES: readonly RemoteRoute[] = [
     anchors: ['if (req.method === "GET" && reqPath === "/api/work/entry") {'],
     query: "?project_id=:id&role=executor",
   },
+  // ── P2/V09-47（DESIGN §6.11）：结果提交前的**只读预检**路由（`kind: "write"` 沿用远程既有授权规则）──
+  // 语义**只读**（不写事件/证据/租约、不自愈、不产生认领、不是门禁/通行票），但用 POST 承载表单式大对象：
+  // `claim_token` 是**业务**秘密（走 body，避免日志/代理留痕），与**传输**凭据（描述符令牌
+  // `x-tatai-work-token` 头）是两回事——不要把 body 里的 `claim_token` 和头里的服务令牌混同。
+  // 登记为 `kind:"write"`：只读远程模式由远程红线先拒（**不为此改远程授权模式**），本机回环 MCP 才用得到。
+  {
+    id: "work-preflight",
+    method: "POST",
+    path: "/api/work/preflight",
+    kind: "write",
+    note:
+      "唯一宿主**只读**结果预检（P2/V09-47，DESIGN §6.11）：提交前列清可预判缺项 + 锁内未查项单列 not_checked；" +
+      "不写事件/证据/租约、不自愈、不产生认领；`claim_token` 业务秘密走 body（不进 URL），与传输令牌 `x-tatai-work-token` 头不是一回事；" +
+      "只读远程模式下由远程红线先拒（沿用既有远程授权规则，不新增授权模式）",
+    anchors: ['if (req.method === "POST" && reqPath === "/api/work/preflight") {'],
+    body: { project_id: "tatai", task_id: "t1", role: "executor", change_id: "chg-1", claim_token: "业务秘密走 body", expected_revision: 1, evidence_refs: [] },
+  },
   // ── V09-29 集成：V09-27 上报域（证据正文存/读）与 V09-28 正向基线（preserve/activate）──
   // 桌面宿主 `index.ts` 对 work 面**逐条列名**转发，未登记的精确路径会落本文件兜底 404；
   // 这四条与上面六条同款（方法 + 精确路径），用于让 MCP 在桌面宿主下也能拿到证据正文写/读口与基线路由
@@ -338,8 +355,12 @@ export const REMOTE_ROUTES: readonly RemoteRoute[] = [
     method: "GET",
     path: "/api/projects/:id/design",
     kind: "read",
-    note: "设计书全文（S2 四样之一；远程响应裁掉落盘绝对路径 source）",
-    anchors: ['if (req.method === "GET" && sub && sub[2] === "design" && !sub[3]) {'],
+    note:
+      "设计书（S2 四样之一；远程响应裁掉落盘绝对路径 source）。B6/V09-56 增 `document` query：" +
+      "缺省 current（旧 shape 不变）、active 读已批准基线快照、<64hex> 读不可变历史快照；" +
+      "返回追加 source_rel/selection/sections/baseline_history 只读元数据（不新增写口/不建 cache）",
+    anchors: ['if (req.method === "GET" && designReadMatch) {'],
+    query: "?document=current|active|<64 位小写十六进制 sha256>",
   },
   {
     id: "discuss-read",
@@ -454,6 +475,23 @@ export const REMOTE_ROUTES: readonly RemoteRoute[] = [
       "父级「自身集成检查通过」的要求来自施工图的版本化验收定义（随有效基线生效），" +
       "检查结果来自审计/证据事件；本路由不读任何 query 参数（补修 C）",
     anchors: ['if (req.method === "GET" && workProjectionMatch) {'],
+  },
+  // ── B2/V09-52（DESIGN.md §6.12）：功能清单**只读**读口（唯一义务派生 → feature_item[]，四维分开）──
+  {
+    id: "feature-ledger-read",
+    method: "GET",
+    path: "/api/projects/:id/feature-ledger",
+    kind: "read",
+    note:
+      "功能清单只读读口（B2/V09-52，DESIGN.md §6.12）：同一 revision 事实快照 → 唯一义务派生 → feature_item[]" +
+      "（设计覆盖/实现/验证/用户接受四维分开，绿只取 verification；功能范围的必需/集成检查按 PLAN 映射**逐条**判，" +
+      "同卡其他检查不拖累）；`document=active` 读**已批准基线快照**、`<revision>` 读不可变历史快照，读不出即 state=not_derived；" +
+      "`artifact_ref` 必须是**已登记**产物引用（取不到 ⇒ 422）；" +
+      "分页 paging.complete 与来源完整性 coverage.source_complete **分开**；错误 400 INVALID_INPUT／404 PROJECT_NOT_FOUND／" +
+      "409 REVISION_CHANGED／422 SOURCE_INVALID／503 SOURCE_UNAVAILABLE，200 可为 state=not_derived（带 reason+补取入口）；" +
+      "**纯读**：不写事件/证据/租约、不触发扫描、不自愈、不调模型",
+    anchors: ['if (req.method === "GET" && featureLedgerMatch) {'],
+    query: "?scope=current&document=active&limit=50",
   },
   // ── V06-12：Git 保存版本提醒（只读探测；不写工作树、不碰 Git 配置、不联网）──
   {

@@ -1,4 +1,4 @@
-﻿@import "tailwindcss";
+@import "tailwindcss";
 
 /* Hallmark · Workbench / modern-minimal. Semantic themes retain existing status meanings. */
 :root,[data-theme="light"] {
@@ -57,7 +57,7 @@ html,body{overflow-x:clip}body{font-size:14px;line-height:1.65}button,input,text
 .tt-brand-mark{width:28px;height:32px;flex-shrink:0}.tt-brand h1{font-size:22px;font-weight:650;line-height:1.3;letter-spacing:2px}.tt-brand p{font-size:12px;color:var(--tt-muted);white-space:nowrap;margin-top:4px}
 .tt-agent-disclosure{margin:0 12px 12px;border-bottom:1px solid var(--tt-border);padding-bottom:8px}.tt-agent-disclosure summary{font-size:12px;color:var(--tt-muted);padding:4px}.tt-agent-disclosure>ul,.tt-agent-disclosure>div{max-height:240px;overflow:auto;margin-top:8px}.tt-agent-disclosure>p{margin-top:8px}
 .tt-sidebar>section>h2{padding:4px 16px 8px;font-size:12px;color:var(--tt-muted);font-weight:400}
-.tt-brand-footer{padding:12px 16px;color:var(--tt-muted);font-size:12px;line-height:1.7}.tt-brand-footer>span{display:block;font-size:12px}.tt-footer-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}.tt-theme-toggle{display:flex;align-items:center;gap:4px;color:var(--tt-muted);padding:2px 4px;font-size:12px;border-radius:4px}.tt-theme-toggle>span:first-child{font-size:20px;line-height:1}.tt-theme-toggle:hover{background:var(--tt-surface);color:var(--tt-accent)}
+.tt-brand-footer{padding:12px 16px;color:var(--tt-muted);font-size:12px;line-height:1.7;flex-shrink:0;max-height:41vh;overflow-y:auto}.tt-brand-footer>span{display:block;font-size:12px}.tt-footer-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}.tt-theme-toggle{display:flex;align-items:center;gap:4px;color:var(--tt-muted);padding:2px 4px;font-size:12px;border-radius:4px}.tt-theme-toggle>span:first-child{font-size:20px;line-height:1}.tt-theme-toggle:hover{background:var(--tt-surface);color:var(--tt-accent)}
 .tt-project-header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;flex-shrink:0;padding:16px 24px 12px;background:var(--tt-surface);border-bottom:1px solid var(--tt-border)}
 .tt-project-identity{min-width:0;flex:1}.tt-project-identity h2{font-size:21px;font-weight:600;line-height:1.4}.tt-project-identity p{font-size:13px;color:var(--tt-muted);margin-top:4px;overflow-wrap:anywhere}.tt-project-identity p>span{color:var(--tt-subtle)}
 .tt-status-disclosure{position:relative;align-self:flex-start;margin-top:4px;font-size:12px}.tt-status-disclosure summary{display:flex;align-items:center;gap:8px;list-style:none;color:var(--tt-muted);white-space:nowrap}.tt-status-disclosure summary::-webkit-details-marker{display:none}.tt-connection-dot{height:7px;width:7px;border:1.5px solid var(--tt-positive);border-radius:50%}.tt-status-warning{color:var(--tt-warning)!important}.tt-status-warning .tt-connection-dot{border-color:var(--tt-warning)}.tt-status-chevron{color:var(--tt-muted)}
@@ -82,3 +82,153 @@ html,body{overflow-x:clip}body{font-size:14px;line-height:1.65}button,input,text
 :where(.text-emerald-200\/50,.text-emerald-300\/80){color:var(--tt-positive)}
 :where(.text-red-300\/90){color:var(--tt-danger)}
 :where(.text-sky-200\/50){color:var(--tt-info)}
+/* ── B6/V09-56：设计页旁的人话功能清单（只读派生；绿色只在 verification 一档） ── */
+.tt-fl{border:1px solid var(--tt-border);border-radius:8px;background:var(--tt-surface);padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.tt-fl-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.tt-fl-title{font-size:14px;font-weight:600}
+.tt-fl-summary{font-size:12px;color:var(--tt-muted);overflow-wrap:anywhere}
+.tt-fl-note{font-size:12px;color:var(--tt-muted);overflow-wrap:anywhere}
+.tt-fl-muted{font-size:12px;color:var(--tt-muted)}
+.tt-fl-warn{font-size:12px;color:var(--tt-warning);overflow-wrap:anywhere}
+.tt-fl-error{font-size:12px;color:var(--tt-danger);overflow-wrap:anywhere}
+.tt-fl-retry{margin-left:8px;text-decoration:underline;color:var(--tt-accent)}
+.tt-fl-attention{border:1px solid var(--tt-warning);border-radius:6px;background:var(--tt-warning-soft);padding:8px}
+.tt-fl-attention-head{font-size:12px;color:var(--tt-warning);font-weight:600}
+.tt-fl-attention-list{margin:4px 0 0;padding-left:16px;display:flex;flex-direction:column;gap:2px}
+.tt-fl-attention-list li{font-size:12px;color:var(--tt-text);overflow-wrap:anywhere}
+.tt-fl-attention-name{margin-right:6px}
+.tt-fl-attention-why{color:var(--tt-warning)}
+.tt-fl-related{border-left:2px solid var(--tt-border);padding-left:8px}
+.tt-fl-listbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tt-fl-toggle{font-size:12px;color:var(--tt-accent);text-decoration:underline}
+.tt-fl-list{display:flex;flex-direction:column;gap:8px;margin:0;padding:0;list-style:none}
+.tt-fl-item{border:1px solid var(--tt-border);border-radius:6px;padding:8px;display:flex;flex-direction:column;gap:6px;min-width:0}
+.tt-fl-item-verified{border-color:var(--tt-positive)}
+.tt-fl-item-active{border-color:var(--tt-accent);background:var(--tt-accent-soft)}
+.tt-fl-item-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.tt-fl-item-name{font-size:13px;font-weight:600;overflow-wrap:anywhere}
+.tt-fl-id{font-size:12px;color:var(--tt-subtle);font-family:ui-monospace,monospace}
+.tt-fl-badge-green{font-size:12px;color:var(--tt-positive);border:1px solid var(--tt-positive);border-radius:10px;padding:0 6px}
+.tt-fl-desc{font-size:12px;color:var(--tt-text);overflow-wrap:anywhere}
+.tt-fl-dims{display:flex;flex-wrap:wrap;gap:6px 14px}
+.tt-fl-dim{display:flex;align-items:baseline;gap:4px;font-size:12px}
+.tt-fl-dim-label{color:var(--tt-subtle)}
+.tt-fl-dim-value{overflow-wrap:anywhere}
+.tt-fl-approved{color:var(--tt-info)}
+.tt-fl-green{color:var(--tt-positive)}
+.tt-fl-missing{color:var(--tt-warning)}
+.tt-fl-stale{color:var(--tt-warning)}
+.tt-fl-unknown{color:var(--tt-muted)}
+.tt-fl-refs{display:flex;flex-wrap:wrap;gap:6px}
+.tt-fl-ref{font-size:12px;color:var(--tt-accent);text-decoration:underline;text-align:left}
+.tt-fl-ref:disabled{color:var(--tt-muted);text-decoration:none;cursor:default}
+.tt-fl-ref-id{color:var(--tt-subtle)}
+.tt-fl-decisions{margin:0;padding-left:16px;display:flex;flex-direction:column;gap:2px;font-size:12px}
+/* 待决完整长列表默认收起后的展开入口：数量写在入口文字里（数量常显靠本项提醒文案），
+   入口按「可点」提示（accent + 指针 + 键盘可见焦点），内容展开后复用详情限高滚动 */
+.tt-fl-decisions-summary{font-size:12px;color:var(--tt-accent);cursor:pointer}
+.tt-fl-decisions-summary:focus-visible{outline:2px solid var(--tt-accent);outline-offset:2px}
+.tt-fl-decisions-body:focus-visible{outline:2px solid var(--tt-accent);outline-offset:2px}
+.tt-fl-detail>summary{font-size:12px;color:var(--tt-muted)}
+.tt-fl-detail-body{max-height:220px;overflow:auto;margin-top:4px;padding:8px;border:1px solid var(--tt-border);border-radius:6px;background:var(--tt-surface-muted)}
+.tt-fl-dl{font-size:12px;display:grid;grid-template-columns:auto 1fr;gap:2px 8px;margin:0}
+.tt-fl-dl dt{color:var(--tt-subtle);white-space:nowrap}
+.tt-fl-dl dd{margin:0;overflow-wrap:anywhere}
+.tt-fl-paging{display:flex;align-items:center;gap:8px}
+.tt-fl-supplement{border-top:1px solid var(--tt-border);padding-top:8px;display:flex;flex-direction:column;gap:6px}
+.tt-fl-supplement-form{display:flex;gap:8px;align-items:flex-start}
+.tt-fl-input{flex:1;min-width:0;border:1px solid var(--tt-border);border-radius:4px;background:var(--tt-bg);color:var(--tt-text);padding:4px 6px;font-size:12px}
+.tt-fl-supplement-btn{border:1px solid var(--tt-accent);border-radius:4px;color:var(--tt-accent);padding:4px 8px;font-size:12px;white-space:nowrap}
+.tt-fl-supplement-btn:disabled{opacity:.5;cursor:not-allowed}
+/* B6/V09-56：首屏**功能概览**（人话；技术材料在它后面） */
+.tt-ov{border:1px solid var(--tt-border);border-radius:8px;background:var(--tt-surface);padding:12px;display:flex;flex-direction:column;gap:6px;min-width:0}
+.tt-ov-title{font-size:14px;font-weight:600}
+/* 概览页眉的「查看功能清单」快捷入口：默认首屏可见、键盘可聚焦（Codex 最终复核补口） */
+.tt-ov-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.tt-ov-jump{font-size:12px;color:var(--tt-accent);text-decoration:underline;background:none;border:none;padding:0;cursor:pointer;white-space:nowrap}
+.tt-ov-jump:focus-visible{outline:2px solid var(--tt-accent);outline-offset:2px}
+.tt-fl:focus-visible{outline:2px solid var(--tt-accent);outline-offset:2px}
+.tt-ov-summary{font-size:13px;color:var(--tt-text);overflow-wrap:anywhere}
+.tt-ov-block{border:1px solid var(--tt-warning);border-radius:6px;background:var(--tt-warning-soft);padding:8px}
+.tt-ov-block-head{font-size:12px;color:var(--tt-warning);font-weight:600}
+.tt-ov-list{margin:4px 0 0;padding-left:16px;display:flex;flex-direction:column;gap:2px}
+.tt-ov-list li{font-size:12px;color:var(--tt-text);overflow-wrap:anywhere}
+.tt-ov-next{font-size:12px;color:var(--tt-muted);overflow-wrap:anywhere}
+/* 概览「需要你看一眼」：默认只列前几项，其余按需展开；展开区**限高独立滚动**（不吞主区），
+   容器可键盘聚焦后用方向键读（Codex R2：37+ 项默认平铺会把正文与清单挤出首屏） */
+.tt-ov-more{margin-top:4px}
+.tt-ov-more-summary{font-size:12px;color:var(--tt-accent);cursor:pointer;text-decoration:underline}
+.tt-ov-more-summary:focus-visible{outline:2px solid var(--tt-accent);outline-offset:2px}
+.tt-ov-list-scroll{max-height:180px;overflow-y:auto;overscroll-behavior:contain;padding-right:4px}
+.tt-ov-list-scroll:focus-visible{outline:2px solid var(--tt-accent);outline-offset:2px}
+/* 旧版读数：正在切版本时**降级显示**，不把上一版结论当当前结论（Codex 复审 6） */
+.tt-fl-dimmed{opacity:.72}
+.tt-fl-dimmed .tt-fl-badge-green{opacity:.45}
+/* 设计页技术材料区（默认展开，可一键收起；不藏入口、不改既有可达性） */
+.tt-design-details{border:1px solid var(--tt-border);border-radius:8px;background:var(--tt-surface);padding:8px 12px}
+.tt-design-details>summary{font-size:13px;font-weight:600;cursor:pointer;color:var(--tt-text)}
+.tt-design-details[open]>summary{margin-bottom:8px}
+.tt-inline-details{display:inline}
+.tt-inline-details>summary{display:inline;cursor:pointer;color:var(--tt-subtle);font-size:12px;margin-left:6px}
+/* 设计正文标题：稳定 id 锚点 + 可点反向定位 */
+[data-design-heading]{scroll-margin-top:12px}
+[data-design-heading][data-design-heading-active="1"]{background:var(--tt-accent-soft);border-radius:4px}
+[data-design-heading]:hover{cursor:pointer;color:var(--tt-accent)}
+/* 设计页：正文与功能清单并排（窄窗堆叠；清单不吃掉主区） */
+.tt-design-columns{display:grid;grid-template-columns:minmax(0,1fr) minmax(340px,440px);gap:16px;align-items:start}
+@media(max-width:1100px){.tt-design-columns{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:900px){
+  .tt-fl-dim{flex-basis:100%}
+  .tt-fl-detail-body{max-height:160px}
+}
+@media(max-width:620px){
+  .tt-fl{padding:8px}
+  .tt-fl-attention{padding:6px}
+  .tt-fl-supplement-form{flex-direction:column}
+  .tt-fl-supplement-btn{align-self:flex-end}
+}
+/* ── V09-62：交付总览（人的默认项目入口；只读派生，绿色只在服务端明确可试用时出现） ── */
+.tt-dlv{flex:1 1 0;min-height:0;overflow-y:auto;padding:16px 24px 28px;display:flex;flex-direction:column;gap:10px;background:var(--tt-bg)}
+.tt-dlv>*{width:100%;max-width:1080px;margin-inline:auto}
+.tt-dlv-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.tt-dlv-title{font-size:16px;font-weight:650}
+.tt-dlv-sub{font-size:12px;color:var(--tt-muted)}
+.tt-dlv-conclusion{font-size:20px;font-weight:650;line-height:1.4;overflow-wrap:anywhere}
+.tt-dlv-positive{color:var(--tt-positive)}
+.tt-dlv-warning{color:var(--tt-warning)}
+.tt-dlv-neutral{color:var(--tt-text)}
+.tt-dlv-summary{font-size:14px;color:var(--tt-text);overflow-wrap:anywhere}
+.tt-dlv-muted{font-size:12px;color:var(--tt-muted);overflow-wrap:anywhere}
+.tt-dlv-warn{font-size:12px;color:var(--tt-warning);overflow-wrap:anywhere}
+.tt-dlv-error{font-size:12px;color:var(--tt-danger);overflow-wrap:anywhere}
+.tt-dlv-retry{margin-left:8px;text-decoration:underline;color:var(--tt-accent)}
+.tt-dlv-block{border:1px solid var(--tt-border);border-radius:8px;background:var(--tt-surface);padding:10px 12px;display:flex;flex-direction:column;gap:6px}
+.tt-dlv-block-warn{border-color:var(--tt-warning);background:var(--tt-warning-soft)}
+.tt-dlv-block-head{font-size:13px;font-weight:600;color:var(--tt-text)}
+.tt-dlv-list{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px}
+.tt-dlv-list li{font-size:13px;color:var(--tt-text);overflow-wrap:anywhere}
+.tt-dlv-blocker-group{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.tt-dlv-blocker-tag{font-size:13px;font-weight:600}
+.tt-dlv-gate{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.tt-dlv-gate-name{font-size:13px}
+.tt-dlv-state{font-size:12px;border:1px solid var(--tt-border);border-radius:10px;padding:0 6px}
+.tt-dlv-accept{font-size:13px;color:var(--tt-text);overflow-wrap:anywhere;border-left:2px solid var(--tt-border);padding-left:8px}
+.tt-dlv-features{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.tt-dlv-feature{border:1px solid var(--tt-border);border-radius:6px;padding:8px;display:flex;flex-direction:column;gap:5px;min-width:0}
+.tt-dlv-feature-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.tt-dlv-feature-name{font-size:14px;font-weight:600;overflow-wrap:anywhere}
+.tt-dlv-id{font-size:12px;color:var(--tt-subtle);font-family:ui-monospace,monospace}
+.tt-dlv-scenario{font-size:13px;color:var(--tt-text);overflow-wrap:anywhere}
+.tt-dlv-dims{display:flex;flex-wrap:wrap;gap:4px 14px}
+.tt-dlv-dim{font-size:12px;color:var(--tt-text);overflow-wrap:anywhere}
+.tt-dlv-detail>summary{font-size:12px;color:var(--tt-muted);cursor:pointer}
+.tt-dlv-detail-body{max-height:240px;overflow:auto;margin-top:4px;padding:8px;border:1px solid var(--tt-border);border-radius:6px;background:var(--tt-surface-muted);font-size:12px}
+.tt-dlv-dl{display:grid;grid-template-columns:auto 1fr;gap:2px 8px;margin:0}
+.tt-dlv-dl dt{color:var(--tt-subtle);white-space:nowrap}
+.tt-dlv-dl dd{margin:0;overflow-wrap:anywhere}
+.tt-dlv-paging{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tt-dlv-load-more{font-size:12px;color:var(--tt-accent);text-decoration:underline}
+.tt-dlv-load-more:disabled{color:var(--tt-muted);text-decoration:none;cursor:not-allowed}
+.tt-dlv-jumps{display:flex;gap:10px;flex-wrap:wrap;padding-top:4px;border-top:1px solid var(--tt-border)}
+.tt-dlv-jumps button{font-size:12px;color:var(--tt-accent);text-decoration:underline;padding-top:6px}
+@media(max-width:900px){.tt-dlv{padding:12px 16px 20px}.tt-dlv-conclusion{font-size:18px}.tt-dlv-detail-body{max-height:180px}}

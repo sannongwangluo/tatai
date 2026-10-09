@@ -18,6 +18,8 @@ import type { ChangeLine } from "../server/watcher";
 import type { AgentRecord } from "../server/agents";
 import { apiBase } from "./tauri-env";
 import { sharedReadFetch, type RawFetch } from "./sharedRead";
+// P0/V09-45：构建身份类型是浏览器安全的共享模块（零 node 依赖），前端直接复用同一份判定
+import type { BuildIdentity } from "../shared/buildIdentity";
 
 // ── P2：跨项目视图（DESIGN.md §11.2「多项目并行增强」）：GET /api/summary/projects ──
 // 汇总口径（行的字段 / 排序键 / 分桶 / 缺文件合成）全在服务端，见 src/server/projects-summary.ts（P1）
@@ -100,6 +102,21 @@ export async function listAgents(): Promise<AgentRecord[]> {
   const body = (await res.json()) as { ok: true; agents: AgentRecord[] } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.agents;
+}
+
+// ── P0/V09-45（§4.6）：后端构建身份（`GET /health`，无鉴权、同源）──
+// 界面诊断用它与**自身内嵌的 ui 身份**对照偏斜。读不到（后端未起/旧后端无此字段）→ null，调用方按未知处理。
+export interface HealthPayload {
+  ok: boolean;
+  pid?: number;
+  build_identity?: BuildIdentity;
+}
+
+// P0 启动恢复（P0-startup-recovery-contract.md）：`opts.signal` 与其它只读读口同一口径——启动恢复的
+// 重试在卸载/换代时**中止在途请求**（面板复用 `useBoundedReloader` 的 signal）。不传则逐字不变。
+export async function getHealth(opts?: FetchOpts): Promise<HealthPayload> {
+  const res = await apiFetch("/health", fetchInit(opts));
+  return (await res.json()) as HealthPayload;
 }
 
 // ── H2：变更流水（DESIGN.md §3.8 简版：顶部小入口「最近变更 · N 条新」，不占主页面）──
@@ -274,12 +291,18 @@ export async function removeProject(id: string): Promise<ReleaseResult> {
 import type { SharedGraph } from "../arch/shared-graph";
 
 /** A3：GET /api/projects/:id/arch/render —— 渲染数据；exists:false = 未解析（200 空态）。
- *  V09-22：`opts.full=true` 时拼 `?full=1` 取全量上限（同一 builder 的另一组参数，超限仍聚合计数）。 */
+ *  V09-22：`opts.full=true` 时拼 `?full=1` 取全量上限（同一 builder 的另一组参数，超限仍聚合计数）。
+ *  2026-10-08 五图补齐：默认显式拼 `?planning=1`——技术详情两图（方框图 / 思维导图）与 MCP 同名图
+ *  （module_map / mind_map）读**同一份**静态＋已发布规划层（服务端同一 builder `viewGraphWithPlan`）。
+ *  只有显式传 `planning:false` 才回到纯静态口（旧调用方不传时同样走规划层）。`full` 与 `planning` 并存。 */
 export async function getArchRender(
   id: string,
-  opts?: { full?: boolean },
+  opts?: { full?: boolean; planning?: boolean },
 ): Promise<{ exists: boolean; graph?: SharedGraph }> {
-  const query = opts?.full === true ? "?full=1" : "";
+  const params: string[] = [];
+  if (opts?.planning !== false) params.push("planning=1");
+  if (opts?.full === true) params.push("full=1");
+  const query = params.length > 0 ? `?${params.join("&")}` : "";
   const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/arch/render${query}`);
   const body = (await res.json()) as
     | { ok: true; render: { exists: boolean; graph?: SharedGraph } }
@@ -848,6 +871,164 @@ export async function getDesign(id: string, opts?: FetchOpts): Promise<DesignDoc
   const body = (await res.json()) as { ok: true; design: DesignDoc } | WsFail;
   if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
   return body.design;
+}
+
+// ── B6/V09-56：设计文档三档版本（DESIGN.md §3.5 版本切换 / §2.9 不混版）──
+// 同一只读接口带 `document` query：current（现行草稿）| active（已审定基线快照）| <revision>（不可变历史快照）。
+// 返回旧 shape（exists/content/source）+ source_rel/selection/sections/baseline_history；界面**不自行判版本**，
+// 「实际读到哪一档」由服务端 `selection` 如实回报（不是只 echo 请求参数）。
+
+/** 版本选择器：`current` | `active` | 64 位小写十六进制 sha256 */
+export type DesignSelector = "current" | "active" | string;
+
+export interface DesignSelectionView {
+  requested: string;
+  mode: "current" | "active" | "revision";
+  design_revision: string | null;
+  baseline_id: string | null;
+  approved_by: string | null;
+  approval_kind: "user_confirmed" | "delegated_technical_review" | null;
+  active_at: string | null;
+  /** 现行源相对所选版本已漂移的人话说明（null = 没漂移 / 不适用） */
+  drift: string | null;
+  /** 所选版本读不回的原因（null = 读到了）；读不回不等于空项目、更不等于已通过 */
+  unreadable: string | null;
+}
+
+export interface DesignSectionView {
+  level: number;
+  title: string;
+  path: string;
+  line_start: number;
+  line_end: number;
+  sha256: string;
+}
+
+export interface DesignBaselineHistoryView {
+  baseline_id: string;
+  approved_by: string;
+  approval_kind: "user_confirmed" | "delegated_technical_review";
+  active_at: string;
+  supersedes: string | null;
+  design_revision: { content_sha256: string; definition_sha256: string; source_path: string };
+  /** 该历史设计快照现在能不能按 hash 重建 */
+  available: boolean;
+  /** 是不是当前生效基线 */
+  current: boolean;
+}
+
+export interface DesignReadDoc {
+  exists: boolean;
+  content: string | null;
+  source: string | null;
+  /** 项目根内相对来源路径（对外展示用它，不依赖远程裁剪） */
+  source_rel: string | null;
+  selection: DesignSelectionView;
+  sections: DesignSectionView[];
+  baseline_history: DesignBaselineHistoryView[];
+}
+
+/** B6：GET /api/projects/:id/design?document=... —— 选定版本设计文档（缺省 current，旧口径不变） */
+export async function getDesignVersioned(
+  id: string,
+  document: DesignSelector,
+  opts?: FetchOpts,
+): Promise<DesignReadDoc> {
+  const q = new URLSearchParams();
+  if (document !== "" && document !== "current") q.set("document", document);
+  const suffix = q.toString() === "" ? "" : `?${q.toString()}`;
+  const res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/design${suffix}`, fetchInit(opts));
+  const body = (await res.json()) as { ok: true; design: DesignReadDoc } | WsFail;
+  if (!body.ok) throw new Error(`[${body.error.code}] ${body.error.message}`);
+  return body.design;
+}
+
+// ── B6/V09-56：功能清单**只读**读口（DESIGN.md §6.12；界面只展示，不涂色、不写状态）──
+import type { FeatureLedger as FeatureLedgerView } from "../shared/coverageTypes";
+export type { FeatureLedgerView };
+
+export interface FeatureLedgerReadParams {
+  scope?: string;
+  document?: DesignSelector;
+  artifact_ref?: string;
+  expected_revision?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+/**
+ * 功能清单读口失败：`unsupported=true` 表示**旧服务不识别该读口**（404 NOT_FOUND）——
+ * 界面据此显式报「本功能未接入」，**绝不回退写路由、不在本地另算一套判据**（§6.6、§6.12）。
+ */
+export class FeatureLedgerReadError extends Error {
+  readonly status: number | null;
+  readonly code: string;
+  readonly detail: unknown;
+  readonly unsupported: boolean;
+  constructor(message: string, info: { status: number | null; code: string; detail: unknown; unsupported: boolean }) {
+    super(message);
+    this.name = "FeatureLedgerReadError";
+    this.status = info.status;
+    this.code = info.code;
+    this.detail = info.detail;
+    this.unsupported = info.unsupported;
+  }
+}
+
+/** B6：GET /api/projects/:id/feature-ledger —— 同一 revision 事实快照 → 只读功能清单（四维分开） */
+export async function getFeatureLedger(
+  id: string,
+  params: FeatureLedgerReadParams = {},
+  opts?: FetchOpts,
+): Promise<FeatureLedgerView> {
+  const q = new URLSearchParams();
+  for (const k of ["scope", "document", "artifact_ref", "expected_revision", "cursor", "limit"] as const) {
+    const v = params[k];
+    if (v !== undefined && v !== null && String(v) !== "") q.set(k, String(v));
+  }
+  const suffix = q.toString() === "" ? "" : `?${q.toString()}`;
+  let res: Response;
+  try {
+    res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/feature-ledger${suffix}`, fetchInit(opts));
+  } catch (e) {
+    throw new FeatureLedgerReadError(`读取失败：${(e as Error).message}`, {
+      status: null,
+      code: "NETWORK_ERROR",
+      detail: null,
+      unsupported: false,
+    });
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    // 旧服务 / 代理吞掉的空体：既不是本读口的业务错误，也不是已知 404 信封
+    throw new FeatureLedgerReadError(
+      res.status === 404 ? "本功能未接入（旧服务不识别该读口）" : `读取失败：响应无法解析（HTTP ${res.status}）`,
+      { status: res.status, code: res.status === 404 ? "UNSUPPORTED" : "BAD_RESPONSE", detail: null, unsupported: res.status === 404 },
+    );
+  }
+  const b = body as
+    | { ok: true; ledger: FeatureLedgerView }
+    | { ok: false; status?: number; code?: string; message?: string; detail?: unknown; error?: { code?: string; message?: string } };
+  if (b.ok) return b.ledger;
+  // 兜底 404 信封（旧服务不认识路由）＝「本功能未接入」，与「项目不存在」分开
+  if (b.error?.code === "NOT_FOUND" || (!b.code && res.status === 404)) {
+    throw new FeatureLedgerReadError("本功能未接入（旧服务不识别该读口）", {
+      status: 404,
+      code: "UNSUPPORTED",
+      detail: b,
+      unsupported: true,
+    });
+  }
+  const code = b.code ?? b.error?.code ?? "UNKNOWN";
+  const message = b.message ?? b.error?.message ?? `读取失败（HTTP ${res.status}）`;
+  throw new FeatureLedgerReadError(`[${code}] ${message}`, {
+    status: b.status ?? res.status,
+    code,
+    detail: b.detail ?? null,
+    unsupported: false,
+  });
 }
 
 // ── D2：待议记录（DESIGN.md §3.5 提疑权：只能追加，没有任何修改/删除接口或 UI）──

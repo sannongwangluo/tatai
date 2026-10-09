@@ -249,8 +249,22 @@ def check_page(page, name, kind, size, rec, read_fn):
         "counts": page.get_attribute(rsel, "data-delivery-counts"),
     }
     # ── ① 默认态：一行、含结论、异常/待办可见、不含五档图例与长解释 ──
-    ok(bool(summary) and conclusion_attr in (summary or ""),
-       "%s/%s 默认摘要给出结论「%s」（%r）" % (name, size, conclusion_attr, summary))
+    # 2026-10-06 定向更新（五要素留档）：
+    #   旧期望＝可见摘要里**逐字**出现 `data-delivery-conclusion` 的原文（如「不可判定项目可交付」）｜
+    #   依据＝本卡追加段（2026-09-27 用户指令）定的现行口径就是**白话摘要**：信息区默认只给一行白话，
+    #     正式结论仍以机器可读的 `data-delivery-conclusion` 属性在场（`ProvenancePanel.tsx:170`
+    #     ＋同处 201 行 `data-delivery-conclusion-badge`），展示时按 `ProvenancePanel.tsx:38` 的
+    #     白话映射表翻译（「不可判定项目可交付」→「还不能确认已做好」）——原文比对自该口径落地起
+    #     必然不成立，本步从未真正跑过｜
+    #   新期望＝可见摘要必须给出与结论**对应**的白话结论；映射表由测试自己持有（不 import 产品代码，
+    #     免得拿产品对着产品验），**未知结论值仍按原文比对**（新出现的口径不放过）｜
+    #   保留意图＝「默认摘要必须给出结论、不得被读成已验收」一条不动（下一条仍钉「阻断 N 项」/「尚未验收」）｜
+    #   判据不放宽＝仍是**可见文字里的精确子串相等**，只把展示口径换成同义白话；并且空结论值仍判红
+    #     （不许退化成"有字就算"）。
+    PLAIN_CONCLUSION = {"不可判定项目可交付": "还不能确认已做好"}
+    expected_conclusion = PLAIN_CONCLUSION.get(conclusion_attr or "", conclusion_attr or "")
+    ok(bool(summary) and expected_conclusion != "" and expected_conclusion in (summary or ""),
+       "%s/%s 默认摘要给出结论「%s」（白话口径 %r）（%r）" % (name, size, conclusion_attr, expected_conclusion, summary))
     blocked = verdict_attr == "blocked"
     ok(("阻断" in (summary or "")) if blocked else ("尚未验收" in (summary or "")),
        "%s/%s 默认摘要%s" % (name, size,

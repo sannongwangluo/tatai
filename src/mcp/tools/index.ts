@@ -11,6 +11,9 @@ import { getProjectGraphsTool } from "./getProjectGraphs";
 import { listProjectsTool } from "./listProjects";
 import { listTasksTool } from "./listTasks";
 import { projectEntryTool, claimTaskTool, submitTaskResultTool } from "./projectEntry";
+// P2/V09-47（DESIGN §6.11）：结果提交前的**只读预检**（独立工具名，旧宿主上明确"不支持"，绝不回退成写入）。
+import { preflightTaskResultTool } from "./preflightTaskResult";
+import { taskBriefTool } from "./taskBrief";
 import { manageRequirementTool, manageChangeTool, importPlanDefinitionsTool } from "./workObjects";
 import { rebindTaskTool } from "./rebindTask";
 import { doctorTool } from "./doctor";
@@ -26,6 +29,8 @@ import { projectIndexTool } from "./projectIndex";
 import { selectProjectTool } from "./selectProject";
 import { updateProgressTool } from "./updateProgress";
 import { SYNC_EVIDENCE_TOOLS } from "./syncEvidence";
+// B2/V09-52（DESIGN.md §6.12）：功能清单**只读**读口 feature_ledger（与 HTTP feature-ledger 同底层、同错误语义）。
+import { featureLedgerTool } from "./featureLedger";
 import { registerToolNameSource } from "../../server/work/eventSurface";
 import type { McpTool } from "./types";
 
@@ -57,6 +62,13 @@ export const TOOLS: readonly McpTool[] = [
   projectEntryTool,
   claimTaskTool,
   submitTaskResultTool,
+  // P2/V09-47：提交前**只读**预检（与 submit_task_result 同形输入、共用同一份判据；不写字节、不自愈、
+  // 不产生通行票；旧宿主 unsupported，绝不回退成写入）。注册在 submit 之后，工具面 29 → 30。
+  preflightTaskResultTool,
+  // V09-41（docs/efficiency-20261004.md）：project_entry 的**紧凑只读简报**——同一份同版判据一次算好后
+  // 只投影白名单字段（next_action/全部 blocking 理由/角色能力/基线/当前卡范围/必读/sync/图简要），
+  // 冗长字段改为补取入口。只读、不认领、不写账、不调模型；描述见 projectEntry.ts 顶部（§6.7）。
+  taskBriefTool,
   // 批3 C-015 接线（DESIGN.md §2.5/§2.6）：需求/变更对象命令与受检施工定义导入的真实入口。
   // 校验只活在对象命令层（单一判据来源）；写操作经 ctx.work 转接唯一写入服务，read 只读投影。
   manageRequirementTool,
@@ -83,6 +95,10 @@ export const TOOLS: readonly McpTool[] = [
   // V09-39（DESIGN.md §6.8；契约 U5/U5.1）：持久项目说明索引——read/impact/coverage 只读（本地读、不拉 writer），
   // upsert/remove 经唯一宿主（完整文件 hash CAS＋锁内核对＋原子写）。Agent 声明默认待审；未声明≠无影响。
   projectIndexTool,
+  // B2/V09-52（DESIGN.md §6.12／契约 B2）：功能清单**只读**读口 feature_ledger——同一 revision 事实快照 →
+  // 唯一义务派生 → feature_item[]（四维分开，绿只取 verification）；与 HTTP GET feature-ledger 同底层、同错误语义。
+  // 只读：不写事件/证据/租约、不触发扫描、不自愈、不调模型；工具面 30 → 31。
+  featureLedgerTool,
 ];
 
 export function findTool(name: string): McpTool | undefined {

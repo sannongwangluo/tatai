@@ -18,7 +18,7 @@ import { isJunkDir, JUNK_DIR_SEGMENTS } from "./config";
 // 顶层模块语义（§3.3；2026-09-29 修订，六图完整读取轮）：不足 MIN_MODULES 按二级目录细分补；
 // **超过 15 个不再有损合并**——旧 mergeOverflow 把超出候选压成「其他」桶发生在采集落盘层，
 // 违反 §3.3「聚合不得吃掉可达性」（原始对象丢失、full 不可恢复）。现在采集层保留全部候选与
-// 稳定身份，5–15 上限只在概览投影层（shared-graph.ts 的 ARCH_LIMITS）施加；旧「其他」桶数据
+// 稳定身份，5–15 上限只在概览投影层（shared-graph.ts 的概览档上限）施加；旧「其他」桶数据
 // 由 legacyAggregationOf 如实识别（读侧标注、重跑解析可展开）。
 
 /** 忽略目录段名：与 chat 工具（搜索/列清单）共用 config.ts#JUNK_DIR_SEGMENTS 这**同一份清单**
@@ -34,7 +34,7 @@ export const IGNORED_SEGMENTS: ReadonlySet<string> = JUNK_DIR_SEGMENTS;
  *  （`<MIN_MODULES` 时候选还要按二级/更深目录细分，新增深层目录就可能改变划分）——
  *  判据必须与划分本体用**同一个数**，不许在触发侧再写一遍。
  *  上限侧（旧 MAX_MODULES=15）2026-09-29 起不再在采集层设卡：候选超 15 照常落盘，
- *  防爆炸由概览投影层的 ARCH_LIMITS.MAX_NODES（config.ts，同一数值 15）施加。 */
+ *  防爆炸由概览投影层的节点上限（config.ts 的 MAX_NODES，同一数值 15）施加。 */
 export const MIN_MODULES = 5;
 /** 参与 import 解析的源码扩展名 → 语言（A4 子树展开复用） */
 export const SOURCE_EXTS: ReadonlyMap<string, "python" | "typescript" | "tsx" | "javascript"> = new Map([
@@ -129,15 +129,13 @@ export function slugify(relPath: string): string {
   return `${base}-${crypto.createHash("sha1").update(relPath).digest("hex").slice(0, SLUG_HASH_LEN)}`;
 }
 
-/** 遍历预算：全量遍历/解析里 readdir 与 tree-sitter parse 单步都没法中途打断，闸门只保证
- *  "到点不再开新活"——把阻塞量与工作量封顶（实测现场项目 `.tmp` 一棵子树 12 286 文件 / 28 883 目录）。
- *  结果不完整时由 stats.budget_exhausted 显式标出，不许当成"这就是全部"。
- *  两条执行路共用同一闸门：同步 parseDirectory（脚本/A4 按范围下钻）与后台 parseDirectoryAsync
- *  （HTTP 全量入口，批3终审 T19 起按 DESIGN §11.8 分片让出事件循环、可取消）。 */
-export const WALK_LIMITS = { maxFiles: 20_000, maxMs: 30_000 } as const;
-// 2026-09-21 试用反馈：3 秒在塔台自举实测不够——audit 证据目录 337 文件＋杀软同步读开销，
-// 遍历+解析共用这道闸提前收工，模块图残缺（budget_exhausted=true、audit loc=0 依赖全空）。
-// 后台解析本就带进度、可取消、分片让出事件循环（T19），放宽到 30 秒不卡界面；同步路径仅脚本用。
+/** 遍历预算（文件数 + 耗时双闸门）：readdir 与 tree-sitter parse 单步都没法中途打断，闸门只保证
+ *  "到点不再开新活"；不完整由 stats.budget_exhausted 显式标出。同步 parseDirectory 与后台
+ *  parseDirectoryAsync（HTTP 全量入口，DESIGN §11.8 起分片让出事件循环、可取消）共用这份常量。 */
+export const WALK_LIMITS = { maxFiles: 50_000, maxMs: 120_000 } as const;
+// 2026-10-04 实测依据（用户授权的最小修法）：示例项目整目录 21 226 文件，仅枚举 469 ms 就走完，旧的
+// 20 000 文件上限先于 120 s 时间上限到点 → budget_exhausted=true（模块图残缺），故 maxFiles 提到 50 000。
+// 上限按 DESIGN §11.8／§12.1-3 依失败回执与实测调节；超限仍如实标记残缺，不跳过证据目录。
 
 export interface WalkBudget {
   /** 单次遍历的文件条目硬上限 */
@@ -191,6 +189,10 @@ interface NativeTreeSitter {
   Parser: new () => Parser;
   /** 语言 → grammar（js/jsx 用 tsx grammar：TS 是 JS 超集，统一一把） */
   languages: Record<"python" | "typescript" | "tsx" | "javascript", Parser.Language>;
+  /** tree-sitter 0.25.1 的 `module.exports` 就是 Parser 构造器、`Query` 挂在其上（`module.exports.Query`）。
+   *  别的绑定/旧版本可能没有这个成员 → 声明为可选，缺了就**明确回退**原全树 DFS（见 collectImportStatements），
+   *  不把"Query 建不起来"当成"这个文件没有 import"。 */
+  Query?: new (language: Parser.Language, source: string) => Parser.Query;
 }
 
 const requireNative = createRequire(import.meta.url);
@@ -211,6 +213,7 @@ function loadNative(): NativeTreeSitter {
   };
   nativeModules = {
     Parser: P,
+    Query: (P as { Query?: NativeTreeSitter["Query"] }).Query,
     languages: { python, typescript: ts.typescript, tsx: ts.tsx, javascript: ts.tsx },
   };
   return nativeModules;
@@ -250,11 +253,109 @@ function collect(node: Parser.SyntaxNode, types: ReadonlySet<string>): Parser.Sy
   return out;
 }
 
+// ── import 语句收集：原生 query 快路径（P5 有界解析热路径优化，2026-10-06）────────────────────
+// 事由（设计依据见 DESIGN.md §11.8）：真实全量采集 ~25–31 s 里约 72% 不在原生
+// tree-sitter parse，而在 `collect()` —— 它把整棵树的每个 namedChild 都 marshal 成 JS 节点包装
+// （`namedChildCount` + 逐 `namedChild(i)` 两次跨界，乘以每个节点），只为挑出 import/export/
+// call 三类语句。改成 tree-sitter 原生 query：游标在 C 侧走树，只有**命中的**节点回 JS。
+//
+// 口径不变（这三条是硬约束）：目标节点类型与旧 `collect` 的集合**逐字相同**、仍是**全树递归**
+// （函数体/类体/try 块里嵌套的 import 与 require 照收，不做顶层剪枝）、返回顺序仍是旧 DFS 的
+// 文档序（pre-order）。query 不可用/构建失败（旧绑定无 `Query`、grammar 认不出某个节点类型）时
+// **明确回退**到上面那趟全树 DFS `collect()`——回退是完整的，不是"少收几条"。
+
+/** import 提取要匹配的节点类型（与旧 collect 调用的集合是同一份：改一处即两处一致） */
+const PY_IMPORT_NODE_TYPES = ["import_statement", "import_from_statement"] as const;
+const JS_IMPORT_NODE_TYPES = ["import_statement", "export_statement", "call_expression"] as const;
+
+/** 节点类型集合 → S-expression query（每个类型一条模式，捕获名统一 @stmt） */
+const querySourceOf = (types: readonly string[]): string => types.map((t) => `(${t}) @stmt`).join("\n");
+
+/** 语言 → query（懒建复用；query 可跨树共享）。与 parsers 同一套"建不起来就记住"策略。 */
+const importQueries = new Map<string, Parser.Query>();
+const brokenImportQueries = new Set<string>();
+
+/** 取该语言收集 import 语句用的 query；建不起来返回 null（调用方回退完整 DFS，不静默少结果） */
+function importQueryFor(
+  lang: "python" | "typescript" | "tsx" | "javascript",
+  types: readonly string[],
+): Parser.Query | null {
+  const hit = importQueries.get(lang);
+  if (hit) return hit;
+  if (brokenImportQueries.has(lang)) return null;
+  try {
+    const native = loadNative();
+    const Q = native.Query;
+    if (typeof Q !== "function") {
+      brokenImportQueries.add(lang);
+      return null;
+    }
+    const q = new Q(native.languages[lang], querySourceOf(types));
+    importQueries.set(lang, q);
+    return q;
+  } catch {
+    brokenImportQueries.add(lang);
+    return null;
+  }
+}
+
+/** 收集目标类型的语句节点，顺序与旧全树 DFS 完全一致（pre-order 文档序）。
+ *  快路径 = 原生 query 游标：captures 本身就是"按出现顺序"，这里再按 (start 升, end 降) 做一次
+ *  稳定排序作为确定性保险——该比较器对树节点**恰好等于** pre-order DFS 顺序（祖先 start ≤ 后代且
+ *  end ≥ 后代，故同 start 时祖先在前；兄弟区间互不重叠，按 start 即文档序）。
+ *  回退路径 = 旧 collect()，逐节点结果与快路径相同（P5 等价 oracle 已逐文件核过）。
+ *  **三条收口都必须是完整回退，且都不许把部分结果当完整结果发布**：
+ *    ① Query 建不起来（旧绑定无 `Query`／grammar 不认节点类型）→ 回退；
+ *    ② Query 建起来了但**执行期抛错**（原生游标异常）→ 丢弃半截 out、回退；
+ *       （旧实现在同一输入本可成功，不能因此把文件虚报 parse_error、更不能让整次解析失败）
+ *    ③ 执行成功但原生游标**自报 match 数被上限截断**（`didExceedMatchLimit()`）→ 那是**部分结果**，
+ *       同样丢弃、回退；该读数必须**紧接 captures** 取，不能被下一次共享游标调用覆盖。
+ *       （tree-sitter 0.25.1 默认 matchLimit=UINT32_MAX、本模式集实测不截断，这里是完整性保险，
+ *       不引入"更大上限"之类的替代手段，也不为将来可能的变化新增缓存/计数/协议。）
+ *  执行期失败**不**把该语言永久判死：异常可能只对某棵树发生，故按次回退、后续文件仍可继续用 query
+ *  （与 `parserFor` 的"失败一次就记住"不同——那里记的是加载/grammar 这类进程级不可恢复失败）。 */
+function collectImportStatements(
+  root: Parser.SyntaxNode,
+  lang: "python" | "typescript" | "tsx" | "javascript",
+  types: readonly string[],
+): Parser.SyntaxNode[] {
+  const query = importQueryFor(lang, types);
+  if (query) {
+    try {
+      const out: Parser.SyntaxNode[] = [];
+      for (const cap of query.captures(root)) {
+        if (cap.name === "stmt") out.push(cap.node);
+      }
+      // 游标自报被截断 ⇒ 上面的 out 只是前缀，丢弃并回退，不"装完整"（读数紧接 captures，见上 ③）
+      if (typeof query.didExceedMatchLimit !== "function" || !query.didExceedMatchLimit()) {
+        out.sort((a, b) => a.startIndex - b.startIndex || b.endIndex - a.endIndex);
+        return out;
+      }
+    } catch {
+      // 执行期抛错：整段丢弃（不保留半截 out），落到下面的完整 DFS 回退
+    }
+  }
+  return collect(root, new Set(types)); // 明确回退真实原 DFS（不是空数组）
+}
+
+/** 只读诊断：各语言能否构造原生 Query；不表示某次文件解析实际使用了哪条路径。
+ *  执行失败或超限仍可能按次回退；完整性由结果等价验证，产品路径不读此诊断。 */
+export function importCollectionMode(): {
+  langs: Record<string, "query" | "dfs_fallback">;
+} {
+  const langs: Record<string, "query" | "dfs_fallback"> = {};
+  for (const lang of ["python", "typescript", "tsx", "javascript"] as const) {
+    const types = lang === "python" ? PY_IMPORT_NODE_TYPES : JS_IMPORT_NODE_TYPES;
+    langs[lang] = importQueryFor(lang, types) ? "query" : "dfs_fallback";
+  }
+  return { langs };
+}
+
 /** Python：import x.y / import x as a / from x.y import z / from . import z / from ..m import z。
  *  返回模块路径片段数组（点分层级展开）；相对 import 带 leadingDots 层级数。 */
 function extractPythonImports(root: Parser.SyntaxNode): { parts: string[]; leadingDots: number }[] {
   const out: { parts: string[]; leadingDots: number }[] = [];
-  for (const stmt of collect(root, new Set(["import_statement", "import_from_statement"]))) {
+  for (const stmt of collectImportStatements(root, "python", PY_IMPORT_NODE_TYPES)) {
     if (stmt.type === "import_statement") {
       for (const name of collect(stmt, new Set(["dotted_name"]))) {
         out.push({ parts: name.text.split("."), leadingDots: 0 });
@@ -279,9 +380,12 @@ function extractPythonImports(root: Parser.SyntaxNode): { parts: string[]; leadi
 
 /** JS/TS：import ... from "..." / export ... from "..." / require("...") / import("...")。
  *  返回 specifier 原文（只相对路径参与依赖边）。 */
-function extractJsImports(root: Parser.SyntaxNode): string[] {
+function extractJsImports(
+  root: Parser.SyntaxNode,
+  lang: "typescript" | "tsx" | "javascript",
+): string[] {
   const specs: string[] = [];
-  for (const n of collect(root, new Set(["import_statement", "export_statement", "call_expression"]))) {
+  for (const n of collectImportStatements(root, lang, JS_IMPORT_NODE_TYPES)) {
     if (n.type === "import_statement" || n.type === "export_statement") {
       const source = n.childForFieldName("source");
       if (source && source.type === "string") {
@@ -427,7 +531,7 @@ function parseImportsWith(
       );
     }
   } else {
-    for (const spec of extractJsImports(tree.rootNode)) {
+    for (const spec of extractJsImports(tree.rootNode, lang)) {
       if (!spec.startsWith("./") && !spec.startsWith("../")) continue; // 包名/裸路径不算项目内依赖
       const resolved = path.posix.normalize(path.posix.join(dir === "" ? "." : dir, spec));
       if (resolved.startsWith("..")) continue; // 跳出项目根
@@ -685,6 +789,33 @@ function writeJsonAtomic(file: string, data: unknown): void {
   fs.renameSync(tmp, file);
 }
 
+/**
+ * modules.json 的**内容稳定落盘**（2026-10-05 六图/同步修复）：
+ *
+ * 事由：`generated_at` 每轮重解析都取 nowIso，**语义内容完全没变**的一轮也会把整文件字节换掉。
+ * 同步证据契约允许把派生文件按**整文件 sha256** 绑定为 artifact（docs/sync-evidence-contract.md），
+ * 于是「健康的图刷新」持续把已通过的同步批次打回 invalid、接续反复 blocked
+ * （实测 demo-project-stage-v2-20261004 一天内 invalid↔passed 翻转十余次）。
+ *
+ * 修法：**语义内容不变就不重写**——新产物与现有落盘件各剥掉 `generated_at` 后逐字节相等时，
+ * 保留旧文件原字节（旧时间戳一并保留），文件哈希与快照输入（graphInputSha 读的就是这份文件）都稳定；
+ * 内容真变了照常原子覆盖（真实漂移仍被同步侧识别——校验一个不放松，syncChecks.ts 不动）。
+ * 读不出现有件/现有件损坏（形状校验失败）时按「内容变了」处理照常覆盖，不因旧件坏而不写。
+ */
+function writeModulesStable(file: string, next: ArchModulesFile): void {
+  const stripVolatile = (v: ArchModulesFile): string => {
+    const { generated_at: _dropped, ...rest } = v;
+    return JSON.stringify(rest);
+  };
+  try {
+    const existing = JSON.parse(fs.readFileSync(file, "utf8")) as ArchModulesFile;
+    if (stripVolatile(existing) === stripVolatile(next)) return; // 语义没变：不重写，保住旧字节/旧哈希
+  } catch {
+    // 没有旧件/旧件读不出：视为内容变了，走正常覆盖
+  }
+  writeJsonAtomic(file, next);
+}
+
 /** 按注册表项目 id 解析并落盘 `.工作台/arch/modules.json`（**同步契约**：验证脚本与既有同步调用方
  *  的入口；HTTP `POST /arch/parse` 正式入口已转后台可取消 run——见文件末 startParseProjectRun，
  *  取消/失败不落盘的语义只有后台路有保证，这里的口径仍是"跑完即原子覆盖"。路径只走注册表） */
@@ -695,7 +826,7 @@ export function parseProject(projectId: string, dataDir?: string): ParseResult {
   }
   const result = parseDirectory(project.path);
   const source = modulesJsonPath(project.path);
-  writeJsonAtomic(source, result.file);
+  writeModulesStable(source, result.file);
   return { ...result, source };
 }
 
@@ -1009,7 +1140,7 @@ export function startParseProjectRun(projectId: string, dataDir?: string, hooks?
         run.status = "cancelled";
       } else {
         const source = modulesJsonPath(project.path);
-        writeJsonAtomic(source, outcome.result.file);
+        writeModulesStable(source, outcome.result.file);
         run.status = "done";
         run.result = {
           source,

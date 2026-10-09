@@ -61,6 +61,7 @@ import type { WorkSubmitter } from "../src/server/work/tasks";
 import { evaluateProjectEntry } from "../src/server/work/entry";
 import { readChatActions, runChatAction } from "../src/server/work/chatActions";
 import { putEvidence } from "../src/server/work/evidence";
+import { buildSourceManifest } from "../src/server/work/sourceEvidence";
 import {
   checkEffectiveness,
   projectFromFacts,
@@ -274,6 +275,45 @@ function approveBaseline(fx: Fixture, basis: string): string {
   return res.baseline.baseline_id;
 }
 
+/**
+ * 夹具：只置状态（**历史口径**）。
+ *
+ * `status="result_submitted"` 走**既有状态边界** `task.status_changed` + `payload.status`——与 `migrate.ts`
+ * 把 v1 `done` 折成 `result_submitted` 逐字同一形态（不带交付包、不宣称判据通过）。`task.result_submitted`
+ * 是一条**交付提交**事件：只由带合法认领 token + 可追溯证据的提交写入（P2/V09-47 锁内共享判据）。
+ * 本夹具只造"这张卡历史上交过结果"的**状态**（**不测试新交付**），不冒充交付提交，也不要求产品为
+ * 夹具放宽校验。`submitTaskStatus` 本身**保留原事件语义**（结果提交一律产出 `task.result_submitted`）。
+ */
+let fixtureStatusSeq = 0;
+function submitStatusOnly(submitter: WorkSubmitter, input: Parameters<typeof submitTaskStatus>[1]): void {
+  if (input.status !== "result_submitted") {
+    submitTaskStatus(submitter, input);
+    return;
+  }
+  fixtureStatusSeq += 1;
+  const payload: Record<string, unknown> = { status: "result_submitted" };
+  if (input.reason !== undefined) payload.reason = input.reason;
+  if (input.definition) {
+    payload.definition_sha256 = input.definition.definition_sha256;
+    payload.plan_revision = input.definition.plan_revision;
+    if (input.definition.definition_revision !== undefined) {
+      payload.definition_revision = input.definition.definition_revision;
+    }
+  }
+  submitter.submit({
+    schema_version: 2,
+    project_id: input.project_id,
+    change_id: input.change_id,
+    entity_id: `task:${input.task_id}`,
+    expected_revision: input.expected_revision,
+    type: "task.status_changed",
+    actor_id: input.actor_id,
+    role: input.role,
+    idempotency_key: `fixture-hist-status:${input.task_id}:result_submitted:${String(input.expected_revision)}:${fixtureStatusSeq}`,
+    payload,
+  });
+}
+
 /** 定义导入 + 交结果（不写任何检查记录 → "无证据/无验证"的现场） */
 function importDefsAndSubmitResult(fx: Fixture, taskId: string, codeRev: string): void {
   submitDefinitionImports(service, {
@@ -296,7 +336,7 @@ function importDefsAndSubmitResult(fx: Fixture, taskId: string, codeRev: string)
     status: "executing",
     definition: bound,
   });
-  submitTaskStatus(submitter, {
+  submitStatusOnly(submitter, {
     project_id: fx.id,
     task_id: taskId,
     change_id: CHG,
@@ -982,6 +1022,13 @@ async function main(): Promise<void> {
 
   // ═══════════════ ⑥ 旧证据失效 ═══════════════
   info("⑥ 旧证据失效：源修订一变，旧绿转待验证、旧结论保留；只重验受影响对象");
+  // 真实源码：T-1 的检查覆盖 `src/t1.ts`（清单里声明的有限范围），`src/t2.ts` 故意**不进**清单（无关文件）。
+  const T1_REL = "src/t1.ts";
+  const T2_REL = "src/t2.ts";
+  const T1_SRC_A = "export const t1 = 'A';\n";
+  const T1_SRC_B = "export const t1 = 'B';\n";
+  const T2_SRC_A = "export const t2 = 'a';\n";
+  const T2_SRC_B = "export const t2 = 'b';\n";
   const staleFx = makeFixture("V0613-STALE", {
     name: "夹具·旧证据失效",
     kind: "backend",
@@ -990,6 +1037,7 @@ async function main(): Promise<void> {
       { id: "T-1", goal: "先绿后失效的卡" },
       { id: "T-2", goal: "另一张不受影响的卡" },
     ]),
+    code: { [T1_REL]: T1_SRC_A, [T2_REL]: T2_SRC_A },
   });
   approveBaseline(staleFx, "V06-13 隔离演练：旧证据失效夹具（技术判断代行设计角色）");
   submitDefinitionImports(service, {
@@ -1007,7 +1055,7 @@ async function main(): Promise<void> {
       project_id: staleFx.id, task_id: taskId, change_id: CHG, actor_id: "fixture-executor", role: "executor",
       expected_revision: 1, status: "executing", definition: bound,
     });
-    submitTaskStatus(submitter, {
+    submitStatusOnly(submitter, {
       project_id: staleFx.id, task_id: taskId, change_id: CHG, actor_id: "fixture-executor", role: "executor",
       expected_revision: 2, status: "result_submitted", definition: bound,
     });
@@ -1031,13 +1079,16 @@ async function main(): Promise<void> {
     effNoEvidence.effective === "unknown" && effNoEvidence.why.includes("没证据"),
     `⑥ 负控：说通过但没给证据哈希 → effective=${effNoEvidence.effective}（不默认通过）`,
   );
+  // 真实源清单：产品**现读** tmp 源码算哈希与指纹（不拿自报修订当来源），落到不可变证据载体。
+  const t1ManifestA = buildSourceManifest(staleFx.root, [T1_REL]);
   const staleEv = putEvidence(staleFx.workDir, {
     content: "夹具：独立审计的复现记录（T-1）\n",
-    kind: "self_check",
-    summary: "T-1 独立审计证据（夹具）",
+    kind: "source_manifest",
+    summary: "T-1 独立审计证据（夹具）：覆盖源清单",
     created_by: "fixture-auditor",
     role: "auditor",
-    binding: { revision_kind: "code", revision: REV_A },
+    binding: { revision_kind: "code", revision: t1ManifestA.fingerprint },
+    source_manifest: [T1_REL],
     occurred_at: NOW,
   });
   // 按投影点名的缺口逐项补独立审计（每一轮都真为它列出的 check_id 出独立记录，最多 3 轮）
@@ -1062,7 +1113,7 @@ async function main(): Promise<void> {
       conclusion: "pass",
       not_reported_scope: ["夹具未覆盖的并发场景"],
       method_limits: ["夹具：单机串行"],
-      binding: { revision_kind: "code", revision: REV_A },
+      binding: { revision_kind: "code", revision: t1ManifestA.fingerprint },
       occurred_at: NOW,
     });
     p1 = projectFromFacts(staleFx.id, DATA_DIR).projection.by_id["T-1"];
@@ -1072,26 +1123,63 @@ async function main(): Promise<void> {
     `⑥ 必需项由**独立审计**逐项通过 → T-1 判绿（display=${p1?.display_status}，补了 ${rounds} 轮；作者自检不算独立 §5.5）`,
   );
   ok(p1?.quality === "audit_passed", `⑥ 质量维度是 ${p1?.quality}（独立审计档，不是只有自检那一档）`);
-  // 源变了（代码修订 A → B）：旧证据失效
+  // 负例①：**仅自报**一个 code 修订（不碰真实源）不得当源变证据——当前代码版本仍未知、旧绿不因此失效
   submitSubmission(submitter, {
-    record_id: "sub-T-1-later", project_id: staleFx.id, change_id: CHG, actor_id: "fixture-executor", role: "executor",
-    goal: "T-1 改了一版（源变了）", task_id: "T-1", changed_files: [], commands: [], untested: [], known_issues: [],
+    record_id: "sub-T-1-selfreport-b", project_id: staleFx.id, change_id: CHG, actor_id: "fixture-executor", role: "executor",
+    goal: "T-1 自报改了代码（未改真实源）", task_id: "T-1", changed_files: [], commands: [], untested: [], known_issues: [],
     evidence_refs: [], binding: { revision_kind: "code", revision: "code-rev-B" },
     submitted_by: "fixture-executor", occurred_at: `${NOW.slice(0, 10)}T09:30:00.000Z`,
   });
+  const pSelfReport = projectFromFacts(staleFx.id, DATA_DIR);
+  ok(
+    pSelfReport.facts.revisions.code === null && pSelfReport.facts.revisions.code_declared === "code-rev-B" &&
+      pSelfReport.projection.by_id["T-1"]?.display_status === "verified",
+    `⑥ 负例：**仅自报** code-rev-B 不构成源变证据（current code=${pSelfReport.facts.revisions.code}；自报值 code_declared=${pSelfReport.facts.revisions.code_declared} 只作展示；T-1 仍 ${pSelfReport.projection.by_id["T-1"]?.display_status}）`,
+  );
+  // 负例②：**不被清单覆盖**的无关文件变了不连坐（清单只声明 T1_REL 这条有限范围）
+  write(path.join(staleFx.root, T2_REL), T2_SRC_B);
+  const pUnrelated = projectFromFacts(staleFx.id, DATA_DIR);
+  const t1Unrelated = pUnrelated.projection.by_id["T-1"];
+  ok(
+    t1Unrelated?.freshness === "fresh" && t1Unrelated?.display_status === "verified",
+    `⑥ 负例：无关文件（不被清单覆盖的 ${T2_REL}）改变**不连坐**：T-1 freshness=${t1Unrelated?.freshness}、仍 ${t1Unrelated?.display_status}（清单是有界覆盖范围）`,
+  );
+  // 负例③：无效清单要拒绝（编造哈希 / kind 与清单不配）
+  let badManifestRejected = "";
+  try {
+    buildSourceManifest(staleFx.root, [{ path: T1_REL, sha256: "0".repeat(64) }]);
+  } catch (e) {
+    badManifestRejected = (e as Error).message;
+  }
+  let badEvidenceRejected = "";
+  try {
+    putEvidence(staleFx.workDir, {
+      content: "夹具：kind 与清单不配\n", kind: "self_check", summary: "夹具：无效载体",
+      created_by: "fixture-auditor", role: "auditor",
+      binding: { revision_kind: "code", revision: t1ManifestA.fingerprint }, source_manifest: [T1_REL],
+    });
+  } catch (e) {
+    badEvidenceRejected = (e as Error).message;
+  }
+  ok(
+    badManifestRejected.includes("哈希与当前文件内容不符") && badEvidenceRejected.includes("kind 必须是 source_manifest"),
+    `⑥ 负例：**无效清单被拒**——编造哈希（${badManifestRejected.slice(0, 22)}…）；kind 与清单不配（${badEvidenceRejected.slice(0, 22)}…）`,
+  );
+  // 正题：**真改**被清单覆盖的源（${T1_REL}：A → B，不再上报任何事件）→ 旧的独立审计绿转待验证
+  write(path.join(staleFx.root, T1_REL), T1_SRC_B);
   const p2 = projectFromFacts(staleFx.id, DATA_DIR);
   const t1After = p2.projection.by_id["T-1"];
   ok(
-    p2.facts.revisions.code === "code-rev-B" && t1After?.freshness === "verification_stale",
-    `⑥ 源修订变成 ${p2.facts.revisions.code} → T-1 freshness=${t1After?.freshness}`,
+    p2.facts.revisions.code === null && t1After?.freshness === "verification_stale",
+    `⑥ 真改覆盖源 ${T1_REL}（A→B）、current 代码版本仍未知（${p2.facts.revisions.code}）→ T-1 freshness=${t1After?.freshness}（清单现读复核判失效）`,
   );
   ok(
     t1After?.display_status === "pending_verification" && t1After?.quality === "evidence_invalid",
     `⑥ **旧绿不再显示为已验证**（display=${t1After?.display_status}、quality=${t1After?.quality}）`,
   );
   ok(
-    (t1After?.history.length ?? 0) >= 1 && t1After?.history[0].bound_revision === REV_A,
-    `⑥ 旧结论**保留在历史里**（${t1After?.history.length} 条，绑定 ${t1After?.history[0]?.bound_revision}）——不因转待验证而消失`,
+    (t1After?.history.length ?? 0) >= 1 && t1After?.history[0].bound_revision === t1ManifestA.fingerprint,
+    `⑥ 旧结论**保留在历史里**（${t1After?.history.length} 条，绑定清单指纹 ${String(t1After?.history[0]?.bound_revision ?? "").slice(0, 12)}…）——不因转待验证而消失`,
   );
   ok(
     (t1After?.reasons ?? []).some((r) => r.code === "evidence_stale") && (t1After?.missing_count ?? 0) >= 1,

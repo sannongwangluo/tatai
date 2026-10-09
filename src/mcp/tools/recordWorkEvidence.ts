@@ -12,6 +12,7 @@
 //     在这里被点名拒；**不接受 role=user** 的写身份（Agent 不代签用户 Gate）；
 //   · 记录有明确版本/对象/来源；不把执行者的自报验证冒充独立审计。
 import { projectWorkDir } from "../../server/workstation";
+import { submitAuditCorrection, type AuditCorrection } from "../../server/work/auditCorrection";
 import { resolveDataDir } from "../../server/registry";
 import {
   submitFix,
@@ -37,7 +38,7 @@ import { WorkError, isWorkError, type WorkReceipt } from "../../server/work/type
 import type { WorkSubmitter } from "../../server/work/tasks";
 import { errorResult, textResult, type McpContext, type McpTool, type ToolResult } from "./types";
 
-const OPS = ["store", "read", "submission", "self_check", "independent_audit", "fix", "retest", "finding"] as const;
+const OPS = ["store", "read", "submission", "self_check", "independent_audit", "fix", "retest", "finding", "correction"] as const;
 type Op = (typeof OPS)[number];
 
 /** 明确不暴露的用户专属操作（点名拒；Agent 不代签用户 Gate） */
@@ -45,6 +46,7 @@ const USER_ONLY_OPS = new Set(["human_acceptance", "acceptance", "accepted_risk"
 
 const ENVELOPE = ["op", "project_id", "role", "actor_id", "change_id", "occurred_at"] as const;
 const OP_KEYS: Record<Op, readonly string[]> = {
+  correction: [...ENVELOPE, "correction_id", "expected_revision", "correction"],
   store: ["op", "project_id", "role", "kind", "content", "summary", "created_by", "binding", "source_ref", "source_manifest", "occurred_at"],
   read: ["op", "project_id", "sha256"],
   submission: [
@@ -280,6 +282,21 @@ export const recordWorkEvidenceTool: McpTool = {
       source_ref: { type: "string", description: "store：来源引用" },
       sha256: { type: "string", description: "read：证据内容哈希" },
       record_id: { type: "string", description: "submission/self_check/independent_audit/fix/retest：记录 id" },
+      correction_id: { type: "string", description: "correction：稳定纠正实体id" },
+      expected_revision: { type: ["integer", "null"], description: "correction：首次null，返工给当前实体修订" },
+      correction: { type: "object", additionalProperties:false,
+        description: "受控追加纠正；不得产生passed。target_raw_sha256为原始账本行（不含换行）哈希；target_sha256为loadEvents规范化事件JSON.stringify的UTF8 SHA256；绑定/检查哈希为对应原对象JSON.stringify SHA256。锁内核验身份、前代和项目内证据文件。",
+        required:["operation","target_event_id","target_seq","target_sha256","target_raw_sha256","task_id","target_binding_sha256","reviewer","reason","report_ref","report_sha256","authorization_ref","authorization_sha256","supersedes"],
+        properties:{
+          operation:{type:"string",enum:["bind_finding_refs","reclassify_not_checked"]},
+          target_event_id:{type:"string"},target_seq:{type:"integer",minimum:1},target_sha256:{type:"string"},target_raw_sha256:{type:"string"},task_id:{type:"string"},target_binding_sha256:{type:"string"},
+          check_id:{type:"string"},target_check_sha256:{type:"string"},
+          finding_scope:{type:"array",items:{type:"object",additionalProperties:false,required:["finding_id","object_id","event_id","event_sha256"],properties:{finding_id:{type:"string"},object_id:{type:"string"},event_id:{type:"string"},event_sha256:{type:"string"}}}},
+          pending:{type:"object",additionalProperties:false,required:["role","reason","basis"],properties:{role:{type:"string",enum:["human_tester","user"]},reason:{type:"string"},basis:{type:"string"}}},
+          mappings:{type:"array",items:{type:"object",additionalProperties:false,required:["original_text","finding_ids","reason"],properties:{original_text:{type:"string"},finding_ids:{type:"array",items:{type:"string"}},reason:{type:"string"}}}},
+          reviewer:{type:"string"},reason:{type:"string"},report_ref:{type:"string"},report_sha256:{type:"string"},authorization_ref:{type:"string"},authorization_sha256:{type:"string"},supersedes:{type:["string","null"]}
+        }
+      },
       goal: { type: "string", description: "submission：本次目标" },
       submitted_by: { type: "string", description: "submission：提交者（缺省取 actor_id）" },
       task_id: { type: "string", description: "可选：关联任务" },
@@ -345,7 +362,8 @@ export const recordWorkEvidenceTool: McpTool = {
           type: "object",
           properties: {
             check_id: { type: "string" },
-            result: { type: "string", enum: ["passed", "failed"] },
+            result: { type: "string", enum: ["passed", "failed", "not_checked"] },
+            pending: { type: "object", properties: { role: { type: "string", enum: ["human_tester", "user"] }, reason: { type: "string" }, basis: { type: "string" } }, required: ["role", "reason", "basis"], additionalProperties: false },
             command: { type: "string" },
             exit_code: { type: "number" },
             output_ref: { type: "string" },
@@ -555,6 +573,12 @@ export const recordWorkEvidenceTool: McpTool = {
         return jsonOk({ ok: true, op, receipt });
       }
 
+      if (op === "correction") {
+        if (writeCtx.role !== "coordinator") return badArgs("correction 只接受coordinator具名裁定");
+        if (!str(args,"correction_id") || !args.correction || typeof args.correction!=="object" || !(args.expected_revision===null || Number.isInteger(args.expected_revision))) return badArgs("缺correction_id/correction/expected_revision");
+        const receipt=await submitAuditCorrection(submitter,{...writeCtx,correction_id:str(args,"correction_id"),expected_revision:args.expected_revision as number|null,correction:args.correction as unknown as AuditCorrection});
+        return jsonOk({ok:true,op,receipt});
+      }
       if (op === "independent_audit") {
         const recordId = str(args, "record_id");
         const auditor = str(args, "auditor");

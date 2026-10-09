@@ -53,6 +53,8 @@ import { runReadJob, ReadWorkersUnavailable, ReadQueueFull, ReadJobTimeout, Read
 import { computeArchBlueprintRead, computeArchRenderRead } from "./work/archReadWorker";
 import { onboardProject } from "./onboard";
 import { requestScanCancel, scanProjectAsync } from "./scanner";
+// P0/V09-45：本后端进程的构建身份（前端诊断经此只读读口取"运行时后端身份"，与自身 ui 身份对照偏斜）
+import { resolveBuildIdentity } from "../shared/buildIdentity";
 import { sweepAllTmpResidue } from "./tmpSweep";
 import { readModules, startParseProjectRun, requestParseCancel, getParseRunStatus } from "../arch/parse";
 import { nameModules } from "../arch/name";
@@ -172,6 +174,10 @@ import {
   type ActivateBaselineInput,
   type DocumentKind,
 } from "./work/documents";
+// B6/V09-56（DESIGN.md §3.5 版本切换 / §2.9 不混版）：选定设计文档的**只读**读取 helper。
+// GET /design 的 `document` query（current|active|<revision>）据此返回正文＋章节索引＋基线历史元数据；
+// 缺省 current 时逐字复用 readDesign（旧 shape 不变），本 helper 只追加、不新增写口/不建 cache。
+import { parseDesignSelector, readDesignView } from "./work/designReadView";
 import { isWorkError, WorkError, type WorkErrorCode } from "./work/types";
 // V06-08：施工图定义 + 运行状态（定义与状态分开给，界面不合并成"完成度"）与待议处置记录。
 // C-015 接线：本服务唯一的图纸导入点走受检导入（references.ts），与正式提交路径同一份引用判据
@@ -217,16 +223,26 @@ import {
   type RuntimeEntrySource,
   type RuntimeEntryView,
 } from "./work/runtimeEntries";
+// 补修（2026-10-08，PLAN V09-61）：版本轴要**逐来源**现读该来源自己引用的源清单才判得出
+// "还能开、但对应旧版成果"（契约 F4：自报不自证）。本文件只做接线，判据与边界全在
+// `work/runtimeEntryRevision.ts`（复用 `sourceEvidence.ts` 的既有读取/复核边界）。
+import { withRuntimeEntryRevisions } from "./work/runtimeEntryRevision";
 import {
   acceptanceDimensionOf,
   checksFromFacts,
   collectProjectFacts,
-  dependencyRelease,
-  objectsFromFacts,
-  projectStatuses,
+  eventsSnapshotOf,
   requiredChecksFromDefinitions,
   v1ModuleStatusOf,
 } from "./work/statusProjection";
+// B2 复审 11:58：status-projection / acceptance 读口必须接**唯一义务层**（同一现读快照 → 一次派生），
+// 与六图 cap-loop 读数、feature_ledger 同值。`scopeConclusionOf` 内部一次 `deriveObligations`。
+import { scopeConclusionOf } from "../arch/sixGraphs";
+import { deriveObligations } from "./work/obligations";
+// B2/V09-52（DESIGN.md §6.12）：功能清单**只读**读口——同一 revision 的事实快照 → 唯一义务派生 →
+// feature_item[]（四维分开，绿只取 verification）。与同族 status-projection 的区别：本路由**读 query**
+// （scope/document/artifact_ref/expected_revision/cursor/limit，只改选择与分页，不改判据）；登记见 remote-routes.ts。
+import { parseFeatureLedgerParams, type FeatureLedgerResult } from "./work/featureLedger";
 // V06-07：聊天动作与可追溯回执（§3.5–§3.6）。修订动作**不在本文件里长**——本文件只做接线：
 // 意图 → 动作 → SSE 回执 + 三条只读/审定路由；动作的语义、落盘与红线全在 work/chatActions.ts。
 import {
@@ -835,6 +851,14 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     replyWorkRoutes();
     return;
   }
+  // P2/V09-47（DESIGN §6.11）：唯一宿主的**只读预检**路由 `POST /api/work/preflight`（结果提交前预检）。
+  // 桌面宿主同样逐条列名转发（未登记的精确路径会落本文件兜底 404），判据同上：**方法 + 精确路径**。
+  // 它是**只读**路由（token 走 body、不进 URL；不写事件/证据/租约、不自愈），但用 POST 承载表单式大对象；
+  // 在只读远程模式下由远程红线先拒（本机回环 MCP 才用得到）。新增字面提及须登记进 `remote-routes.ts`（防漂移对账）。
+  if (req.method === "POST" && reqPath === "/api/work/preflight") {
+    replyWorkRoutes();
+    return;
+  }
   // V09-29 集成：V09-27 上报域（证据正文存/读，`work/reportingHost.ts`）与 V09-28 正向基线
   // （`work/baselineHost.ts`）此前只挂在 workHost 委派链上；桌面宿主 `index.ts` 是**逐条列名**转发，
   // 未登记的精确路径落本文件兜底 404——于是 MCP 在桌面宿主下取不到证据正文写/读口。
@@ -1343,67 +1367,72 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       const which = workProjectionMatch[2];
       const project = getProject(id);
       if (!project) throw new WsError("PROJECT_NOT_FOUND", `项目不存在: ${id}`);
-      const facts = collectProjectFacts(id, DATA_DIR);
-      // 人工验收按对象取（任务按 task_id 关联；模块/连线只看批次级或 pending）——不接受"质量状态代写验收"
-      const withAcceptance = (objs: ReturnType<typeof objectsFromFacts>) =>
-        objs.map((o) => ({
-          ...o,
-          acceptance:
-            o.object_kind === "task"
-              ? acceptanceDimensionOf(Object.values(facts.audit.acceptances), { task_id: o.object_id })
-              : ("pending" as const),
-        }));
-      // 两趟：先算每个依赖线的"前置是否释放"，再让依赖线带上释放结论（依赖释放不看前卡自报 done）
-      const pass1 = projectStatuses({
-        objects: withAcceptance(objectsFromFacts(id, DATA_DIR, facts)),
-        findings: facts.findings,
-        checks: checksFromFacts(facts),
-        source_revision: facts.revisions,
-        binding_segments: facts.binding_segments,
-      });
-      const releases: Record<string, { released: boolean; reasons: string[] }> = {};
-      for (const def of facts.definitions) {
-        for (const dep of def.dependency_ids) {
-          const prereq = pass1.by_id[dep];
-          if (prereq === undefined) continue;
-          releases[`${dep}->${def.task_id}`] = dependencyRelease({
-            prerequisite_id: dep,
-            prerequisite: prereq,
-            evidence_requirement: def.dependency_evidence.find((d) => d.dependency_id === dep)?.evidence ?? null,
-          });
-        }
-      }
-      const projection = projectStatuses({
-        objects: withAcceptance(objectsFromFacts(id, DATA_DIR, facts, { dependency_releases: releases })),
-        findings: facts.findings,
-        checks: checksFromFacts(facts),
-        source_revision: facts.revisions,
-        binding_segments: facts.binding_segments,
-      });
+      // 同一现读快照：事件账本读**一次**；facts 与义务派生都从它来（§2.6「一个事实、一次派生」）。
+      const eventsSnapshot = eventsSnapshotOf(id, DATA_DIR);
+      const facts = collectProjectFacts(id, DATA_DIR, { events: eventsSnapshot });
       if (which === "status-projection") {
+        // 唯一义务层：任务/模块/依赖线 + 功能范围（cap-loop-*）+ 蓝图范围对象**同一次** `deriveObligations`
+        //（内部一次 `projectStatuses`，含依赖释放与人工验收；传原始事件 ⇒ 逐条记录的不可变定义绑定生效，
+        // 稳定键身份不被丢）。不再用旧位置 `checksFromFacts` 在这里重算一套（B2 复审 11:58）。
+        const scope = scopeConclusionOf({
+          projectId: id,
+          dataDir: DATA_DIR,
+          blueprint: readBlueprint(id, DATA_DIR),
+          facts,
+          events: eventsSnapshot,
+        });
+        const projection = scope.full;
+        const scopeDiagnostics = scope.anomalies;
+        const base = {
+          last_seq: facts.last_seq,
+          revisions: facts.revisions,
+          baseline: facts.baseline,
+          // 补修 C：把"需要哪些集成检查"的来源一起带出（可解释性：绿灯依据来自哪版定义、
+          // 是否已被有效基线批准）。**只读事实摘要**，不接受任何 query/前端声明覆盖。
+          integration_requirements: {
+            declared: facts.integration_requirements.declared,
+            plan_revision: facts.integration_requirements.plan_revision,
+            in_force: facts.integration_requirements.in_force,
+            not_in_force_reason: facts.integration_requirements.not_in_force_reason,
+            issues: facts.integration_requirements.issues,
+            by_object: facts.integration_requirements.by_object,
+          },
+        };
+        if (projection === null) {
+          // 诊断**上屏**：唯一义务层没有产出投影时如实带出原因，不静默吞、不本地造绿。
+          res.end(
+            JSON.stringify({
+              ok: true,
+              projection: {
+                ...base,
+                summary: {},
+                objects: [],
+                degraded: true,
+                anomalies:
+                  scopeDiagnostics.length > 0
+                    ? scopeDiagnostics
+                    : ["唯一义务层没有产出投影（事实快照读不出来）：按「无状态记录」表达，不本地造绿"],
+              },
+            }),
+          );
+          return;
+        }
         res.end(
           JSON.stringify({
             ok: true,
             projection: {
-              last_seq: facts.last_seq,
-              revisions: facts.revisions,
-              baseline: facts.baseline,
-              // 补修 C：把"需要哪些集成检查"的来源一起带出（可解释性：绿灯依据来自哪版定义、
-              // 是否已被有效基线批准）。**只读事实摘要**，不接受任何 query/前端声明覆盖。
-              integration_requirements: {
-                declared: facts.integration_requirements.declared,
-                plan_revision: facts.integration_requirements.plan_revision,
-                in_force: facts.integration_requirements.in_force,
-                not_in_force_reason: facts.integration_requirements.not_in_force_reason,
-                issues: facts.integration_requirements.issues,
-                by_object: facts.integration_requirements.by_object,
-              },
+              ...base,
               summary: projection.summary,
               objects: projection.objects.map((p) => ({
                 ...p,
                 // 兼容投影的四色（v1 读口的派生值；真状态仍看 display_status）
                 v1_status: v1ModuleStatusOf(p.display_status),
               })),
+              // 范围（能力/功能）上屏读数：与六图 `scope_readouts` **同一份**（共享 `scopeConclusionOf`），
+              // 含 display + scope_revision + 成员账目——客户端画布/对账读同一份，不各自再算（§2.6）。
+              scope_readouts: scope.readouts,
+              // 范围段落自己的异常（能力节点按「无 canonical 投影」标未知时的原因）——只读诊断，不静默吞。
+              ...(scopeDiagnostics.length === 0 ? {} : { anomalies: scopeDiagnostics }),
             },
           }),
         );
@@ -1507,6 +1536,56 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     return;
   }
 
+  // ── B2/V09-52：功能清单**只读**读口（DESIGN.md §6.12；登记 remote-routes.ts 的 feature-ledger-read）──
+  //   GET /api/projects/:id/feature-ledger
+  // 同一 revision 事实快照 → 唯一义务派生（deriveObligations）→ feature_item[]（四维分开，绿只取 verification）。
+  // **只读**：不写事件/证据/租约、不触发扫描、不自愈、不启动写宿主、不调模型；参数只改选择/分页，不改判据。
+  // 响应只含项目根内相对来源引用与哈希，不含任何本机绝对路径。
+  const featureLedgerMatch = req.url?.match(/^\/api\/projects\/([^/]+)\/feature-ledger(?:\?(.*))?$/);
+  if (req.method === "GET" && featureLedgerMatch) {
+    const id = decodePathSegment(featureLedgerMatch[1]);
+    const query = new URLSearchParams(featureLedgerMatch[2] ?? "");
+    const raw: Record<string, unknown> = {};
+    for (const k of ["scope", "document", "artifact_ref", "expected_revision", "cursor", "limit"]) {
+      const v = query.get(k);
+      if (v !== null) raw[k] = v;
+    }
+    const parsed = parseFeatureLedgerParams(raw);
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    if ("ok" in parsed) {
+      res.statusCode = parsed.status;
+      res.end(JSON.stringify(parsed));
+      return;
+    }
+    // V09-31/37 同族（2026-10-07 运行时负载修复）：本路由此前在**主线程内联**跑一次 2–7s 的现读派生，
+    // 每 5s 一次把主线程事件循环占住——`/api/work/health` 与 `/api/work/entry` 请求随之排队超预算。
+    // 改在**有界只读 worker 池**里跑同一判据（`readFeatureLedger`），主线程只等消息；worker 基础设施不可用
+    // → 明确 503（结构化 code，可重试），**绝不**回退主线程长算（那会把主线程又占住）。判据/参数/错误语义不变。
+    const projectExists = getProject(id) !== undefined;
+    void runReadJob("feature_ledger", {
+      projectId: id,
+      dataDir: DATA_DIR,
+      params: parsed,
+      projectExists,
+    })
+      .then((result) => {
+        if (res.headersSent) return;
+        const r = result as FeatureLedgerResult;
+        res.statusCode = r.ok ? 200 : r.status;
+        res.end(JSON.stringify(r.ok ? { ok: true, ledger: r.ledger } : r));
+      })
+      .catch((e: unknown) => {
+        if (res.headersSent) {
+          res.end();
+          return;
+        }
+        // 结构化作业错误（worker 起不来/队列满/超时）→ 与该错误码对应的状态（503 可重试）。
+        const d = describeReadJobError(e);
+        res.statusCode = d.httpStatus;
+        res.end(JSON.stringify({ ok: false, status: d.httpStatus, code: d.code, message: d.message, detail: d.detail }));
+      });
+    return;
+  }
   // ── V06-12：Git 保存版本提醒的**只读**探测口（PLAN.md V06-12，DESIGN.md §3.15 / §8.5）──
   //   GET /api/projects/:id/git-status → { git: 只读探测结果, reminder: 提醒派生 }
   // ██ 红线：**一个写操作都没有**。探测只跑 `src/server/gitStatus.ts` 里登记过的固定 argv
@@ -1963,44 +2042,18 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     try {
       const id = decodePathSegment(acceptanceMatch[1]);
       if (!getProject(id)) throw new WsError("PROJECT_NOT_FOUND", `项目不存在: ${id}`);
-      const facts = collectProjectFacts(id, DATA_DIR);
-      // 与 status-projection 同一份两趟口径（先判依赖释放，再算主状态）——验收页读的是**同一份**
-      // 状态投影，不另立一套"验收专用状态"（两套状态就是两个真相）。
-      const withAcceptance = (objs: ReturnType<typeof objectsFromFacts>) =>
-        objs.map((o) => ({
-          ...o,
-          acceptance:
-            o.object_kind === "task"
-              ? acceptanceDimensionOf(Object.values(facts.audit.acceptances), { task_id: o.object_id })
-              : ("pending" as const),
-        }));
-      const pass1 = projectStatuses({
-        objects: withAcceptance(objectsFromFacts(id, DATA_DIR, facts)),
-        findings: facts.findings,
-        checks: checksFromFacts(facts),
-        source_revision: facts.revisions,
-        binding_segments: facts.binding_segments,
+      const eventsSnapshot = eventsSnapshotOf(id, DATA_DIR);
+      const facts = collectProjectFacts(id, DATA_DIR, { events: eventsSnapshot });
+      // 与 status-projection 同一份**唯一义务层**结论（同一现读快照 → 一次 `deriveObligations`；含依赖释放
+      // 与人工验收；传原始事件 ⇒ 逐条记录的不可变定义绑定生效）。验收页读的是同一份状态投影，
+      // 不另立一套"验收专用状态"、也不用旧位置 `checksFromFacts` 重算（B2 复审 11:58／两套状态＝两个真相）。
+      const obligations = deriveObligations({
+        project_id: id,
+        data_dir: DATA_DIR,
+        facts,
+        events: eventsSnapshot.events,
       });
-      const releases: Record<string, { released: boolean; reasons: string[] }> = {};
-      for (const def of facts.definitions) {
-        for (const dep of def.dependency_ids) {
-          const prereq = pass1.by_id[dep];
-          if (prereq === undefined) continue;
-          releases[`${dep}->${def.task_id}`] = dependencyRelease({
-            prerequisite_id: dep,
-            prerequisite: prereq,
-            evidence_requirement:
-              def.dependency_evidence.find((d) => d.dependency_id === dep)?.evidence ?? null,
-          });
-        }
-      }
-      const projection = projectStatuses({
-        objects: withAcceptance(objectsFromFacts(id, DATA_DIR, facts, { dependency_releases: releases })),
-        findings: facts.findings,
-        checks: checksFromFacts(facts),
-        source_revision: facts.revisions,
-        binding_segments: facts.binding_segments,
-      });
+      const projection = obligations.projection;
       const manifest = evidenceManifest(facts.work_dir);
       const manifestById = new Map(manifest.map((m) => [m.evidence_id, m]));
       const defsById = new Map(facts.definitions.map((d) => [d.task_id, d]));
@@ -2009,7 +2062,12 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       // 补修包 F ③：可体验入口来自**成果登记**（谁的成果、哪一版、什么时候验的），
       // **不来自用户的验收记录**——所以用户还没接受时，入口照样能显示。
       const runtimeNow = Date.now();
-      const runtimeSources: RuntimeEntrySource[] = [
+      // 逐来源解析版本轴（2026-10-08，PLAN V09-61）：每条来源记录只拿它**自己正式引用**、且
+      // 版本绑定一致的合法源清单去现读复核——覆盖源没变 ⇒ current；变了/被删 ⇒ outdated（仍可打开）；
+      // 没清单/错来源/错绑定/缺失/多歧义 ⇒ unknown。**不拿账本自报当当前版本**（契约 F4），
+      // 也不从全项目任选一份清单给所有来源背书。产品读口对**每条**来源都挂解析结论，故这里的
+      // 全局 `currentRevision` 只作旧调用/函数层显式注入的回落，HTTP 下不再决定版本轴。
+      const runtimeSources: RuntimeEntrySource[] = withRuntimeEntryRevisions(facts.work_dir, [
         ...submissions.map((s) => ({
           kind: "submission" as const,
           record_id: s.record_id,
@@ -2018,14 +2076,15 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
           at: s.at,
           revision: s.binding?.revision ?? null,
           revision_kind: s.binding?.revision_kind ?? null,
+          evidence_refs: s.evidence_refs,
           entries: s.runtime_entries,
         })),
         // 补修 F3：**Agent 结果回报**那条路径（`task.result_submitted`）。两条路径形状/校验/状态判定同一套，
-        // 只是来源不同；读取侧一律从权威事实装配，不靠调用方在进程内传参（§3.7）。
+        // 只是来源不同；读取侧一律从权威事实装配，不靠调用方在进程内传参（§3.7）。两路版本轴同权。
         ...facts.result_runtime_sources,
-      ];
+      ]);
       // 2026-09-20（补修 F2）：`reviewMs` 只产出"待重新验证"，**不判不可达、不撤打开入口**；
-      // 版本轴另算——拿当前事实里的代码版本对比，过期与"打不开"是两条互不覆盖的判断。
+      // 版本轴另算——逐来源现读复核，过期与"打不开"是两条互不覆盖的判断。
       const runtimeEntries = runtimeEntryViews(runtimeSources, runtimeNow, {
         reviewMs: RUNTIME_ENTRY_REVIEW_MS,
         currentRevision: facts.revisions.code ?? null,
@@ -2192,6 +2251,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         ? input.evidence_refs.filter((s): s is string => typeof s === "string" && s !== "")
         : [];
       // 人工验收**只接受真实用户身份**（§5.8）：role 固定 user，Agent/技术审定不得代签
+      const acceptanceBaseline = activeBaseline(id, DATA_DIR);
       const receipt = submitHumanAcceptance(workHost.service, {
         project_id: id,
         change_id: "manual-acceptance",
@@ -2200,6 +2260,11 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         record_id: `acc-${id}-${decisionCn}-${Date.now()}`,
         decision,
         task_id: taskId,
+        baseline: {
+          baseline_id: acceptanceBaseline?.baseline_id ?? null,
+          design_revision: acceptanceBaseline?.design_revision.content_sha256 ?? null,
+          plan_revision: acceptanceBaseline?.plan_revision.content_sha256 ?? null,
+        },
         scenario_refs: scenarioRefs,
         evidence_refs: evidenceRefs,
         accepted_by: typeof input.accepted_by === "string" && input.accepted_by.trim() !== "" ? input.accepted_by.trim() : "user",
@@ -2218,20 +2283,27 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     return;
   }
 
-  // GET /api/projects/:id/design —— 读设计书全文（D1，§3.5 只读展示）。
+  // GET /api/projects/:id/design[?document=current|active|<revision>] —— 读设计书（D1，§3.5）。
   // 口径：塔台（self_managed 或 id=="tatai"）读 <repo>/DESIGN.md（AGENTS.md §7 塔台自身例外），
   // 其他项目读 <项目根>/.工作台/design.md（§2.2）；不存在返回 {ok:true,design:{exists:false}}（200 空态，不是错误）。
+  // B6/V09-56：`document` 缺省 current（**旧 getDesign 口径与 shape 一字不变**）——那时逐字走 readDesign；
+  //   active = 读**已批准基线快照**、<revision> = 读不可变历史快照（均按 hash 复核，读不回如实未知）。
+  //   返回 = 旧 shape（exists/content/source）＋ source_rel/selection/sections/baseline_history 只读元数据。
   // ████████████████████████████ 红线 ████████████████████████████
   // 设计书【只读 + 唯一写口 = 落稿笔】：PUT/DELETE /design 一律 404；POST /design 本体也 404。
   // 唯一的写接口是下方 POST /design/append（D3 落稿笔，§3.5 两条笔之一）——塔台自身同样
   // 开放（2026-09-19 主人拍板解锁，落点在 DESIGN.md 附录 B 之前）；POST /design/draft 只生成
-  // 草稿（读会话 + 调 flash），不落盘。
+  // 草稿（读会话 + 调 flash），不落盘。本分支**只读**：不写、不存证、不建 cache、不调模型。
   // ███████████████████████████████████████████████████████████████
-  if (req.method === "GET" && sub && sub[2] === "design" && !sub[3]) {
+  const designReadMatch = req.url?.match(/^\/api\/projects\/([^/]+)\/design(?:\?(.*))?$/);
+  if (req.method === "GET" && designReadMatch) {
     try {
+      const id = decodePathSegment(designReadMatch[1]);
+      const q = new URLSearchParams(designReadMatch[2] ?? "");
+      const selector = parseDesignSelector(q.get("document"));
       res.end(
         JSON.stringify(
-          withoutLocalPaths({ ok: true, design: readDesign(decodePathSegment(sub[1])) }, guard.remote),
+          withoutLocalPaths({ ok: true, design: readDesignView(id, DATA_DIR, selector.selector) }, guard.remote),
         ),
       );
     } catch (e) {
@@ -3077,16 +3149,18 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     return;
   }
   // V09-22：`?full=1` → 全量上限（RENDER_FULL_LIMITS，同一 builder 的另一组参数）；无 query 逐字不变。
+  // 2026-10-08 五图补齐：`?planning=1` → 并入已发布规划层（与 MCP 同名图 module_map/mind_map 同源，
+  //   同一 builder `viewGraphWithPlan`）；UI 技术详情两图显式带它。**不带 planning 的旧调用逐字不变**
+  //   （仍是纯静态口），既有 HTTP 级测试与旧读口不受影响。
   // regex 允许 query；从 req.url 手写 split 取 query（不引入 URL/querystring 依赖）。
   const archRenderMatch = req.url?.match(/^\/api\/projects\/([^/]+)\/arch\/render(?:\?.*)?$/);
   if (req.method === "GET" && archRenderMatch) {
-    const full = (req.url ?? "")
-      .split("?")[1]
-      ?.split("&")
-      .some((kv) => kv === "full=1");
+    const query = (req.url ?? "").split("?")[1]?.split("&") ?? [];
+    const full = query.some((kv) => kv === "full=1");
+    const planning = query.some((kv) => kv === "planning=1");
     const id = decodePathSegment(archRenderMatch[1]);
     // V09-31/37 复审 E：图合成（UI 重、只读）同上——优先只读 worker，worker 不可用退化为进程内。
-    void archReadViaWorker("arch_render", { projectId: id, full }, () => computeArchRenderRead(id, full))
+    void archReadViaWorker("arch_render", { projectId: id, full, planning }, () => computeArchRenderRead(id, full, planning))
       .then((raw) => {
         if (res.headersSent) return;
         res.end(JSON.stringify(withoutLocalPaths(raw, guard.remote)));
@@ -4022,6 +4096,9 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             ok: true,
             data_dir: resolveDataDir(),
             pid: process.pid,
+            // P0/V09-45（§4.6）：本进程**启动时载入的**后端构建身份。取内嵌常量，不是每次请求读盘上的
+            // build-stamp（那只能说明磁盘现状，不能说明"我加载的是它"——§4.4）。未内嵌（tsx 直跑）如实 unknown。
+            build_identity: resolveBuildIdentity("server"),
             ...(auditLog ? { audit: auditLog.health() } : {}),
           },
           guard.remote,

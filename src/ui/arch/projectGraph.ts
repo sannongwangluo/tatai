@@ -24,7 +24,20 @@ import type {
   BlueprintSourceRef,
 } from "../../arch/blueprint";
 import type { StatusProjection } from "../../server/work/statusProjection";
-import { DISPLAY_STATUS_KEYS, DISPLAY_STATUS_PALETTE, type DisplayStatusKey } from "./statusColor";
+import {
+  scopeMemberLedgerOf,
+  worseDisplayStatus,
+  type ScopeLedger,
+  type ScopeReadout,
+} from "../../arch/featureScope";
+import { DISPLAY_STATUS_PALETTE, type DisplayStatusKey } from "./statusColor";
+
+// V09-55：优先级序比较的唯一实现移入 `featureScope`（范围聚合层），此处转出供既有消费方使用，
+// 保证主视图/技术三图/脚本读到的是同一份判据。
+export { worseDisplayStatus } from "../../arch/featureScope";
+
+/** 范围读数（上屏）：`ScopeReadout` 的别名，供读口/界面同一份类型 */
+export type { ScopeReadout };
 
 // ═══════════════════════════ ① 三视图分工（§3.2 表格三行） ═══════════════════════════
 
@@ -298,15 +311,6 @@ export interface NodeStatus {
   short?: string;
 }
 
-/** 优先级比较（§4.2「未知有效性→明确问题/阻塞→进行中→待验证→全部通过→未开始」） */
-const priorityOf = (d: DisplayStatusKey): number => {
-  const i = (DISPLAY_STATUS_KEYS as readonly string[]).indexOf(d);
-  return i === -1 ? DISPLAY_STATUS_KEYS.length : i;
-};
-
-export const worseDisplayStatus = (a: DisplayStatusKey, b: DisplayStatusKey): DisplayStatusKey =>
-  priorityOf(a) <= priorityOf(b) ? a : b;
-
 /** 直接把一个投影当作节点状态（模块/任务/连线；`mapping === "unmapped"` → 不着完成色） */
 export function directStatusOf(p: StatusProjection | null | undefined): NodeStatus {
   if (p === null || p === undefined) {
@@ -371,6 +375,9 @@ export const planCodeNodeIdOf = (technicalId: string): string =>
  *
  * V08-06 缺陷①的修法：技术详情画布与系统架构画布都从这里取，**plan 层节点不再只查 `by_object`**
  * （`by_object` 的键只有 `module:<代码模块 id>`，声明模块与能力节点在那里永远查不到）。
+ * 2026-10-05 六图修复：**任务/能力的规划节点键也并入**（`plan_status`）——技术三图并入规划层后的
+ * `plan:task:*` 节点由此拿到自己的投影状态（此前一律「无状态记录」，与主视图自相矛盾）。
+ * 任务/能力节点 id 不剥前缀（`plan:task:T01a` 就是技术图上的节点 id 本身，没有第二套键）。
  */
 export function moduleStatusKeysOf(
   derived: ReturnType<typeof taskDerivedModuleStatus>,
@@ -386,11 +393,52 @@ export function moduleStatusKeysOf(
     const techId = objectId.startsWith("module:") ? objectId.slice("module:".length) : null;
     if (techId !== null && out[techId] === undefined) out[techId] = st.display ?? NO_STATUS_RECORD;
   }
+  for (const [nodeId, st] of Object.entries(derived.plan_status)) {
+    if (out[nodeId] !== undefined) continue; // 模块键优先：同一 id 不会既是模块又是任务/能力（蓝图 id 空间不相交）
+    // 与主视图 viewNodeEntries 同一判据（display ?? kind 判 unmapped），不再用模块键的 no_task_evidence 分支
+    const key = st.display ?? (st.kind === "unmapped" ? "unmapped" : NO_STATUS_RECORD);
+    out[nodeId] = key;
+  }
   return out;
 }
 
 /** 模块「验证通过」的展示短标（V08-03 附录 D：让人一眼看懂"这东西存在且验证过了"） */
 export const MODULE_VERIFIED_SHORT = "已存在·已验证通过";
+
+// ── 画布节点状态解析顺序（F1 集成修正 2026-10-06；V09-55 统一后同一判据） ──
+//
+// `moduleStatusKeysOf` 会把 `plan:cap:*` 也并进通用键表，其值来自 `plan_status`（同一 `capabilityStatusOf`）。
+// V09-55 之前：通用键表的能力聚合用声明成员、系统架构主画布按本视图成员，两套口径会让同一能力
+// 在不同画布判出不同状态（诊断快照 plan:cap:08/09）。统一后成员账目与主状态都由
+// `featureScope` 一处给出：**画布的能力分支与通用键表给同一结论**，解析顺序只是"谁来算"，
+// 不再是"算哪一套"。故仍固定为：**能力节点先判**（走聚合层的结论），其余才走通用键表。
+//
+// 纯函数、零 React、零 IO：渲染层与验证脚本读同一份顺序，不各写一套（`ProjectGraphView` 调用它）。
+
+export interface ArchStatusResolvers {
+  /** 能力节点（`plan:cap:*`）按**本视图成员**派生的上屏键（在通用键表之前判） */
+  capabilityStatusOf: (nodeId: string) => string;
+  /** 其余节点的通用键表命中（`moduleStatusKeysOf` 等）；未命中返回 `undefined` */
+  keysOf: (nodeId: string) => string | undefined;
+  /** 键表都没有时按投影直取 / 如实「无状态记录」 */
+  directStatusOf: (nodeId: string) => string;
+}
+
+/**
+ * 单个视图画布的节点状态解析（**顺序即语义**）：能力节点先于通用键表判，保留本视图成员语义；
+ * 其余节点才走通用键表、再退回投影直取。返回 `节点 id → 上屏键`。
+ */
+export function archStatusRecordOf(nodeIds: readonly string[], r: ArchStatusResolvers): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const id of nodeIds) {
+    if (id.startsWith("plan:cap:")) {
+      out[id] = r.capabilityStatusOf(id);
+      continue;
+    }
+    out[id] = r.keysOf(id) ?? r.directStatusOf(id);
+  }
+  return out;
+}
 
 // ── §3.2 能力分类：声明表状态与逐能力分类（R-1/B 类返工 2026-09-26） ──
 //
@@ -494,19 +542,35 @@ function moduleStatusFromTasks(
  *      对应模块全部验证通过 ⇒ 验证通过；有对应但没全通过 ⇒ 取最差、不给绿；**没有对应 ⇒ 无状态记录**
  *      （不硬凑：功能名形态的声明模块没有可判定的落点）。
  *   ③ 不发明任何事件类型、不写完成色到源；本派生只读蓝图与状态投影。
+ *   ④（2026-10-05 六图修复；V09-55 统一）`plan_status` 补**非模块规划节点**的状态：任务
+ *      （`plan:task:*`）按状态投影**直取**（与主视图 `nodeOf` 同一语义）；能力（`plan:cap:*`）按
+ *      **唯一成员账目**（`featureScope.scopeMemberLedgerOf`：design_interface／task_design_ref ＋
+ *      observed implementation_map 的实测派生）派生，成员状态＝任务直取/模块派生——与三个主视图
+ *      逐 id 同一份成员与同一主状态（不再一个用声明成员、另一个再叠加派生）。
+ *      动机：技术三图（模块方框图/数据流向图/思维导图）并入规划层后，`plan:task:*` 节点此前查不到
+ *      任何模块键、一律落「无状态记录」——同一张卡在施工依赖图是 verified、到技术图变无记录，
+ *      同一快照内自相矛盾（2026-10-05 现场核查 46/46 张卡复现）。本表让共用键口径
+ *      （`moduleStatusKeysOf`）把任务/能力也覆盖掉；概念（`plan:concept:*`）没有状态对象，仍如实无记录。
  *
  * 出参：`status` 键＝模块**节点 id**（`plan:code:*` / `plan:mod:*`）；`by_object` 键＝模块**对象 id**
- * （`module:<代码模块 id>`，给共用数据层/详情卡用）；`tasks_by_module` 键与 `status` 同域。
+ * （`module:<代码模块 id>`，给共用数据层/详情卡用）；`tasks_by_module` 键与 `status` 同域；
+ * `plan_status` 键＝任务/能力**节点 id**（`plan:task:*` / `plan:cap:*`，只有键域不同、判据同源）。
  */
 export function taskDerivedModuleStatus(input: {
   blueprint: Blueprint;
   projection: ProjectionIndex;
   /** 声明模块稳定 ID → 代码模块 id（审定材料索引的配对；缺省 = 不做声明模块继承） */
   declared_links?: Readonly<Record<string, readonly string[]>>;
+  /**
+   * V09-55：**范围（能力）的 canonical 义务层投影**（`deriveObligations`/`projectStatuses` 的产物，
+   * 键 = `plan:cap:*`）。给了才判能力状态；缺省/某范围缺键 ⇒ 如实「未知」，不退回本地汇总造绿。
+   */
+  scope_projection?: ProjectionIndex;
 }): {
   status: Record<string, NodeStatus>;
   by_object: Record<string, NodeStatus>;
   tasks_by_module: Record<string, string[]>;
+  plan_status: Record<string, NodeStatus>;
 } {
   const members = moduleMembersOf(input.blueprint);
   const status: Record<string, NodeStatus> = {};
@@ -579,7 +643,22 @@ export function taskDerivedModuleStatus(input: {
         `**不是全部验证通过 ⇒ 不给绿**（附录 D）`,
     };
   }
-  return { status, by_object, tasks_by_module };
+  // ④ 非模块规划节点（2026-10-05 六图修复）：任务直取投影；能力按成员派生。
+  //    与主视图 `nodeOf` 的语义逐字对齐——同一稳定任务 id 在主视图与技术三图必须同一事实状态。
+  const plan_status: Record<string, NodeStatus> = {};
+  for (const n of input.blueprint.nodes) {
+    if (n.kind === "task") {
+      plan_status[n.id] = directStatusOf(input.projection[objectIdOf(n.id, "task") ?? ""]);
+      continue;
+    }
+  }
+  // V09-55 返工：能力状态**只读 canonical 义务层投影**（与三个主视图逐 id 同一判据），
+  // 不再本地按成员汇总——失败集成由 canonical 给 blocked、缺输入给 unknown/missing，六图只作适配。
+  for (const n of input.blueprint.nodes) {
+    if (n.kind !== "capability") continue;
+    plan_status[n.id] = canonicalScopeStatusOf(input.scope_projection?.[n.id]);
+  }
+  return { status, by_object, tasks_by_module, plan_status };
 }
 
 /** 没有任何任务指向的模块：如实标「无状态记录」（不是「未开始」，也不是「未映射到任务」的投影口径） */
@@ -598,93 +677,33 @@ export function noStatusRecordOf(moduleObjectId: string): NodeStatus {
 }
 
 /**
- * 能力的验证状态（附录 D）：能力**不另设验证**，由**本视图的成员**派生——
- * 成员全部「验证通过」（且成员非空）⇒ 能力验证通过；有成员没有状态记录、或不是全部通过 ⇒ **不给绿**。
+ * 能力（scope）节点的上屏状态：**只读 canonical 义务层投影**（V09-55 返工）。
+ *
+ * 判据**只有一处**——唯一义务层 `deriveObligations`／`projectStatuses`（§2.6「一个事实、一次派生」）。
+ * 本函数把该范围的 canonical `StatusProjection` 原样读成 `NodeStatus`：**不判绿、不封顶、不合成**。
+ * 失败集成 ⇒ canonical 给 `blocked`（不是橙封顶）；缺必需输入 ⇒ canonical 给 `unknown/missing`。
+ *
+ * `p` 为 `null`/`undefined`（本读口没拿到该范围的 canonical 投影：旧客户端 / 尚未接入）⇒ 如实标
+ * **未知**（`no_status_source`），**绝不退回本地按成员汇总造绿**（B5 复审口径：unsupported/unknown）。
  */
-export function capabilityStatusOf(members: readonly { id: string; status: NodeStatus }[]): NodeStatus {
-  if (members.length === 0) return aggregateStatusOf([]);
-  const known = members.filter((m) => m.status.display !== null);
-  const unknown = members.length - known.length;
-  if (known.length === 0) {
+export function canonicalScopeStatusOf(p: StatusProjection | null | undefined): NodeStatus {
+  if (p === null || p === undefined) {
     return {
       kind: "unmapped",
       display: null,
       projection: null,
-      member_count: members.length,
+      member_count: 0,
       basis:
-        `成员都没有状态结论：这 ${members.length} 个成员都没有状态记录（无证据链，不空集判绿）——` +
-        "能力不另设验证，成员没有结论时能力也不给结论（附录 D）",
-      unmapped_reason: "no_task_evidence",
+        "本读口没有该范围的 canonical 义务层投影（deriveObligations/projectStatuses）：按**未知**处理——" +
+        "不退回本地按成员汇总造绿（§2.6「一个事实、一次派生」；unsupported/unknown）",
+      unmapped_reason: "no_status_source",
     };
   }
-  if (unknown === 0 && allVerifiedOf(known.map((m) => m.status.display))) {
-    return {
-      kind: "aggregated",
-      display: "verified",
-      projection: null,
-      member_count: members.length,
-      basis:
-        `能力验证通过（附录 D）：成员 ${members.length} 个全部「验证通过」——` +
-        "能力不另设验证对象，由成员派生（不是给能力单独涂色）",
-    };
-  }
-  const worst = known.map((m) => m.status.display!).reduce(worseDisplayStatus);
-  const green = known.filter((m) => m.status.display === "verified").length;
-  return {
-    kind: "aggregated",
-    display: worst === "verified" ? "pending_verification" : worst,
-    projection: null,
-    member_count: members.length,
-    basis:
-      `本视图汇总（不是服务端单独算的状态）：成员 ${members.length} 个，其中 ${green} 个「验证通过」` +
-      (unknown > 0 ? `、${unknown} 个**没有状态记录**（无证据链，不能算通过）` : "") +
-      `；不是全部通过 ⇒ 按 §4.2 优先级序取最高、**不给绿**（附录 D）`,
-  };
+  return directStatusOf(p);
 }
 
-/**
- * 能力这类**服务端暂无独立投影对象**的节点，按已声明口径在本视图汇总。
- *
- * 口径（两条，都是 fail-closed）：
- *   ① 取成员里**优先级最高**（最差）的那个状态——这正是 §4.2 的优先级序，不另立一套；
- *   ② **永不给绿**：能力级没有自己的集成检查记录（服务端根本没有该对象），
- *      "成员全绿"推不出"集成通过"，所以汇总结果封顶在**橙（结果待验证）**。
- *      这与 V06-09「父级没有自身集成检查记录就不判绿」同一条 fail-closed 读法。
- * 没有成员、或成员都没有投影 → `unmapped`（不着完成色，不空集判绿）。
- */
-export function aggregateStatusOf(members: readonly (StatusProjection | null | undefined)[]): NodeStatus {
-  const live = members.filter((m): m is StatusProjection => m !== null && m !== undefined);
-  const withStatus = live.filter((m) => m.display_status !== null && m.mapping === "mapped").map((m) => m.display_status!);
-  if (live.length === 0 || withStatus.length === 0) {
-    return {
-      kind: "unmapped",
-      display: null,
-      projection: null,
-      member_count: live.length,
-      basis:
-        members.length === 0
-          ? "没有关联成员：这个对象在规划图里没有关联的任务/模块，没有可解释的状态（不空集判绿，§4.2）"
-          : `成员都没有状态结论：关联的 ${members.length} 个对象都没有状态投影结论，不空集判绿（§4.2）`,
-      // 成员**存在**但没有状态投影 ≠ 没有成员：两种原因分开（V08-02 C1）
-      unmapped_reason: members.length === 0 ? "no_members" : "members_without_status",
-    };
-  }
-  const worst = withStatus.reduce(worseDisplayStatus);
-  const green = withStatus.filter((s) => s === "verified").length;
-  const capped: DisplayStatusKey = worst === "verified" ? "pending_verification" : worst;
-  return {
-    kind: "aggregated",
-    display: capped,
-    projection: null,
-    member_count: live.length,
-    basis:
-      `本视图汇总（不是服务端为该对象单独算的状态）：关联 ${live.length} 个对象，取优先级最高的状态` +
-      `（§4.2 优先级序；其中 ${green} 个为「验证已通过」）` +
-      (worst === "verified"
-        ? "；能力级没有自身的集成检查证据，汇总**封顶在「结果待验证」，不给绿**（§4.2 / V06-09 父级口径）"
-        : ""),
-  };
-}
+/** 范围读数（canonical 投影 → 上屏口径）适配：委托 `featureScope.scopeReadoutOf`（唯一适配实现） */
+export { scopeReadoutOf } from "../../arch/featureScope";
 
 // ═══════════════════════════ ⑤ 节点/边的视图模型 ═══════════════════════════
 
@@ -741,6 +760,34 @@ export interface ViewEdge {
   group_key?: string;
 }
 
+/**
+ * 本视图关系里**端点解析不到任何可见分组**的成因（V09-02 的账目恒等式：一条关系要么有归类、要么被
+ * 逐条点名，**不许静默消失**）。判「是不是缺陷」由消费方按成因分——**前两类是本视图口径本身的合理结果，
+ * 后两类是真实缺口**，不混成一句「落空」：
+ *   · `folded_group`        —— 端点所属分组被概览折叠（点「显示全部分组」/展开后可见，§3.3 合理折叠）；
+ *   · `governance_excluded` —— 端点是按能力分类排除的设计/治理章节（功能全景不作能力节点，§3.2 声明表）；
+ *   · `no_ownership`        —— 端点在蓝图里没有能力归属（无归属边 ⇒ 待归属，§4.5，须核对后补登证据）；
+ *   · `missing_node`        —— 端点不在蓝图节点集里（来源账与画布不一致，须核对）。
+ */
+export type UnresolvedEndpointReason = "folded_group" | "governance_excluded" | "no_ownership" | "missing_node";
+
+/** 一条解析不到可见分组的关系（逐条点名：稳定 ID、落空的那一端、成因与蓝图出处） */
+export interface UnresolvedRelation {
+  /** 稳定关系 ID（`<source>><target>:<kind>`，与 `edges`／`intra_relations` 同一命名口径） */
+  id: string;
+  kind: BlueprintEdgeKind;
+  certainty: BlueprintCertainty;
+  source: string;
+  target: string;
+  /** 落空的那一端 */
+  unresolved_end: "source" | "target";
+  /** 落空端点的稳定 ID */
+  missing_id: string;
+  reason: UnresolvedEndpointReason;
+  /** 这条关系在蓝图里的出处（逐条可追，§4.1；**不发明关系、不给无来源的线**） */
+  sources: BlueprintSourceRef[];
+}
+
 export interface ProjectViewModel {
   view: ProjectViewKind;
   spec: ProjectViewSpec;
@@ -755,6 +802,12 @@ export interface ProjectViewModel {
    * 反例（不合格）：只在本视图口径句里写一句"有 N 条"而不给逐条可见可点的条目。
    */
   intra_relations: ViewEdge[];
+  /**
+   * V09-02 账目恒等式（**一条关系要么有归类、要么被点名，不许静默丢失**）：本视图声明的关系里，
+   * 端点解析不到任何可见分组的那些。它们既不在 `edges` 也不在 `intra_relations`——**必须在这里逐条在场**，
+   * 并按成因区分「合理折叠／分类排除」与「真实待归属／缺节点」（`UnresolvedEndpointReason`）。
+   */
+  unresolved_relations: UnresolvedRelation[];
   overview: OverviewCap<ViewNode>;
   /** 概览聚合节点（超量时追加的一个节点；null = 没超量） */
   aggregate_node: ViewNode | null;
@@ -800,6 +853,11 @@ export function buildViewModel(input: {
   mergedNodes?: readonly { id: string; plan_refs?: string[] }[];
   /** V08-03（附录 D）：模块层派生结果（`taskDerivedModuleStatus`）。不给 = 模块节点按投影直取（旧行为） */
   module_status?: Readonly<Record<string, NodeStatus>>;
+  /**
+   * V09-55 返工：**范围（能力）的 canonical 义务层投影**（`deriveObligations`/`projectStatuses` 的产物，
+   * 键 = `plan:cap:*`）。能力节点上屏状态**只读它**；缺键 ⇒ 如实「未知」，不退回本地汇总造绿。
+   */
+  scope_projection?: ProjectionIndex;
   /** V09-22「显示全部」：概览上限放开——分组/任务节点一个不漏、无聚合节点（aggregate_node 恒 null）。
    *  缺省 false = 概览默认口径逐字不变。 */
   overview_full?: boolean;
@@ -818,44 +876,25 @@ export function buildViewModel(input: {
   const classBroken = classState === "broken";
   const classIssues = (bp.capability_classes?.issues ?? []).map((i) => `§${i.chapter ?? "—"} ${i.kind}`).join("、");
   const capClassOf = (id: string): "functional" | "governance" | "unknown" => capabilityClassOf(bp, id);
-  // 成员 → 归属能力（**多值**：design_interface 能力→模块、task_design_ref 任务→能力）。
-  // 同一任务的设计依据可以指向多个能力（真实蓝图 94 条 task_design_ref 分布在 41 张卡上、
-  // 32 张卡指向 ≥2 个能力）：单值 Map 后写覆盖会让前面能力的分组成员被静默吃掉
-  // （2026-09-26 安装版复核：cap:01/07/10 的功能全景分组各 0 成员，而它们分别有 6/2/1 条引用）。
+  // 成员账目（**视图无关**，V09-55）：旧实现把「能力 ← task_design_ref ← 任务 → implementation_map
+  // (observed) → 代码模块」的二级派生**只放在系统架构分支**里，于是同一能力在功能全景/技术三图按
+  // 声明成员算、到系统架构按「声明＋派生」算，成员集合不同 ⇒ 同一事实判出不同主状态（诊断快照
+  // plan:cap:08/09 功能图全绿 vs 架构图橙、跨项目 cap:11 blocked vs unmapped）。现在成员枚举唯一
+  // 来源是 `featureScope.scopeMemberLedgerOf`，三个主视图与三张技术详情图逐 id 读同一份。
+  // **主状态不由成员汇总**（V09-55 返工）：只读 canonical `scope_projection`，见 `canonicalScopeStatusOf`。
+  // 多值归属（一个成员可同属多个能力）保持不变：真实蓝图有 32 张卡的设计依据指向 ≥2 个能力。
+  const scopeLedger: Record<string, ScopeLedger> = scopeMemberLedgerOf(bp);
   const ownersOfMember = new Map<string, string[]>();
   const addOwner = (member: string, cap: string): void => {
     const list = ownersOfMember.get(member) ?? [];
     if (!list.includes(cap)) list.push(cap);
     ownersOfMember.set(member, list);
   };
-  for (const e of bp.edges) {
-    if (e.kind === "design_interface" && capabilityIds.has(e.source)) addOwner(e.target, e.source);
-    if (e.kind === "task_design_ref" && capabilityIds.has(e.target)) addOwner(e.source, e.target);
-  }
-  // 系统架构视图的能力→模块归属**二级派生**（2026-09-26 复核口径，设计口径变更已提交待议审定）：
-  // 设计书里「能力↔模块」的唯一声明位是 §11.1 模块清单（⇒ 只有 cap:11 有 design_interface 边），
-  // 但能力引用的任务与代码模块之间有**实测**实现映射——「能力 ← task_design_ref ← 任务
-  // → implementation_map(observed) → 代码模块」是真实可追的证据链，不是编造的关系；
-  // 它与 §11.1 的声明归属并列，口径句写明这是**派生**（不冒充设计声明的归属）。
   let derivedMemberships = 0;
-  if (input.view === "architecture") {
-    const tasksByCap = new Map<string, string[]>();
-    for (const e of bp.edges) {
-      if (e.kind === "task_design_ref" && capabilityIds.has(e.target)) {
-        const list = tasksByCap.get(e.target) ?? [];
-        if (!list.includes(e.source)) list.push(e.source);
-        tasksByCap.set(e.target, list);
-      }
-    }
-    for (const e of bp.edges) {
-      if (e.kind !== "implementation_map" || e.certainty !== "observed") continue;
-      if (!e.target.startsWith("plan:code:")) continue;
-      for (const [cap, tasks] of tasksByCap) {
-        if (!tasks.includes(e.source)) continue;
-        const before = ownersOfMember.get(e.target) ?? [];
-        if (!before.includes(cap)) derivedMemberships += 1;
-        addOwner(e.target, cap);
-      }
+  for (const [cap, l] of Object.entries(scopeLedger)) {
+    for (const m of l.members) {
+      if (m.via.includes("implementation_map")) derivedMemberships += 1;
+      addOwner(m.id, cap);
     }
   }
   /** 成员的全部归属（多值账目：分组/成员资格以它为准） */
@@ -867,17 +906,13 @@ export function buildViewModel(input: {
     return capabilityIds.has(id) ? id : null;
   };
 
-  /** 一个节点（蓝图节点 id）的状态：模块走附录 D 的派生，其余按投影直取 */
-  const statusOfNode = (nodeId: string): NodeStatus =>
-    blueprintNodeStatusOf(nodeId, { blueprint: bp, projection: input.projection, module_status: input.module_status });
-
   const nodeOf = (n: BlueprintNode, members: string[], hidden: number): ViewNode => {
     const objectId = objectIdOf(n.id, n.kind);
     // 能力不另设验证对象（附录 D）：由**本视图的成员**派生——成员全绿才绿，成员里有无状态记录就不给绿
     // 模块：按附录 D 的派生给状态（`module_status`），没有派生结果时如实「无状态记录」
     let status =
       n.kind === "capability"
-        ? capabilityStatusOf(members.map((m) => ({ id: m, status: statusOfNode(m) })))
+        ? canonicalScopeStatusOf(input.scope_projection?.[n.id])
         : n.kind === "module"
           ? (input.module_status?.[n.id] ?? noStatusRecordOf(n.id))
           : directStatusOf(objectId === null ? null : projectionOf(objectId));
@@ -956,6 +991,9 @@ export function buildViewModel(input: {
   } else {
     const memberKindSet = new Set(spec.member_kinds);
     const members = bp.nodes.filter((n) => memberKindSet.has(n.kind) && n.kind !== "capability");
+    /** 能力的**唯一成员账目**（`scopeLedger`）转成查表集合：成员资格的**来源**只有它一处（V09-55） */
+    const ledgerMemberIds = new Map<string, ReadonlySet<string>>();
+    for (const [capId, l] of Object.entries(scopeLedger)) ledgerMemberIds.set(capId, new Set(l.member_ids));
     // 「未归属能力」的分组只给**本视图画布上首层可见的非能力 kind**（架构 = 模块）——
     // 功能全景的成员含任务，但没人会因为"任务没挂能力"就多出一个功能分组（那会把功能全景的节点集搅乱）。
     const ungroupedKinds = new Set<BlueprintNodeKind>(spec.node_kinds.filter((k) => k !== "capability"));
@@ -967,7 +1005,15 @@ export function buildViewModel(input: {
         governanceExcluded.push({ id: cap.id, name: cap.name });
         continue;
       }
-      const own = members.filter((m) => ownersOf(m.id).includes(cap.id)).map((m) => m.id);
+      // V09-55 修的是成员资格的**来源**（唯一成员账目 `scopeLedger`：不再"一个视图只算声明成员、另一个再叠加
+      // 二级派生"）；**成员 kind 仍由本视图口径定**（`spec.member_kinds`，§3.2 表格第三列）——
+      // 功能全景 = 模块＋任务（"关联验收证据、模块与任务"），系统架构 = 模块（"这些能力由哪些模块协作实现"；
+      // 任务归施工依赖视图）。成员还必须是**蓝图节点**：非节点成员画不出来也点不开，按
+      // §3.3「聚合不得吃掉可达性」另行逐条点名（`unresolved_relations`／`canvasMembershipGapsOf`），
+      // 不当成"已经在分组里"（否则 P11 的存在性判据会被名单本身顶掉）。
+      // 顺序＝蓝图节点顺序（既有口径：显示稳定、不随 id 排序漂移）。
+      const inLedger = ledgerMemberIds.get(cap.id) ?? new Set<string>();
+      const own = members.filter((m) => inLedger.has(m.id)).map((m) => m.id);
       groups.push({ key: cap.id, label: cap.name, members: own });
     }
     for (const m of members) {
@@ -1012,7 +1058,12 @@ export function buildViewModel(input: {
         hidden_members: hiddenMembers,
         status: {
           kind: "aggregated",
-          display: aggregateStatusOf(hiddenGroups.flatMap((g) => g.members.map((m) => projectionOf(m)))).display,
+          // 只是"被折叠成员里最差的一个"的上屏提示（纯 §4.2 优先级比较，不判业务状态、不冒充完成）
+          display: hiddenGroups
+            .flatMap((g) => g.members.map((m) => projectionOf(m)))
+            .map((p) => (p !== null && p.mapping === "mapped" ? p.display_status : null))
+            .filter((d): d is DisplayStatusKey => d !== null)
+            .reduce<DisplayStatusKey | null>((a, d) => (a === null ? d : worseDisplayStatus(a, d)), null),
           projection: null,
           member_count: hiddenMembers,
           basis: `聚合节点：包含被折叠的 ${hiddenGroups.length} 个分组 / ${hiddenMembers} 个成员——**隐藏不等于已完成**（§3.3）`,
@@ -1032,10 +1083,13 @@ export function buildViewModel(input: {
     // ① V09-02：成员节点被改名/分组后，解析到**本视图上代表它的那个分组节点**（见 `memberGroupNodeId`）
     const grouped = memberGroupNodeId.get(planId);
     if (grouped !== undefined && visible.has(grouped)) return grouped;
-    // ② 不是本视图成员的节点（如系统架构视图里的任务、功能全景里的实现模块）：解析到其归属能力；
+    // ② 不是本视图成员的**蓝图节点**（如系统架构视图里的任务、功能全景里的实现模块）：解析到其归属能力；
     //    能力自己就是分组节点（`plan:cap:*`），所以这一步同时也是"归属能力已画出"的判定。
     //    多值归属下按稳定 id 升序**逐个**试：第一归属的分组若被概览折叠，线仍能落到
     //    该节点真实归属的另一个可见分组上，不被静默丢掉（§3.3：不许线悄悄消失）。
+    //    **先要求它是蓝图节点**：归属账目是按边枚举的，指向不在蓝图节点集里的端点（来源账与画布不一致）
+    //    不该被"归属"悄悄收编成一个正常关系——那一类如实进 `unresolved_relations` 的 `missing_node`。
+    if (byId.get(planId) === undefined) return null;
     for (const owner of [...ownersOf(planId)].sort()) {
       if (visible.has(owner)) return owner;
     }
@@ -1059,6 +1113,36 @@ export function buildViewModel(input: {
    * 解析成跨组线，线会随分组大小排序时有时无（任意性），不如实。
    */
   const groupsOfPlanId = (id: string): readonly string[] => (capabilityIds.has(id) ? [id] : ownersOf(id));
+  /** V09-02 账目恒等式：解析不到可见分组的关系逐条在场（不静默丢关系；成因分类见 `UnresolvedEndpointReason`） */
+  const unresolvedRelations: UnresolvedRelation[] = [];
+  /**
+   * 端点解析不到任何可见分组的**成因**（不把"合理折叠/分类排除"与"真实缺口"混成一句「落空」）：
+   * 与 `resolveEndpoint` 同一份事实（`visible`／`ownersOf`／`capClassOf`），不另算一套。
+   *   ① 节点不在蓝图节点集里 ⇒ `missing_node`（来源账与画布不一致）；
+   *   ② 端点是本视图按能力分类排除的**设计/治理章节**，或**只归属于**这类章节 ⇒ `governance_excluded`
+   *      （功能全景不作治理能力节点、其任务也因此没有可见归属——这是分类口径的结果，不是折叠）；
+   *   ③ 有归属但归属分组都没画出来（被概览折叠）⇒ `folded_group`（§3.3 合理折叠，展开即达）；
+   *   ④ 归属账目里根本没有它 ⇒ `no_ownership`（§4.5 待归属）。
+   */
+  const endpointMissReasonOf = (planId: string): UnresolvedEndpointReason => {
+    const node = byId.get(planId);
+    if (node === undefined) return "missing_node";
+    const governanceCapOf = (id: string): boolean =>
+      input.view === "functional" && byId.get(id)?.kind === "capability" && capClassOf(id) === "governance";
+    if (governanceCapOf(planId)) return "governance_excluded";
+    const owners = ownersOf(planId);
+    if (owners.length > 0 && !owners.some((o) => visible.has(o))) {
+      return owners.every(governanceCapOf) ? "governance_excluded" : "folded_group";
+    }
+    return "no_ownership";
+  };
+  /** 成因的展示优先级：真实缺口（缺节点／待归属）优先于合理结果（折叠／分类排除），如实不美化 */
+  const REASON_PRECEDENCE: readonly UnresolvedEndpointReason[] = [
+    "missing_node",
+    "no_ownership",
+    "folded_group",
+    "governance_excluded",
+  ];
   for (const e of bp.edges) {
     if (!edgeKinds.has(e.kind)) continue;
     const from = resolveEndpoint(e.source);
@@ -1095,7 +1179,27 @@ export function buildViewModel(input: {
       });
       continue;
     }
-    if (from === null || to === null) continue;
+    if (from === null || to === null) {
+      // V09-02 账目恒等式：不许静默丢关系——解析不到可见分组的逐条记下（含落空端与成因分类）。
+      // 两端都落空时按**展示优先级**取更重的那一种成因（真实缺口优先）；`missing_id` 与它同源。
+      const missEnds: { end: "source" | "target"; id: string; reason: UnresolvedEndpointReason }[] = [];
+      if (from === null) missEnds.push({ end: "source", id: e.source, reason: endpointMissReasonOf(e.source) });
+      if (to === null) missEnds.push({ end: "target", id: e.target, reason: endpointMissReasonOf(e.target) });
+      const reason = REASON_PRECEDENCE.find((r) => missEnds.some((m) => m.reason === r)) ?? missEnds[0].reason;
+      const hit = missEnds.find((m) => m.reason === reason) ?? missEnds[0];
+      unresolvedRelations.push({
+        id: `${e.source}>${e.target}:${e.kind}`,
+        kind: e.kind,
+        certainty: e.certainty,
+        source: e.source,
+        target: e.target,
+        unresolved_end: hit.end,
+        missing_id: hit.id,
+        reason,
+        sources: e.source_refs,
+      });
+      continue;
+    }
     const semantics = edgeSemanticsOf(e.kind);
     const id = `${from}>${to}:${e.kind}`;
     if (seen.has(id)) continue;
@@ -1182,6 +1286,10 @@ export function buildViewModel(input: {
             "点开即追到出处；§3.2 同组关系可见性）",
         ]
       : []),
+    // V09-02 账目恒等式（§3.2 同组关系可见性 / §3.3 隐藏≠没有 / §4.5 待归属）：解析不到可见分组的关系
+    // **逐条点名**、并按成因区分「合理折叠／分类排除」与「真实待归属／缺节点」——不静默丢关系，也不把
+    // 两种情况混成一句「落空」（本视图口径句与 `unresolved_relations` 同源）。
+    ...(unresolvedRelations.length > 0 ? [unresolvedRelationsNoteOf(unresolvedRelations)] : []),
   ];
   return {
     view: input.view,
@@ -1189,11 +1297,49 @@ export function buildViewModel(input: {
     nodes,
     edges,
     intra_relations: intraRelations.sort((a, b) => a.id.localeCompare(b.id)),
+    unresolved_relations: unresolvedRelations.sort((a, b) => a.id.localeCompare(b.id)),
     overview,
     aggregate_node: nodes.find((n) => n.aggregate === true) ?? null,
     groups,
     notes,
   };
+}
+
+/** 落空成因的上屏用语（`UnresolvedEndpointReason` 的唯一词表；口径句与读口共用，不各写一套） */
+export const UNRESOLVED_REASON_LABELS: Readonly<Record<UnresolvedEndpointReason, string>> = {
+  folded_group: "所属分组被概览折叠（点「显示全部分组」/展开后可见——合理折叠，不是丢失；§3.3）",
+  governance_excluded: "端点是（或只归属于）按能力分类排除的**设计/治理章节**（本视图不作能力节点；§3.2 能力分类声明）",
+  no_ownership: "端点在蓝图里**没有能力归属**（没有任务设计引用/归属边 ⇒ 待归属，须核对后补登；§4.5）",
+  missing_node: "端点**不在蓝图节点集**里（来源账与画布不一致，须核对）",
+};
+
+/** 后两类＝**真实缺口**（前两类是视图口径本身的合理结果）；调用方据此决定是否计入阻断/待办 */
+export const UNRESOLVED_REAL_GAP_REASONS: readonly UnresolvedEndpointReason[] = ["no_ownership", "missing_node"];
+
+/**
+ * 落空关系的口径句（逐类给条数、逐条点名；**成因分类原样上屏**，不把它折算成"已验证/可交付"）。
+ * 与 `unresolved_relations` 同一份事实——界面、HTTP 与 MCP 读同一个 `notes`，不各写一套。
+ */
+export function unresolvedRelationsNoteOf(relations: readonly UnresolvedRelation[]): string {
+  const order: readonly UnresolvedEndpointReason[] = ["folded_group", "governance_excluded", "no_ownership", "missing_node"];
+  const parts: string[] = [
+    `关系未画出：本次 ${relations.length} 条本视图关系的端点解析不到本视图可见分组，**逐条点名下**` +
+      "（V09-02 账目恒等式：一条关系要么有归类、要么被点名，不许静默消失）",
+  ];
+  for (const reason of order) {
+    const list = relations.filter((r) => r.reason === reason);
+    if (list.length === 0) continue;
+    const named = list
+      .slice(0, 6)
+      .map((r) => `${r.missing_id}（${r.unresolved_end === "source" ? "起点" : "终点"}·${r.kind}）`)
+      .join("、");
+    const realGap = UNRESOLVED_REAL_GAP_REASONS.includes(reason);
+    parts.push(
+      `· ${list.length} 条${realGap ? "【真实缺口】" : "【合理结果】"}——${UNRESOLVED_REASON_LABELS[reason]}：` +
+        `${named}${list.length > 6 ? `…（另有 ${list.length - 6} 条，完整名单见 unresolved_relations）` : ""}`,
+    );
+  }
+  return parts.join("\n");
 }
 
 // ═══════════════════════════ ⑥ 筛选 / 搜索 / 当前范围（§3.3 第二段） ═══════════════════════════
@@ -1985,8 +2131,11 @@ export const DATA_FLOW_TARGET_SEMANTICS_NOTE =
  * 验证标准成文（可复跑判据；`validateDataFlowModel` 逐条实现，检查项⑤）：
  *
  *   R1 **哪些关系算已核实**：关系 `verification === "verified"` ⇔ 它至少有**一条有效的
- *      `code_measured` 出处**（指向既有可复跑验证脚本，且该脚本登记在 `package.json` 里、
- *      脚本正文真的提到这条路径）。设计声明与代码静态分析**只能**支撑 `unverified`。
+ *      `code_measured` 出处**，该出处须有**正式检查记录**（`audit.self_check_recorded`／
+ *      `audit.independent_audit_recorded`）引用，且其运行记录绑定**当前**源清单（现读有效、覆盖被测
+ *      源码）与**当前**声明定义哈希、退出码 0、且**没有未解除的独立失败**压过它；仅"可复跑脚本存在"
+ *      只是线索，不足以判已验证。运行退出码/输出摘要由执行者如实登记、系统不替其复跑（残余信任假设）。
+ *      设计声明与代码静态分析**只能**支撑 `unverified`。
  *   R2 **未核实如何标注**：有有效出处但不到实测档 ⇒ `unverified`；一条有效出处都没有 ⇒ `missing`（缺证）。
  *   R3 **无效来源如何剔除**：出处靠「定位片段复算」——`find` 片段必须在 `path` 的
  *      `locator` 处原样出现（设计书按章节区间、代码按行、实测按脚本行）。复算失败、文件不存在、
@@ -2001,7 +2150,7 @@ export const DATA_FLOW_TARGET_SEMANTICS_NOTE =
  *      `missing_paths` 非空 ⇒ `deliverable_blocked === true`（**不得**只报缺却放行「项目可交付」）。
  */
 export const DATA_FLOW_EVIDENCE_POLICY: readonly { rule: string; text: string }[] = [
-  { rule: "R1", text: "verified ⇔ 至少一条有效 code_measured 出处（可复跑脚本＋登记在 package.json＋脚本正文提到该路径）；设计声明与代码静态分析只能支撑 unverified" },
+  { rule: "R1", text: "verified ⇔ 至少一条有效 code_measured 出处：该出处须有**正式检查记录**（self_check／independent_audit）引用，且其运行记录绑定**当前**源清单（现读有效、覆盖被测源码）与**当前**声明定义哈希、退出码 0、且**没有未解除的独立失败**压过它；仅有可复跑脚本（脚本存在／登记在 package.json／正文提到该路径）只是线索，不足以判已验证。运行退出码/输出摘要由执行者如实登记，系统不替其复跑——『真跑过』是残余信任假设。设计声明与代码静态分析只能支撑 unverified" },
   { rule: "R2", text: "有有效出处但不到实测档 ⇒ unverified；一条有效出处都没有 ⇒ missing（缺证）" },
   { rule: "R3", text: "出处靠定位片段复算：find 必须在 path 的 locator 处原样出现；复算失败／文件不存在／行号越界／脚本未登记的出处一律剔除并按 R2 重判，不保留已不作数的出处" },
   { rule: "R4", text: "静态 import 只作线索（static_clues），永不计入出处档位；verified 拿不出 code_measured 出处 ⇒ 违规（静态线索不得生成已验证的数据边）" },

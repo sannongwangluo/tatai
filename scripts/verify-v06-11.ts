@@ -126,9 +126,59 @@ const appendixBOf = (text: string): string => {
  *   按本卡既定程序**重钉前缀为当时全文**（旧钉值 b4d38d17… → 新钉值 36d8e74b…，字节 70992 → 82558）。
  *   判据未放宽：前缀仍逐字节钉死、尾部仍只许追加；本批改动出处见 `PLAN.md` 同日「附记（非卡）」与
  *   `D:/demo-project/.工作台/tatai-alignment/20260930-entry-patch/`。
+ * 定向重定基线（2026-10-07 证据补登批次）：c49d277（V09-42，2026-10-04）把 `required_reads` 项目级扩展
+ *   一条扩写为 stage-reads v2 章节绑定语义（同一条目一行替换、git diff 实测仅此一处），当时漏同步本钉值，
+ *   导致 ⑤-1 红（现场前缀 359a825b… ≠ 旧钉 36d8e74b…）。改动出处可追（git log docs/work-v2-contract.md），
+ *   按本卡既定程序**重钉前缀为当前全文**（字节 82558 → 85103，Windows CRLF 工作树口径，与历次钉值同一口径；
+ *   旧钉值 36d8e74b…｜新钉值 c35df8b7…＝当前全文实测）。判据未放宽：前缀仍逐字节钉死、尾部仍只许追加。
  */
-const CONTRACT_PREFIX_BYTES = 82558;
-const CONTRACT_PREFIX_SHA256 = "36d8e74b55557c4cfd6610c7ca171c710f89f9103ea0dd7fa32311b86ba328ab";
+const CONTRACT_PREFIX_BYTES_OLD = 85103;
+const CONTRACT_PREFIX_SHA256_OLD = "c35df8b78e265324af37c91e87d6d98d5556c7902d251058ead392852e68d845";
+/**
+ * 重定基线（2026-10-08，V09-61 测试维护；本轮治理修复授权）：
+ *   正文增量 = §9.4 下方**唯一一处**「2026-10-08 审计追加纠正」整段（段落 + 空行两行），
+ *   与 `docs/audit-recovery.md` 对应。`git diff docs/work-v2-contract.md` 实测**仅 2 行插入、0 行删除**
+ *   （插入点在第 199 行、`### 9.4` 小节内；非新开场次而是对既有只读入口一节补审计纠正口径）。
+ *   行尾口径（如实解释；**不做无条件 normalize 后弱比较**）：当前工作树是**混合行尾**——该新增段所在
+ *   §9.4 区域被编辑工具写成 LF（3 处孤 LF），其余为 CRLF；历次钉值按「Windows 工作树整篇」口径。
+ *   为免行尾抖动造成假红/假绿，新钉值对正文做**显式行尾归一化（CRLF→LF）后取精确 sha256 + 字节数**，
+ *   比对是**逐字节精确相等**；同时保留旧 CRLF 钉值做 before 对照：
+ *   移除该已审新增段后，正文（CRLF 化）**精确复现**旧钉值 85103 字节 / c35df8b7…（见下方断言）。
+ *   保留意图：此后前缀再有任何字节改动仍必须红；尾部仍只许追加（长度 ≥ 前缀即视为尾部新增）。
+ *   负例（下方断言）：改原前缀正文 / 改已审新增段 / 整段跳过 都必须报错，不允许跳过审核段。
+ */
+const CONTRACT_LF_BYTES = 85069;
+const CONTRACT_LF_SHA256 = "4a4438413ce748e88840fafe69f1d3f7674e99654ed994bb49d70e50dd3afcc2";
+/** 已审新增段（2026-10-08 审计纠正）段落原文（不含行尾）；其 sha256 亦钉死，防「整段跳过」。 */
+const CONTRACT_AUDIT_SEGMENT_20261008 =
+  "审计追加纠正（2026-10-08）：`audit.record_corrected` 使用 `audit-correction:` 实体，唯一写入者在锁内验证。仅允许 `bind_finding_refs` 和 `reclassify_not_checked`，不能产生 passed 或删除历史。必须绑定原始事件单行哈希与规范化事件哈希、目标/检查/原绑定，以及逐字段批准本请求的结构化独审裁定包和逐目标授权包；旧复合 finding 归属只接受原事件精确身份裁定。返工用同实体 CAS 与显式 supersedes。读面保留原记录与 correction_refs；待人验仍占必需项，普通 Agent pass 不能解除，user Gate 还须同任务、后续且基线有效的人工接受。完整协议、哈希区别、信任边界和真人操作见 [审计纠正契约](audit-recovery.md)。新写 finding/audit 在唯一写入服务锁内校验，非法值零追加；旧合法历史不批量改写。";
+const CONTRACT_AUDIT_SEGMENT_20261008_SHA256 = "243f14fd29fdf4e662c931e02d4e1139a3697725937a8ed0f8478e79e234e583";
+/** 移除已审段后的正文（LF 口径）应精确等于旧全文：84174 字节 / fabe122d…（before 对照的另一半）。 */
+const CONTRACT_WITHOUT_AUDIT_LF_BYTES = 84174;
+const CONTRACT_WITHOUT_AUDIT_LF_SHA256 = "fabe122d37218ae1028f34138e155f1716af6f5c12cb547780889473fb2bd19d";
+
+/** 精确前缀判据（正例/负例共用；不做任何弱比较） */
+const contractPrefixPinned = (lf: string): boolean => {
+  const b = Buffer.from(lf, "utf8");
+  return b.length >= CONTRACT_LF_BYTES && sha256(b.subarray(0, CONTRACT_LF_BYTES)) === CONTRACT_LF_SHA256;
+};
+/** 已审新增段精确在场判据：整段原文 + 其后空行都在，且整段 sha 相符 */
+const contractAuditSegmentPinned = (lf: string): boolean =>
+  lf.includes(`${CONTRACT_AUDIT_SEGMENT_20261008}\n\n`) &&
+  sha256(CONTRACT_AUDIT_SEGMENT_20261008) === CONTRACT_AUDIT_SEGMENT_20261008_SHA256;
+/** 移除已审新增段（段落 + 其后空行）；找不到就原样返回 */
+const stripAuditSegment20261008 = (lf: string): string => {
+  const i = lf.indexOf(CONTRACT_AUDIT_SEGMENT_20261008);
+  if (i < 0) return lf;
+  const after = lf.slice(i + CONTRACT_AUDIT_SEGMENT_20261008.length);
+  if (!after.startsWith("\n\n")) return lf;
+  return lf.slice(0, i) + after.slice(2);
+};
+/** 旧已钉前缀复现判据：移除已审段后的正文 CRLF 化后应精确等于旧钉值 */
+const reproducesOldPrefix = (lf: string): boolean => {
+  const b = Buffer.from(stripAuditSegment20261008(lf).replace(/\n/g, "\r\n"), "utf8");
+  return b.length === CONTRACT_PREFIX_BYTES_OLD && sha256(b) === CONTRACT_PREFIX_SHA256_OLD;
+};
 /** §6.5「不替用户选择新服务」的口径句头（断言里引用，避免把长句抄两遍） */
 const NO_SUBSTITUTE_HEAD = "不替用户选择新服务";
 
@@ -1371,12 +1421,49 @@ const run = async () => {
     "⑤-1 适配档案贴的是真实实测片段（doctor / --version / --help / 一次性执行输出），不是照抄文档",
   );
   const contractText = read(path.join(REPO, "docs", "work-v2-contract.md"));
-  const contractBytes = Buffer.from(contractText, "utf8");
+  // 行尾归一化仅此一处（口径见 CONTRACT_LF_* 常量注释）：CRLF→LF；之后一律按精确 sha256/字节数比对。
+  const contractLf = contractText.replace(/\r\n/g, "\n");
+  const contractLfBytes = Buffer.from(contractLf, "utf8");
   ok(
-    contractBytes.length >= CONTRACT_PREFIX_BYTES && sha256(contractBytes.subarray(0, CONTRACT_PREFIX_BYTES)) === CONTRACT_PREFIX_SHA256,
-    `⑤-1 docs/work-v2-contract.md **纯追加**（前 ${CONTRACT_PREFIX_BYTES} 字节哈希不变），尾部新增 §13`,
-    { bytes: contractBytes.length, prefix: sha256(contractBytes.subarray(0, CONTRACT_PREFIX_BYTES)).slice(0, 16) },
+    contractPrefixPinned(contractLf),
+    `⑤-1 docs/work-v2-contract.md **纯追加**（新钉前缀=当前全文：LF 口径前 ${CONTRACT_LF_BYTES} 字节精确 sha256 不变），尾部已含已审 2026-10-08 审计纠正段`,
+    { bytes: contractLfBytes.length, prefix: sha256(contractLfBytes.subarray(0, CONTRACT_LF_BYTES)).slice(0, 16) },
   );
+  // 已审新增段精确在场（先钉整段原文 + sha，再用它做 before 对照与负例）
+  ok(
+    contractAuditSegmentPinned(contractLf),
+    `⑤-1 已审新增段精确在场（2026-10-08 审计纠正，§9.4 下方；段落 sha=${CONTRACT_AUDIT_SEGMENT_20261008_SHA256.slice(0, 16)}…）`,
+  );
+  // before 对照：移除该已审段后复现旧已钉前缀（证明本轮增量只此一段，别的字节没被顺手放过）
+  const lfWithoutAudit = stripAuditSegment20261008(contractLf);
+  const oldFullCrlfBytes = Buffer.from(lfWithoutAudit.replace(/\n/g, "\r\n"), "utf8");
+  ok(
+    Buffer.byteLength(lfWithoutAudit, "utf8") === CONTRACT_WITHOUT_AUDIT_LF_BYTES &&
+      sha256(lfWithoutAudit) === CONTRACT_WITHOUT_AUDIT_LF_SHA256 &&
+      oldFullCrlfBytes.length === CONTRACT_PREFIX_BYTES_OLD &&
+      sha256(oldFullCrlfBytes) === CONTRACT_PREFIX_SHA256_OLD,
+    `⑤-1 移除已审新增段后**复现旧已钉前缀**（before：${CONTRACT_PREFIX_BYTES_OLD} 字节/${CONTRACT_PREFIX_SHA256_OLD.slice(0, 16)}…；判据=精确 sha256 相等）`,
+  );
+  // 负例（判据不放宽）：改原前缀正文 / 改已审新增段 / 整段跳过 都必须报错
+  {
+    const bodyIdx = contractLf.indexOf("### 9.4 ");
+    const mutatedBody = `${contractLf.slice(0, bodyIdx)}${contractLf[bodyIdx] === "#" ? "$" : "#"}${contractLf.slice(bodyIdx + 1)}`;
+    const mutatedSegment = contractLf.replace(
+      CONTRACT_AUDIT_SEGMENT_20261008,
+      `申${CONTRACT_AUDIT_SEGMENT_20261008.slice(1)}`,
+    );
+    ok(
+      !contractPrefixPinned(mutatedBody) &&
+        !contractPrefixPinned(mutatedSegment) &&
+        !contractPrefixPinned(lfWithoutAudit) &&
+        !contractAuditSegmentPinned(mutatedSegment) &&
+        !contractAuditSegmentPinned(lfWithoutAudit) &&
+        !reproducesOldPrefix(mutatedSegment) &&
+        !reproducesOldPrefix(mutatedBody),
+      "⑤-1 负例：改原前缀正文 / 改已审新增段 / 整段跳过 均报错（前缀钉值、整段在场、旧前缀复现三重判据都拦）",
+      { body: sha256(mutatedBody).slice(0, 16), segment: sha256(mutatedSegment).slice(0, 16), skipped: sha256(lfWithoutAudit).slice(0, 16) },
+    );
+  }
   ok(
     contractText.includes("## 13. 外部执行与恢复（V06-11 登记") &&
       contractText.includes("execution.start_requested") &&

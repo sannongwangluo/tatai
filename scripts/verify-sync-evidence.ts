@@ -161,8 +161,30 @@ async function main(): Promise<void> {
   documentsMod.activateBaseline(OLDPID, { approved_by: "user", approval_basis: "旧项目夹具审定", approval_kind: "user_confirmed" }, dataDir);
 
   const revOf = (taskId: string): number | null => tasksMod.readTaskStates(workDir).states[taskId]?.revision ?? null;
+  // 夹具：`result_submitted` 是**历史/迁移状态**（造"登记前已交付"的现场），不是一次新交付——走**既有状态边界**
+  // `task.status_changed` + `payload.status`（`migrate.ts` 把 v1 `done` 折成 `result_submitted` 的同一形态）；
+  // `task.result_submitted` 是交付提交事件，只由带合法认领 + 证据的提交写入（P2/V09-47 锁内共享判据），
+  // 夹具不冒充交付提交（本项不测试新交付）。
+  let fixtureStatusSeq = 0;
   const setStatus = (taskId: string, status: string, reason?: string): void => {
-    tasksMod.submitTaskStatus(submitter, { project_id: PID, task_id: taskId, change_id: CHG, actor_id: "fixture", role: "coordinator", expected_revision: revOf(taskId), status: status as never, ...(reason === undefined ? {} : { reason }) });
+    const expectedRevision = revOf(taskId);
+    if (status === "result_submitted") {
+      fixtureStatusSeq += 1;
+      submitter.submit({
+        schema_version: typesMod.SCHEMA_VERSION,
+        project_id: PID,
+        change_id: CHG,
+        entity_id: `task:${taskId}`,
+        expected_revision: expectedRevision,
+        type: "task.status_changed",
+        actor_id: "fixture",
+        role: "coordinator",
+        idempotency_key: `fixture-hist-status:${taskId}:result_submitted:${expectedRevision}:${fixtureStatusSeq}`,
+        payload: { status, ...(reason === undefined ? {} : { reason }) },
+      });
+      return;
+    }
+    tasksMod.submitTaskStatus(submitter, { project_id: PID, task_id: taskId, change_id: CHG, actor_id: "fixture", role: "coordinator", expected_revision: expectedRevision, status: status as never, ...(reason === undefined ? {} : { reason }) });
   };
   setStatus("T-1", "result_submitted", "夹具：登记前已交付");
   // 夹具代码层采集（graph_full 正向例：modules.json + budget_exhausted=false ⇒ collection complete）
@@ -580,8 +602,12 @@ async function main(): Promise<void> {
     write(REPORT_ABS, "夹具报告：本次同步证据包引用的真实 artifact。\n");
     await scanOf();
 
-    // L-7 锁内**不跑 sixGraphsOf 全量**：对一个带 graph_full 项的批次，直接提交一条仍正确的命令，
-    //     全量图探针恰被调 1 次（只在锁外预评估）；锁内只用有界图源探针。若锁内跑了全量图构建，fullCalls 会是 2。
+    // L-7 持锁主进程**不跑 sixGraphsOf 全量**：对一个带 graph_full 项的批次，直接提交一条仍正确的命令。
+    //     2026-10-03 起（6215779「unify incremental evidence reads」）锁外预评估在**受信 worker 进程**里跑
+    //     （service.submitAsync → runReadJob("sync_prep")），全量六图构建恰发生在 worker、不在本进程——
+    //     本进程探针计数恒为 0；主进程只剩锁内有界图源探针。worker 确实做了独立全量评估由 L-7b
+    //     （声称与独立重算逐项一致才放行）与 L-6b（目标漂移被拒、零字节）共同钉住；若锁内（主进程）
+    //     跑了全量图构建，fullCalls 会 ≥1 而失败。
     const graphBaselineId = entryOf("executor").baseline?.active?.baseline_id ?? "bl-none";
     await reg(mkContract("b-graph-probe", [{ id: "g", label: "图探针计数", required: true, check: { type: "graph_full", expected_baseline_id: graphBaselineId } }]));
     postEvidence("b-graph-probe", mkEvidence("b-graph-probe", contractSha("b-graph-probe"), [{ id: "g", result: "passed" }]));
@@ -599,7 +625,7 @@ async function main(): Promise<void> {
     const okReplay = { ...okCmd, idempotency_key: `${okCmd.idempotency_key}-ok`, expected_revision: syncMod.syncEntityRevision(PID, dataDir, "b-graph-probe") };
     const okRes = await postCommand(okReplay);
     ok(okRes.status === 200 && okRes.json.ok === true, "L-7b 仍正确的命令经直连提交成功（锁外预评估 + 锁内有界复核）", { status: okRes.status, code: okRes.json.code });
-    ok(fullCalls === 1, "L-7c 全量六图探针恰被调 1 次（只在锁外预评估；锁内未跑 sixGraphsOf）", { fullCalls });
+    ok(fullCalls === 0, "L-7c 持锁主进程未跑 sixGraphsOf 全量（全量评估已隔离在受信 worker 锁外预评估）", { fullCalls });
     ok(sourceCalls >= 1, "L-7d 锁内有界图源探针被调（图源输入稳定快照复核）", { sourceCalls });
     // 还原探针
     if (origFull !== null) syncProbeMod.registerSyncGraphProbe(origFull);

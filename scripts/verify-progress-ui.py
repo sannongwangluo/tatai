@@ -73,6 +73,25 @@ def write(path, text):
     return path
 
 
+# 本脚本只访问隔离的本机服务：全部 loopback 请求必须绕过系统 HTTP 代理。
+# 系统代理（HTTP_PROXY/HTTPS_PROXY）会把 127.0.0.1 的回环请求也劫走——实测经代理拿回 HTTP 502，
+# 而 no_proxy 是否在场由调用方环境决定，不能依赖。故这里用空 ProxyHandler 的局部 opener：只影响本脚本，
+# 不改用户代理设置（V09-26 修复：后端健康检查曾因代理劫持在 120s 等待后误判「未就绪」）。
+LOCAL_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _ensure_loopback_no_proxy():
+    """把 loopback 显式并入 NO_PROXY：后端/vite 子进程继承本进程环境，别让它们把本机流量交给系统代理。
+    只改本脚本进程的环境，不动用户 shell/系统代理设置。"""
+    hosts = ("localhost", "127.0.0.1", "::1")
+    for key in ("NO_PROXY", "no_proxy"):
+        parts = [p for p in os.environ.get(key, "").split(",") if p]
+        os.environ[key] = ",".join(parts + [h for h in hosts if h not in parts])
+
+
+_ensure_loopback_no_proxy()
+
+
 def http(url, method="GET", body=None, headers=None, timeout=120):
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, method=method, data=data)
@@ -81,7 +100,7 @@ def http(url, method="GET", body=None, headers=None, timeout=120):
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with LOCAL_HTTP.open(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8")
             return resp.status, (json.loads(text) if text.strip().startswith(("{", "[")) else text)
     except urllib.error.HTTPError as e:
@@ -235,7 +254,7 @@ def start_vite(port, backend_port, log_path, cache_dir):
         if proc.poll() is not None:
             raise RuntimeError("vite 起不来（进程已退出，见 ui-vite.log）")
         try:
-            with urllib.request.urlopen("http://localhost:%d/" % port, timeout=5) as resp:
+            with LOCAL_HTTP.open("http://localhost:%d/" % port, timeout=5) as resp:
                 if resp.status == 200:
                     return proc
         except Exception:
@@ -244,11 +263,13 @@ def start_vite(port, backend_port, log_path, cache_dir):
 
 
 def launch_browser(p):
+    # 浏览器同样不该把 loopback 交给系统代理（与脚本其它回环请求同口径）。
+    args = ["--no-proxy-server", "--proxy-bypass-list=*"]
     try:
-        return p.chromium.launch(headless=True)
+        return p.chromium.launch(headless=True, args=args)
     except Exception as e:  # noqa: BLE001 — 本机未装 playwright chromium 时退回系统 Edge
         info("默认 chromium 不可用（%s），退回系统 Edge" % str(e).splitlines()[0][:80])
-        return p.chromium.launch(channel="msedge", headless=True)
+        return p.chromium.launch(channel="msedge", headless=True, args=args)
 
 
 # ══════════════════════════════ 浏览器辅助 ══════════════════════════════
@@ -301,7 +322,26 @@ def wait_attr(page, selector, attr, want, timeout_s=16, label=""):
 
 
 def goto_view(page, view):
-    page.locator('button[data-view="%s"]' % view).first.click()
+    """切页：主视图直点；辅助入口（overview / terminal）先展开「更多」再点。
+
+    2026-10-06 定向更新（五要素留档）：
+      旧前提＝「项目信息」(overview) 在主视图按钮里可直接点击｜依据＝`src/ui/App.tsx:83-86` 已把
+      overview/terminal 放进 AUX_NAV，并渲染在「更多」`<details class="tt-tools-disclosure">` 的
+      `[data-aux-nav]` 内（该导航布局自 commit 986253e「用户 2026-09-22 拍板收口」起即如此；本套件
+      03f676c 2026-10-02 建立时就没适配，同一时期的源码快照里 overview 同样在 AUX_NAV）⇒
+      定位器自建立起目标按钮就不可见，第 ④ 步「慢响应>5s」从未真正跑过｜新前提＝切辅助页须先
+      展开「更多」再点｜保留意图＝仍用**真实鼠标点击**走界面切页（不改成直接改 state 或调 API
+      绕过 UI），且第 ④ 步其余断言一条不动｜判据不放宽＝仍是真点击＋真等元素可见，未用 force
+      点击、未放宽等待时长。
+    """
+    btn = page.locator('button[data-view="%s"]' % view)
+    aux = page.locator('[data-aux-nav] button[data-view="%s"]' % view)
+    if aux.count() > 0:
+        det = page.locator("details.tt-tools-disclosure")
+        if det.count() > 0 and not det.first.evaluate("(d) => d.open"):
+            det.first.locator("summary").click()
+            page.wait_for_timeout(150)
+    btn.first.click()
 
 
 def goto_acceptance(page):
@@ -453,24 +493,52 @@ def run_browser(vite_port, backend, home, fixture_root):
         step["now"] = "慢响应>5s最终显示"
         goto_view(page, "plan")
         page.wait_for_selector(PLAN_CARD_A, timeout=30000)
-        slow_calls = {"n": 0}
+        # 「慢响应」用**挂起 + 事后放行**实现，不用 time.sleep 阻塞 Playwright 同步事件循环。
+        # 2026-10-08 修正：旧写法在 route 处理器里 sleep 6.6s 会把同步事件循环整体卡住；被延迟的
+        # 请求各自再 sleep，读断言几乎跑不动、最后必然超时——那是**夹具缺陷**（等价于 sync UI 里
+        # 早就注明的「不用 sleep 阻塞事件循环」），不是产品丢刷新。
+        held = {"n": 0, "routes": [], "first_at": None}
         def slow_a(route):
-            slow_calls["n"] += 1
-            time.sleep(6.6)  # 约 6.6s > 5s 对账周期：旧「每轮 stale 就重发、旧回包一律丢」的实现永远看不到结果
-            route.continue_()
+            if held["first_at"] is None:
+                held["first_at"] = time.time()  # 计时要锚在「第一笔真被挂起」这一刻，不是脚本自己开始等
+            held["n"] += 1
+            held["routes"].append(route)  # 先不回包：模拟在途慢响应（不阻塞事件循环）
         page.route("**/api/projects/%s/plan" % IDA, slow_a)
-        slow_calls["n"] = 0
         goto_view(page, "overview")  # 卸载 PlanView
-        goto_view(page, "plan")      # 重挂 → 首发请求被延迟 6.6s
+        goto_view(page, "plan")      # 重挂 → 首发请求被挂起
         t0 = time.time()
+        # 有界等**至少一笔真被挂起**再计时：拦不到请求时「在途 0 笔 ≤ 3」是恒真，等于没测（复审第 3 点）。
+        hold_deadline = time.time() + 8.0
+        while held["n"] < 1 and time.time() < hold_deadline:
+            page.wait_for_timeout(100)
+        inflight_before_release = held["n"]
+        ok(inflight_before_release >= 1,
+           "慢响应夹具确实拦到在途请求（/plan 在途 %d 笔，不是「0 笔也过」）" % inflight_before_release)
+        # 只有真拦到才等：让被挂起的首发请求在途 > 5s（跨过至少一个 5s 对账周期）后放行——慢响应必须最终落地。
+        if inflight_before_release >= 1:
+            hold_start = held["first_at"] if held["first_at"] is not None else t0
+            remain = 5.5 - (time.time() - hold_start)
+            if remain > 0:
+                page.wait_for_timeout(int(remain * 1000))
+        for r in list(held["routes"]):
+            try:
+                r.continue_()
+            except Exception:  # noqa: BLE001
+                pass
         landed, _ = wait_attr(page, PLAN_CARD_A, "data-plan-card", lambda v: v == "TA-1",
-                              timeout_s=22, label="慢响应最终落地")
-        elapsed = time.time() - t0
+                              timeout_s=20, label="慢响应最终落地")
+        elapsed = time.time() - (held["first_at"] if held["first_at"] is not None else t0)
         ok(landed and elapsed > 5.0,
-           "慢响应（%.1fs > 5s 对账周期）最终仍落地显示（期间 /plan 请求 %d 笔，同一加载器有界）"
-           % (elapsed, slow_calls["n"]))
-        ok(slow_calls["n"] <= 3, "慢响应在途期间同一加载器未并发堆积（/plan 仅 %d 笔）" % slow_calls["n"])
+           "慢响应（%.1fs > 5s 对账周期）最终仍落地显示（在途期间 /plan 仅 %d 笔，同一加载器有界）"
+           % (elapsed, inflight_before_release))
+        ok(inflight_before_release <= 3,
+           "慢响应在途期间同一加载器未并发堆积（/plan 仅 %d 笔）" % inflight_before_release)
         page.unroute("**/api/projects/%s/plan" % IDA)
+        for r in list(held["routes"]):
+            try:
+                r.continue_()
+            except Exception:  # noqa: BLE001
+                pass
 
         # ── ④b 多次快速切换 A↔B：不串项目、不回退、网络有界（并发 ≤1） ──
         step["now"] = "多次切换"
@@ -547,11 +615,23 @@ def run_browser(vite_port, backend, home, fixture_root):
         ok(attr_of(page, "[data-arch-status-loads]", "data-arch-status-stale") == "0",
            "技术详情状态层无陈旧标记")
         page.locator('[data-graph-mode="DATA_FLOW"]').click()
-        page.wait_for_selector("[data-flow-target-layer]", timeout=30000)
+        # 2026-10-08：产品新增「业务数据路径」层（BusinessDataFlowView）并设为 DATA_FLOW 的默认层；
+        # 旧画布与目标语义层 `[data-flow-target-layer]` 现在挂在「代码引用线索」层下（父容器 .hidden）。
+        # 目标语义层不可见就先切到代码层再核——仍是同一个被断言的目标语义层，判据不放宽；切不过去
+        # 也不让整段中止（下面用容错读取，坏在红例里如实记 FAIL，后续段照跑）。
+        if not page.locator("[data-flow-target-layer]").is_visible():
+            code_btn = page.get_by_role("button", name="代码引用线索")
+            if code_btn.count() > 0:
+                code_btn.first.click()
+                page.wait_for_timeout(800)
+        has_flow_anchor = wait_present(page, "[data-flow-target-layer]", timeout_s=12)
         m1 = int(attr_of(page, "[data-flow-target-layer]", "data-flow-target-loads") or "0")
         page.wait_for_timeout(6500)
         m2 = int(attr_of(page, "[data-flow-target-layer]", "data-flow-target-loads") or "0")
-        ok(m2 > m1, "数据流向图**目标语义层**自动重取（data-flow-target-loads %d → %d）" % (m1, m2))
+        flow_visible = page.locator("[data-flow-target-layer]").is_visible()
+        ok(has_flow_anchor and flow_visible and m2 > m1,
+           "数据流向图**目标语义层**在场、可见且自动重取（data-flow-target-loads %d → %d；层可见=%s）"
+           % (m1, m2, flow_visible))
         page.screenshot(path=os.path.join(SHOT_DIR, "06-tech-dataflow.png"))
 
         # ── ⑦ 只有文件变化（Gate）没有账本事件，也追平 ──

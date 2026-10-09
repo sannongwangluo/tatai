@@ -30,9 +30,15 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "vite";
+// P0/V09-45：构建身份（docs/agent-optimization-20261006.md §4）。身份经构建器 define 内联进产物，
+// **不落文件**（无生成物 ⇒ 无自指，写值不改指纹）。
+import { BUILD_IDENTITY_DEFINE, buildDefineConfig, deriveIdentity, detectInputDrift, reconcileInputs, SERVER_BUILD_TARGET } from "./lib/buildIdentity";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const OUT_DIR = path.join(REPO_ROOT, "src-tauri", "resources", "server");
+// 产物目录可用 TATAI_BUILD_SERVER_OUT 覆盖：验证/隔离跑构建时不碰真实随包目录（默认逐字不变）。
+const OUT_DIR = process.env.TATAI_BUILD_SERVER_OUT
+  ? path.resolve(process.env.TATAI_BUILD_SERVER_OUT)
+  : path.join(REPO_ROOT, "src-tauri", "resources", "server");
 
 /** 目标平台（本卡只出 Windows 包，U3 卡负责安装包；跨平台包另开卡） */
 const PLATFORM = `${process.platform}-${process.arch}`;
@@ -335,6 +341,21 @@ function buildThirdPartyNotices(built: { modules?: Record<string, unknown> }[]):
 
 fs.rmSync(OUT_DIR, { recursive: true, force: true });
 
+// ── P0/V09-45：构建输入先冻结、校验未漂移，再据此推身份并内联（§4.2、§4.3、§4.4）──
+// 有冻结值（`tauri:build` 起了同一次构建）就以冻结值为准并核实未漂移；不一致 ⇒ 立即 FAIL、不构建。
+// 身份经 `define` 编译期内联，**不写身份文件**——因此身份生成物本身不进输入指纹（无自指）。
+const inputs = reconcileInputs(REPO_ROOT);
+if (inputs.drifted) {
+  for (const r of inputs.reasons) console.log(`[build-server] FAIL 构建输入漂移：${r}`);
+  console.error("[build-server] 冻结输入在构建期被改动——拒绝构建（不静默放行）");
+  process.exit(1);
+}
+const derivation = deriveIdentity(REPO_ROOT, { inputs: inputs.effective });
+console.log(
+  `[build-server] 构建身份：release ${derivation.release_id.slice(0, 12)}… / build ${derivation.build_id.server.slice(0, 12)}…` +
+    `（server 输入 ${derivation.server_input_fingerprint.slice(0, 12)}… / ui 输入 ${derivation.ui_input_fingerprint.slice(0, 12)}…）`,
+);
+
 const externals = NATIVE_DEPS.map((d) => d.name);
 console.log(`[build-server] 打包后端：vite SSR → ${path.relative(REPO_ROOT, OUT_DIR)}（external: ${externals.join(", ")}）`);
 
@@ -343,11 +364,13 @@ const result = await build({
   configFile: false,
   root: REPO_ROOT,
   logLevel: "warn",
+  // 身份内联：编译期把 __TATAI_BUILD_IDENTITY__ 替换成这份常量（与 src/shared/version.ts 同类先例）
+  define: buildDefineConfig(derivation.identities),
   build: {
     ssr: true,
     outDir: OUT_DIR,
     emptyOutDir: false,
-    target: "node20",
+    target: SERVER_BUILD_TARGET,
     minify: false,
     sourcemap: false,
     reportCompressedSize: false,
@@ -374,6 +397,26 @@ ok(fs.existsSync(path.join(OUT_DIR, "index.js")), "① 后端入口 index.js 产
 ok(fs.existsSync(path.join(OUT_DIR, "mcp.js")), "① MCP 入口 mcp.js 产出");
 ok(fs.existsSync(path.join(OUT_DIR, "write-service.js")), "① 独立写入服务入口 write-service.js 产出（V07-01，MCP 自愈按需拉起的就是它）");
 ok(fs.existsSync(path.join(OUT_DIR, "read-worker.js")), "① 只读 worker 入口 read-worker.js 产出（V09-37，宿主只读派生的工作线程；readWorkerPool 打包态按它起）");
+
+// ── P0/V09-45：构建后清单漂移检测（§4.2）──
+// 把**实际打进产物的模块清单**（rollup 的 chunk.modules）与显式输入集比对：仓库内、清单外的模块 ⇒ FAIL。
+// 第三方（node_modules）与 Node 内建排除在"清单外源码"判定之外（按锁文件与工具链归属，不误判），
+// 但仓库内模块出现在输出目录（自指）同样 FAIL。这样"显式清单悄悄过期"不会变成假绿。
+const drift = detectInputDrift(
+  "server",
+  chunks.flatMap((c) => Object.keys(c.modules ?? {})),
+  REPO_ROOT,
+);
+console.log(
+  `[build-server] 清单漂移检测：仓库内模块 ${drift.repo_modules.length} 个；` +
+    `本仓依赖树内第三方 ${drift.external_modules} 个、非文件路径 ${drift.non_path_ids} 个（不计入清单外判定）`,
+);
+ok(drift.outside.length === 0, `① 无清单外仓库内模块（清单外：${drift.outside.join(", ") || "无"}）`);
+ok(drift.output_self_reference.length === 0, `① 无输出目录自指模块（自指：${drift.output_self_reference.join(", ") || "无"}）`);
+ok(
+  drift.external_undeclared.length === 0,
+  `① 无未声明外部源码（仓库外非依赖的绝对源：${drift.external_undeclared.join(", ") || "无"}）`,
+);
 
 // ───────────────────────── ② 原生依赖按白名单落地 ─────────────────────────
 

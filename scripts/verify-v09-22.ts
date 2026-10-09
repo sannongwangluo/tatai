@@ -354,7 +354,16 @@ async function main(): Promise<void> {
     ok(full.nodes.length === G && full.nodes.every((n) => n.kind !== "aggregate"), `B 全量：分组节点 ${full.nodes.length}（=源 ${G}）、无聚合节点`);
     ok(full.aggregate_node === null && full.nodes.every((n) => n.hidden_members === 0), `B 全量：aggregate_node=${full.aggregate_node}、hidden_members 全 0`);
     const shownMembers = new Set(full.nodes.flatMap((n) => n.members));
-    ok(shownMembers.size === G && taskIds.every((t) => shownMembers.has(t)), `B 全量：成员 id 并集=${shownMembers.size}（=源任务 ${G}，一个不漏）`);
+    // V09-55 定向更新：成员账目统一后，能力成员 = 声明归属（task_design_ref）+ 实测二级派生
+    // （observed implementation_map 经任务归到能力）；本夹具每能力都有一条 observed 实现映射，
+    // 故并集 = 任务 G + 派生代码模块 G。判据**不放宽**：源任务与派生模块都必须一个不漏地在场。
+    const codeMembers = nodes.filter((n) => n.kind === "module").map((n) => n.id);
+    ok(
+      shownMembers.size === G * 2 &&
+        taskIds.every((t) => shownMembers.has(t)) &&
+        codeMembers.every((c) => shownMembers.has(c)),
+      `B 全量：成员 id 并集=${shownMembers.size}（源任务 ${G}＋实测派生代码模块 ${G}，一个不漏）`,
+    );
     info(`B 概览聚合节点 label：${aggregate?.label ?? "(无)"}`);
   }
 

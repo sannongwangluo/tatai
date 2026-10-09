@@ -251,13 +251,28 @@ async function main(): Promise<void> {
         clueEdges.every((e) => !e.static_clues.some((c) => e.evidence.some((r) => r.locator.includes(c.split(" · ")[0])))),
       `② 静态 import／字符串线索只进 static_clues（${clueEdges.length} 条关系有线索），没有被当成出处档位`,
     );
+    // V09-61（2026-10-08 判据收紧；finding f-4c71d59ab5552d36）：**脚本存在不再等于实测**。
+    // 这两条关系的实测档原口径是「脚本在 + 登记在 package.json + 正文含定位片段」就判已验证——
+    // 那是假绿（脚本实际 exit 1 也绿）。收紧后判 `code_measured` 还必须有一条**当前可成立的运行记录**
+    // （内容地址复核通过 + 退出码 0 + 源清单载体现读 valid + 范围覆盖；见 src/arch/dataflowEvidence.ts）。
+    // 真实塔台当前**没有**这类运行记录，故如实退回未核实；脚本仍作为可复跑线索（code_static 出处）在场。
+    // 定向更新的是**读数**（原断言依赖旧口径的偶然绿），判据本身由 ⑤ 的反例（自造已验证的链）继续证明仍会拦住违规。
     for (const id of ["df-edge-service-events", "df-edge-events-projection"]) {
       const e = model.edges.find((x) => x.id === id);
       ok(
-        e !== undefined && e.verification === "verified" && e.evidence.some((r) => r.tier === "code_measured"),
-        `② ${id} 标「已验证」并拿得出 code_measured 出处（${e?.evidence.find((r) => r.tier === "code_measured")?.locator ?? "无"}）`,
+        e !== undefined &&
+          e.verification !== "verified" &&
+          e.evidence.some((r) => r.tier === "code_static") &&
+          !e.evidence.some((r) => r.tier === "code_measured"),
+        `② ${id} 无有效运行证据 ⇒ 不标「已验证」、仍保留可复跑线索（${e?.verification}；` +
+          `线索 ${e?.evidence.find((r) => r.tier === "code_static")?.locator ?? "无"}）`,
       );
     }
+    ok(
+      model.scan.notes.some((n) => n.includes("实测未采信")) &&
+        model.edges.some((e) => e.id === "df-edge-service-events" && e.verification === "unverified"),
+      "② 实测未采信的原因逐条可见（scan.notes 点名「实测未采信」，不是静默降级）",
+    );
     ok(
       model.edges
         .filter((e) => e.verification === "verified")
@@ -433,10 +448,13 @@ async function main(): Promise<void> {
       c8.nodes = c8.nodes.filter((n) => n.kind !== "store");
       caseOk("实体缺一类（没有存储）", c8, ["entity_kind_uncovered"]);
     }
+    // V09-61 定向更新：旧反例靠"真实链当时是已验证"才触发判据——收紧后真实链如实退回未核实，
+    // 反例必须**自造**「链标已验证」这一前提（更自足，不再依赖真实数据的偶然绿）。
     {
       const c9 = clone();
       c9.chains[0].hops = c9.chains[0].hops.filter((h) => h.node_id !== "df-node-work-events");
       c9.chains[0].hops = c9.chains[0].hops.map((h, i) => ({ ...h, index: i + 1 }));
+      c9.chains[0].verification = "verified";
       caseOk("链上缺一环（少了存储跳）却仍标「已验证」", c9, ["chain_missing_kinds", "chain_verified_with_missing_hop"]);
     }
     {
@@ -444,12 +462,14 @@ async function main(): Promise<void> {
       const hop = c10.chains[0].hops[2];
       c10.nodes = c10.nodes.map((n) => (n.id === hop.node_id ? { ...n, verification: "unverified" as const } : n));
       c10.chains[0].hops[2].verification = "unverified";
+      c10.chains[0].verification = "verified";
       caseOk("链上有一跳没到已验证却整条标「已验证」", c10, ["chain_verified_with_missing_hop"]);
     }
     {
       const c11 = clone();
       const chainEdge = c11.chains[0].hops[3].edge_id!;
       c11.edges = c11.edges.map((e) => (e.id === chainEdge ? { ...e, verification: "unverified" as const } : e));
+      c11.chains[0].verification = "verified";
       caseOk("链上有一条关系没到已验证却整条标「已验证」", c11, ["chain_verified_with_missing_hop"]);
     }
     {

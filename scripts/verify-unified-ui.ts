@@ -421,6 +421,104 @@ async function directedChecks(raw: RawFetch): Promise<void> {
     ok(ra.ok && rb.ok && count(u) === 1 && ta === tb, "U-HDR2 大小写归一后同义头仍合并（不因规范化而过度不共享）", { count: count(u) });
   }
 
+  // U-HDR3 同名多值的先后次序是请求语义，不能按值排序后误合并。
+  {
+    const u = mkUrl("hdr-value-order", "delay=120");
+    const [ra, rb] = await Promise.all([
+      settle(sharedReadFetch(u, { headers: [["X-Order", "a"], ["X-Order", "b"]] }, raw)),
+      settle(sharedReadFetch(u, { headers: [["X-Order", "b"], ["X-Order", "a"]] }, raw)),
+    ]);
+    const ja = ra.ok ? await ra.value.json() as { headers: Record<string, string> } : null;
+    const jb = rb.ok ? await rb.value.json() as { headers: Record<string, string> } : null;
+    ok(count(u) === 2 && ja?.headers["x-order"] === "a, b" && jb?.headers["x-order"] === "b, a",
+      "U-HDR3 同名值反序不共享，真实后端分别收到 a,b 与 b,a", { count: count(u), ja, jb });
+  }
+  // U-HDR4 平台语义相同的数组、Headers 与对象形态仍共享一笔真实请求。
+  {
+    const u = mkUrl("hdr-equivalent-shapes", "delay=120");
+    const inputs: HeadersInit[] = [
+      [["X-Order", "a"], ["x-order", "b"], ["X-Other", " z "]],
+      new Headers([["X-Other", "z"], ["X-Order", "a"], ["X-Order", "b"]]),
+      { "x-other": "z", "X-Order": "a, b" },
+    ];
+    const responses = await Promise.all(inputs.map(headers => settle(sharedReadFetch(u, { headers }, raw))));
+    const bodies = await Promise.all(responses.map(async r => r.ok ? await r.value.json() as { headers: Record<string, string> } : null));
+    ok(count(u) === 1 && bodies.every(b => b?.headers["x-order"] === "a, b" && b.headers["x-other"] === "z"),
+      "U-HDR4 同义头跨形态/大小写/空白/不同头顺序仍合并", { count: count(u), bodies });
+  }
+
+  // U-HDR5 无效 null 头不可借用空头的成功响应，错误语义也必须保留。
+  {
+    const u = mkUrl("hdr-null-invalid", "delay=120");
+    const [valid, invalid] = await Promise.all([
+      settle(sharedReadFetch(u, { headers: {} }, raw)),
+      settle(sharedReadFetch(u, { headers: null as unknown as HeadersInit }, raw)),
+    ]);
+    if (valid.ok) await valid.value.text();
+    ok(valid.ok && !invalid.ok && count(u) === 1,
+      "U-HDR5 null 头仍由真实 fetch 拒绝，不借空头在途请求伪成功", { count: count(u), valid: valid.ok, invalid: invalid.ok });
+  }
+
+  // U-HDR6 fetch 支持的自定义迭代器不等于 Object.entries；未知形态须原样不共享。
+  {
+    const u = mkUrl("hdr-custom-iterator", "delay=120");
+    const iterable = { *[Symbol.iterator]() { yield ["X-Order", "iterator"]; } };
+    const [plain, custom] = await Promise.all([
+      settle(sharedReadFetch(u, { headers: {} }, raw)),
+      settle(sharedReadFetch(u, { headers: iterable as unknown as HeadersInit }, raw)),
+    ]);
+    const a = plain.ok ? await plain.value.json() as { headers: Record<string, string> } : null;
+    const b = custom.ok ? await custom.value.json() as { headers: Record<string, string> } : null;
+    ok(count(u) === 2 && a?.headers["x-order"] === undefined && b?.headers["x-order"] === "iterator",
+      "U-HDR6 自定义可迭代头不误读为空对象共享，真实 fetch 仍收到原头", { count: count(u), a, b });
+  }
+
+  // U-HDR7 Headers 子实例的迭代语义仍由平台决定，不能用旧 forEach 内容替代。
+  {
+    const u = mkUrl("hdr-native-custom-iterator", "delay=120");
+    const customHeaders = new Headers();
+    Object.defineProperty(customHeaders, Symbol.iterator, { value: function* () { yield ["X-Order", "native-custom"]; } });
+    const [plain, custom] = await Promise.all([
+      settle(sharedReadFetch(u, { headers: new Headers() }, raw)),
+      settle(sharedReadFetch(u, { headers: customHeaders }, raw)),
+    ]);
+    const a = plain.ok ? await plain.value.json() as { headers: Record<string, string> } : null;
+    const b = custom.ok ? await custom.value.json() as { headers: Record<string, string> } : null;
+    ok(count(u) === 2 && a?.headers["x-order"] === undefined && b?.headers["x-order"] === "native-custom",
+      "U-HDR7 原生 Headers 自定义迭代器不与空头合并，真实语义保留", { count: count(u), a, b });
+  }
+
+  // U-HDR8 自定义头迭代器可能有副作用；规范化不得在真实 fetch 前额外消费。
+  {
+    const u = mkUrl("hdr-stateful-iterator", "delay=120");
+    const customHeaders = new Headers();
+    let iterations = 0;
+    Object.defineProperty(customHeaders, Symbol.iterator, { value: function* () { yield ["X-Step", String(++iterations)]; } });
+    const response = await settle(sharedReadFetch(u, { headers: customHeaders }, raw));
+    const body = response.ok ? await response.value.json() as { headers: Record<string, string> } : null;
+    ok(iterations === 1 && body?.headers["x-step"] === "1" && count(u) === 1,
+      "U-HDR8 自定义迭代器只由真实 fetch 消费一次，不改变单次请求", { iterations, count: count(u), body });
+  }
+
+  // U-HDR9 同一保守边界覆盖数组迭代器与对象访问器，预检本身不得执行它们。
+  {
+    const u = mkUrl("hdr-array-iterator", "delay=120");
+    let reads = 0;
+    const headers: [string, string][] = [];
+    Object.defineProperty(headers, Symbol.iterator, { value: function* () { yield ["X-Step", String(++reads)]; } });
+    const response = await settle(sharedReadFetch(u, { headers }, raw));
+    const body = response.ok ? await response.value.json() as { headers: Record<string, string> } : null;
+    ok(reads === 1 && body?.headers["x-step"] === "1", "U-HDR9a 数组自定义迭代器原样单次消费", { reads, body });
+  }
+  {
+    const u = mkUrl("hdr-record-getter", "delay=120");
+    let reads = 0;
+    const headers = { get "X-Step"() { return String(++reads); } };
+    const response = await settle(sharedReadFetch(u, { headers }, raw));
+    const body = response.ok ? await response.value.json() as { headers: Record<string, string> } : null;
+    ok(reads === 1 && body?.headers["x-step"] === "1", "U-HDR9b 对象访问器原样单次消费", { reads, body });
+  }
+
   // U-SYNC 底层同步抛错：清槽并拒绝，不留永久空槽
   {
     let calls = 0;

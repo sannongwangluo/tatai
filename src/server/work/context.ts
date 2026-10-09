@@ -581,7 +581,7 @@ export function readContextSource(
   if (opts.cursor !== undefined && opts.cursor !== "") {
     // U3 上游接线：泛型文件读口**兼容消费**新格式 `tcur1`（完整 sha ＋ 项目/文档绑定），
     // 因为上下文包的设计/施工页现在给的正是它——若只认旧 `tctx1`，包里的指路标就用不了。
-    // 旧 `tctx1` 行为**逐字不变**（16 位前缀匹配）。校验：完整哈希不符＝SOURCE_CHANGED、绑定不符＝CROSS_PROJECT。
+    // 旧 `tctx1` 行为**逐字不变**（16 位前缀匹配）。校验：完整哈希不符＝SOURCE_CHANGED、绑定不符＝INVALID_CURSOR。
     const modern = parseProjectCursor(opts.cursor);
     if (modern !== null) {
       if (modern.fullSha !== version) {

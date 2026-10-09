@@ -51,6 +51,7 @@ import {
   hasV2ProjectionMarker,
   readTaskStates,
   submitDefinitionImports,
+  submitTaskEvent,
   submitTaskRebind,
   submitTaskStatus,
   taskEntityId,
@@ -1034,20 +1035,39 @@ const statusSeq: [string, "claimed" | "executing" | "result_submitted" | "blocke
 ];
 for (const [taskId, status] of statusSeq) {
   const current = readTaskStates(defsWorkDir).states[taskId];
-  submitTaskStatus(defsSvc, {
-    project_id: "defs",
-    task_id: taskId,
-    change_id: "defs-status-1",
-    actor_id: "kimi-code",
-    role: "executor",
-    expected_revision: current.revision,
-    status,
-    definition: {
-      definition_sha256: hashes0.get(taskId)!,
-      plan_revision: current.plan_revision ?? "",
-      definition_revision: 1,
-    },
-  });
+  const definition = {
+    definition_sha256: hashes0.get(taskId)!,
+    plan_revision: current.plan_revision ?? "",
+    definition_revision: 1,
+  };
+  if (status === "result_submitted") {
+    // V09-47/P2 起 `task.result_submitted` 是**交付提交**事件（锁内要求当前认领 + 可追溯证据），
+    // 而 `submitTaskStatus(result_submitted)` 仍按原语义产出它 ⇒ 会被锁内判据拒。本用例只想把卡
+    // **置成历史状态**（不是一次新交付），按设计走**既有状态边界** `task.status_changed(status=
+    // "result_submitted")`——与 `migrate.ts` 把 v1 `done` 折成 `result_submitted` 逐字同一形态
+    // （不带交付包、不宣称交付判据通过）。用例原意（状态更新不改变定义哈希）与断言都不变。
+    submitTaskEvent(defsSvc, {
+      project_id: "defs",
+      task_id: taskId,
+      change_id: "defs-status-1",
+      actor_id: "kimi-code",
+      role: "executor",
+      expected_revision: current.revision,
+      type: "task.status_changed",
+      payload: { status, ...definition },
+    });
+  } else {
+    submitTaskStatus(defsSvc, {
+      project_id: "defs",
+      task_id: taskId,
+      change_id: "defs-status-1",
+      actor_id: "kimi-code",
+      role: "executor",
+      expected_revision: current.revision,
+      status,
+      definition,
+    });
+  }
 }
 const statesAfterStatus = readTaskStates(defsWorkDir);
 const reimportedSame = importTaskDefinitions(read(defsPlanPath), {

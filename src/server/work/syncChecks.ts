@@ -11,8 +11,9 @@ import type { WorkEvent } from "./types";
 import { resolveProjectRelative } from "./documents";
 import { importTaskDefinitions, taskDefinitionHash, type TaskDefinition } from "./plan";
 import { foldTaskStates, readTaskStates } from "./tasks";
-import { loadStageReads } from "./stageReads";
+import { loadStageReads, type StageReadEntry } from "./stageReads";
 import { findDuplicateKey } from "./stageReads";
+import { markdownSectionDigest } from "../../shared/materialSection";
 import { contractSourceSnapshot, isSyncInboxRelativePath, jsonPointerProblem, stableStringify, syncContractSha256, type SyncSourceSnapshot } from "./syncContract";
 import {
   SYNC_EVIDENCE_FILE_SUFFIX,
@@ -140,6 +141,18 @@ export interface ItemEvaluation {
   expected: unknown;
   actual: unknown;
   reasons: string[];
+  /**
+   * **非 actual 的一部分**（不参与任何指纹/锁内逐字段比对）：只有 `graph_full` 在**全量**模式下带回
+   * 当前图更新态（`updating`/`ready`/`stale`/`failed`），供只读修复计划如实标 `waiting_for_derivation`。
+   * 锁内有界模式（graphSourceOnly）拿不到它 → undefined（不猜、不编）。
+   */
+  graph_update_state?: string | null;
+  /**
+   * `graph_update_state="updating"` 时，updating 是不是**唯一**的未通过原因（图项结构上无其它问题、
+   * 且探针只带回这一条原因）。有来源漂移/其它失败时须为 false——修复计划据此**不**把 updating 说成
+   * 唯一"直接原因"。非 updating 时为 undefined。
+   */
+  graph_update_sole?: boolean;
 }
 
 const okEval = (expected: unknown, actual: unknown): ItemEvaluation => ({ verdict: "passed", expected, actual, reasons: [] });
@@ -324,28 +337,97 @@ function evalCheck(check: SyncCheck, registeredSeq: number, ctx: EvalContext): I
       // actual **只放有界稳定字段**（基线身份 + 源修订 + 当前是否仍有效 + 图输入身份 + 业务事件投影指纹），
       // 完整图结论在 reasons——这样锁内可用图源探针重算出**逐字段一致**的 actual 做指纹复核。
       const actual = { baseline_id: res.baseline_id, baseline_valid: res.baseline_valid, design_revision: res.design_revision, plan_revision: res.plan_revision, plan_definition_revision: res.plan_definition_revision, graph_inputs: res.graph_inputs, graph_input_problems: res.graph_input_problems, events_fp: eventsFp };
-      if (!res.ok) return bad(res.verdict, expected, actual, res.reasons);
+      // graph_update_state 走 ItemEvaluation 的**旁路字段**（不进 actual）：锁内 actual 逐字段一致性不受影响。
+      // `graph_update_sole`：图项结构上没别的毛病、且探针只带回这一条原因时，才敢说 updating 是**唯一**原因
+      // （探针在 updating 时必push「图正在更新」；只要另有问题就会多一条原因 → reasons.length>1）。
+      const structurallyClean =
+        res.availability === "published" &&
+        res.complete === true &&
+        res.collection_status === "complete" &&
+        res.anomalies.length === 0 &&
+        res.baseline_valid === true &&
+        res.baseline_id === check.expected_baseline_id &&
+        res.graph_input_problems.length === 0;
+      const updateSole = res.update_state === "updating" && structurallyClean && res.reasons.length === 1;
+      const withState = (ev: ItemEvaluation): ItemEvaluation => ({ ...ev, graph_update_state: res.update_state ?? null, graph_update_sole: res.update_state === "updating" ? updateSole : undefined });
+      if (!res.ok) return withState(bad(res.verdict, expected, actual, res.reasons));
       if (res.baseline_id !== check.expected_baseline_id) {
-        return bad("failed", expected, actual, [`有效基线不是登记的 ${check.expected_baseline_id}（实际 ${res.baseline_id ?? "（无）"}）`]);
+        return withState(bad("failed", expected, actual, [`有效基线不是登记的 ${check.expected_baseline_id}（实际 ${res.baseline_id ?? "（无）"}）`]));
       }
-      return okEval(expected, actual);
+      return withState(okEval(expected, actual));
     }
     case "required_reads": {
       const expected = { entries: check.expected };
       const load = loadStageReads(ctx.projectRoot);
       if (load.status === "absent") return bad("failed", expected, null, ["项目没有阶段必读指针（.工作台/work/stage-reads.json 不存在）"]);
       if (load.status === "invalid") return bad("invalid", expected, null, load.reasons);
-      const byPath = new Map(load.entries.map((e) => [e.path, e]));
+      // v2 允许同一 path 以不同 section 各列一条（登记去重键是 path+section）——按 **(path, section)** 建索引；
+      // 只用 path 会让同 path 的多章节互相覆盖，出现假通过/假缺项。
+      const index = new Map<string, StageReadEntry[]>();
+      for (const e of load.entries) {
+        const k = `${e.path}\u0000${e.section ?? ""}`;
+        const arr = index.get(k);
+        if (arr === undefined) index.set(k, [e]);
+        else arr.push(e);
+      }
+      const label = (path: string, section: string | null): string => (section === null ? path : `${path}（章节 ${JSON.stringify(section)}）`);
       const reasons: string[] = [];
-      const rows: { path: string; present: boolean; sha256: string | null }[] = [];
+      const rows: { path: string; section: string | null; present: boolean; matched: number; revision: string | null }[] = [];
       for (const want of check.expected) {
-        const e = byPath.get(want.path);
-        rows.push({ path: want.path, present: e !== undefined, sha256: e?.revision ?? null });
-        if (e === undefined) reasons.push(`阶段必读缺条目：${want.path}`);
-        else if (want.sha256 !== undefined && e.revision !== want.sha256) reasons.push(`阶段必读 ${want.path} 的 revision 与登记不符`);
+        const wantSection = want.section ?? null;
+        const hits = index.get(`${want.path}\u0000${wantSection ?? ""}`) ?? [];
+        if (hits.length === 0 && wantSection === null) {
+          // 未点名 section，但该 path 只有章节绑定条目：明确要求点名 section，不按整文件哈希猜。
+          const bound = load.entries.filter((e) => e.path === want.path && e.section !== undefined);
+          if (bound.length > 0) {
+            rows.push({ path: want.path, section: null, present: false, matched: 0, revision: null });
+            reasons.push(
+              `阶段必读 ${want.path} 只有章节绑定条目（section=${bound.map((e) => JSON.stringify(e.section)).join("、")}）；登记未点名 section，不按整文件哈希猜——请显式登记 section`,
+            );
+            continue;
+          }
+        }
+        rows.push({ path: want.path, section: wantSection, present: hits.length > 0, matched: hits.length, revision: hits[0]?.revision ?? null });
+        if (hits.length === 0) {
+          reasons.push(`阶段必读缺条目：${label(want.path, wantSection)}`);
+          continue;
+        }
+        if (hits.length > 1) {
+          reasons.push(`阶段必读 ${label(want.path, wantSection)} 命中 ${hits.length} 条重复条目（登记不唯一）`);
+          continue;
+        }
+        const e = hits[0] as StageReadEntry;
+        if (want.sha256 !== undefined && e.revision !== want.sha256) {
+          reasons.push(
+            `阶段必读 ${label(want.path, e.section ?? null)} 的 revision 与登记不符（该条目是${e.section === undefined ? "整文件" : "章节子树"}哈希）`,
+          );
+        }
       }
       const actual = { entries: rows };
       return reasons.length === 0 ? okEval(expected, actual) : bad("missing", expected, actual, reasons);
+    }
+    case "markdown_section": {
+      const expected = { path: check.path, section: check.section, sha256: check.sha256 };
+      const r = readTargetFile(check.path, ctx);
+      if (!r.ok) return bad(r.verdict, expected, null, [r.reason]);
+      // 章节子树哈希（标题行 + 全部后代；代码围栏里的 `#` 不算标题）。章节外改动不影响。
+      const d = markdownSectionDigest(r.buf, check.section);
+      if (!d.ok) {
+        // 非文本/非法选择器 = invalid（目标形状不对）；章节缺失/同级同名重复 = failed（目标内容不再满足契约）。
+        const verdict: SyncItemVerdict = d.code === "not_text" || d.code === "bad_selector" ? "invalid" : "failed";
+        return bad(verdict, expected, null, [`${check.path} 章节 ${JSON.stringify(check.section)} 拒绝：${d.reason}`]);
+      }
+      const actual = {
+        path: check.path,
+        section: d.section.path,
+        section_sha256: d.sha256,
+        section_lines: [d.section.line_start, d.section.line_end],
+      };
+      return d.sha256 === check.sha256
+        ? okEval(expected, actual)
+        : bad("failed", expected, actual, [
+            `章节 ${JSON.stringify(check.section)} 子树哈希不符：登记 ${check.sha256.slice(0, 12)}…，当前 ${d.sha256.slice(0, 12)}…（章节内改动即失败；章节外改动不影响）`,
+          ]);
     }
     default:
       return bad("invalid", null, null, [`未知 check 类型：${(check as { type: string }).type}`]);
@@ -364,24 +446,54 @@ export interface BatchEvaluation {
    */
   source_fingerprint: string;
   reasons: string[];
+  /**
+   * P3 / V09-48：只读修复计划要用的**同一份**本次核验事实（不另算）——
+   * 契约来源快照（逐条 registered/current）、证据包工件逐条可复用/已失效、图更新态（仅全量模式）。
+   * 它们**不参与** target/source 指纹，只是同一次求值的旁路输出。
+   */
+  source_snapshots: SyncSourceSnapshot[];
+  artifact_checks: SyncArtifactCheck[];
+  graph_update_state: string | null;
+  /** graph_update_state="updating" 时 updating 是否为**唯一**未通过原因（见 `ItemEvaluation.graph_update_sole`） */
+  graph_update_sole: boolean;
 }
 
-function artifactProblems(item: SyncEvidenceItem, ctx: EvalContext): string[] {
+/** 证据包单个工件的本次核验事实（可复用 / 已失效分开列；**同一份** artifactChecks 求值产出，不另读一遍） */
+export interface SyncArtifactCheck {
+  item_id: string;
+  path: string;
+  declared_sha256: string;
+  /** 当前实际哈希；自引用/不可读为 null（不冒充一致） */
+  current_sha256: string | null;
+  reusable: boolean;
+  problem: string | null;
+}
+
+function artifactChecks(item: SyncEvidenceItem, ctx: EvalContext): { problems: string[]; checks: SyncArtifactCheck[] } {
   const problems: string[] = [];
+  const checks: SyncArtifactCheck[] = [];
   for (const a of item.artifacts) {
+    const push = (current: string | null, reusable: boolean, problem: string | null): void => {
+      checks.push({ item_id: item.id, path: a.path, declared_sha256: a.sha256, current_sha256: current, reusable, problem });
+      if (problem !== null) problems.push(problem);
+    };
     if (isSyncInboxRelativePath(a.path)) {
-      problems.push(`artifact ${a.path} 落在同步收件目录内——收件目录里的东西不能当独立目标（自引用），不放行`);
+      push(null, false, `artifact ${a.path} 落在同步收件目录内——收件目录里的东西不能当独立目标（自引用），不放行`);
       continue;
     }
     const r = readTargetFile(a.path, ctx);
     if (!r.ok) {
-      problems.push(`artifact ${a.path} 不可作为证据：${r.reason}`);
+      push(null, false, `artifact ${a.path} 不可作为证据：${r.reason}`);
       continue;
     }
     const actual = sha256Hex(r.buf);
-    if (actual !== a.sha256) problems.push(`artifact ${a.path} 哈希不符：登记 ${a.sha256.slice(0, 12)}…，实际 ${actual.slice(0, 12)}…`);
+    if (actual !== a.sha256) {
+      push(actual, false, `artifact ${a.path} 哈希不符：登记 ${a.sha256.slice(0, 12)}…，实际 ${actual.slice(0, 12)}…`);
+      continue;
+    }
+    push(actual, true, null);
   }
-  return problems;
+  return { problems, checks };
 }
 
 /** 逐项裁决的总体优先级：invalid > incomplete > stale > missing > needs_review > failed > passed */
@@ -409,6 +521,9 @@ export function evaluateBatch(
 ): BatchEvaluation {
   const reportItems: SyncItemReport[] = [];
   const reasonsAll: string[] = [];
+  const artifactChecksAll: SyncArtifactCheck[] = [];
+  let graphUpdateState: string | null = null;
+  let graphUpdateSole = false;
   let evidenceSha: string | null = null;
 
   let pkg: SyncEvidencePackage | null = null;
@@ -468,9 +583,10 @@ export function evaluateBatch(
       reportItems.push({ id: item.id, label: item.label, required: item.required, verdict: "missing", expected: item.check, actual: null, reasons: item.required ? ["必需项在本批次证据包里没列出（缺项点名）"] : ["非必需项未列（如实记 missing）"], artifacts: [] });
       continue;
     }
-    const artProblems = artifactProblems(ev, ctx);
-    if (artProblems.length > 0) {
-      reportItems.push({ id: item.id, label: item.label, required: item.required, verdict: "invalid", expected: item.check, actual: null, reasons: artProblems, artifacts: ev.artifacts });
+    const art = artifactChecks(ev, ctx);
+    artifactChecksAll.push(...art.checks);
+    if (art.problems.length > 0) {
+      reportItems.push({ id: item.id, label: item.label, required: item.required, verdict: "invalid", expected: item.check, actual: null, reasons: art.problems, artifacts: ev.artifacts });
       continue;
     }
     if (ev.result !== "passed") {
@@ -478,6 +594,10 @@ export function evaluateBatch(
       continue;
     }
     const evalRes = evalCheck(item.check, registeredSeq, ctx);
+    if (evalRes.graph_update_state !== undefined) {
+      graphUpdateState = evalRes.graph_update_state;
+      graphUpdateSole = evalRes.graph_update_sole === true;
+    }
     reportItems.push({ id: item.id, label: item.label, required: item.required, verdict: evalRes.verdict, expected: evalRes.expected, actual: evalRes.actual, reasons: evalRes.reasons, artifacts: ev.artifacts });
   }
 
@@ -501,7 +621,18 @@ export function evaluateBatch(
       }),
     )
     .digest("hex");
-  return { verdict, items: reportItems, evidence_sha256: evidenceSha, target_fingerprint: fingerprint, source_fingerprint: sourceFingerprint, reasons: reasonsAll };
+  return {
+    verdict,
+    items: reportItems,
+    evidence_sha256: evidenceSha,
+    target_fingerprint: fingerprint,
+    source_fingerprint: sourceFingerprint,
+    reasons: reasonsAll,
+    source_snapshots: sourceCheck.snapshots,
+    artifact_checks: artifactChecksAll,
+    graph_update_state: graphUpdateState,
+    graph_update_sole: graphUpdateSole,
+  };
 }
 
 // 契约哈希唯一实现在 syncContract.ts（本文件不另写一份——同一仓库不留两套判据）

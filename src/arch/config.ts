@@ -106,9 +106,27 @@ export const JUNK_DIR_SEGMENTS: ReadonlySet<string> = new Set([
   "cache",
 ]);
 
-/** 目录级垃圾判定（清单与 A1 解析、chat 搜索/列清单共用）：具名黑名单 + 构建元数据后缀（*.egg-info） */
+/** 随机名临时目录的确定性形状（2026-10-05 六图/同步修复）：Python tempfile 系
+ *  （`mkdtemp` / `TemporaryDirectory`）的默认命名＝前缀 "tmp" + **恰好 8 个** [a-z0-9_] 随机字符
+ *  （`tempfile._RandomNameSequence`，实测样本 tmp2y6_hlid / tmpne9_v42g / tmplbi59bsb 全部吻合）。
+ *  精确段名清单只认 "tmp"，这类随机名漏网后的实害（2026-10-05 现场核查）：
+ *  ① 被 A1 当真实顶层模块收进 modules.json（技术图出现假模块）；
+ *  ② 测试反复建删触发 structure_top 图刷新、每次重写派生文件（把同步证据的整文件哈希反复打漂）。
+ *  只认「tmp+恰好 8 位随机串」这一形状，**不搞 tmp* 前缀通配**：真实业务目录撞上它的概率可忽略，
+ *  而通配会把用户自建的 tmp_ 正式目录静默吞掉（保留真实目录触发图更新的能力）。 */
+export const JUNK_DIR_RANDOM_TEMP_RE = /^tmp[a-z0-9_]{8}$/;
+
+/** 目录级垃圾判定（清单与 A1 解析、chat 搜索/列清单共用）：具名黑名单 + 构建元数据后缀（*.egg-info）
+ *  + 随机名临时目录形状（JUNK_DIR_RANDOM_TEMP_RE，见上）。
+ *
+ *  **共用范围如实**（F2 注释更正，2026-10-06）：只有**随机临时目录形状**这一条正则是各处共用的
+ *  （`arch/parse.ts`／`arch/expand.ts`／`server/watcher.ts`／`server/scanner.ts`／`server/work/graphRefresh.ts`
+ *  都直接测 `JUNK_DIR_RANDOM_TEMP_RE`）。**watcher/scanner 并不调用 `isJunkDir`**：它们各自维护一份本地
+ *  `IGNORED_SEGMENTS`，走「本地清单 + 该正则」（故 `.egg-info`/`.pytest_cache`/`.mypy_cache`/`.ruff_cache`/
+ *  `.tatai` 等只在具名清单里的段，watcher/scanner 仍会处理；随机 tmp 形状则三处一致）。
+ *  统一段名清单属**后续批次**（本批不改，避免大改忽略口径），届时一并补等价论证与回归。 */
 export function isJunkDir(name: string): boolean {
-  return JUNK_DIR_SEGMENTS.has(name) || name.endsWith(".egg-info");
+  return JUNK_DIR_SEGMENTS.has(name) || name.endsWith(".egg-info") || JUNK_DIR_RANDOM_TEMP_RE.test(name);
 }
 
 /** A5 文件级「有变动」点的时间窗（DESIGN.md §4.2 文件级只标一个点）：近 N 小时 changes.jsonl 有记录即标 */

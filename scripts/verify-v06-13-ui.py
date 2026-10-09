@@ -33,6 +33,7 @@ why 必须跑真浏览器（PLAN.md V06-13 检查项 ③ / DESIGN §3.14）：�
 import hashlib
 import json
 import os
+import pathlib
 import shutil
 import socket
 import subprocess
@@ -48,12 +49,17 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 SHOT_DIR = os.environ.get(
     "V0613_SHOT_DIR", os.path.join(REPO, ".工作台", "evidence", "V06-13", "1", "screenshots")
 )
+# 测试只访问本次隔离的回环服务，显式直连：ambient 代理会把 127.0.0.1 探活转成 502（同
+# `scripts/verify-forward-baseline-ui.py` 的既有口径）。判据不变，只是不让代理插手回环。
+DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 A = "v0613ui-a"
 B = "v0613ui-b"
 C = "v0613ui-empty"
 KEEP = os.environ.get("V0613_KEEP_TMP") == "1"
 
-MAIN_NAV = ["项目图", "设计书", "施工图", "聊天", "实况与验收"]
+# V09-62 起「交付总览」是人的默认项目入口，排在主导航首位（其余五页顺序不变）。
+# 这里只同步新导航导致的旧预期，不弱化任何功能断言。
+MAIN_NAV = ["交付总览", "项目图", "设计书", "施工图", "聊天", "实况与验收"]
 
 fails = []
 passes = [0]
@@ -108,7 +114,7 @@ def http(url, method="GET", body=None, timeout=120, headers=None):
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with DIRECT.open(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8")
             return resp.status, (json.loads(text) if text.strip().startswith(("{", "[")) else text)
     except urllib.error.HTTPError as e:
@@ -194,6 +200,39 @@ def put_evidence(root, content, summary, revision):
     return sha
 
 
+def source_manifest_evidence(root, rel_paths, content, summary):
+    """经**产品实现**落一条 `source_manifest` 证据（`sourceEvidence.buildSourceManifest` +
+    `evidence.putEvidence`，都从产品模块动态 import，不另抄格式）。
+
+    为什么：V09-29／契约 F4 起，绑 `code` 的检查**不能**拿账本里自报的 code revision 当"当前代码版本"
+    ——产品读口的当前 code 修订默认为 null，于是**没有可核对来源的 code 检查一律 unknown 待复核**。
+    能让 code 检查真正"算通过"的，是证据带一份**有限覆盖的源清单**：读侧按清单里声明的文件现读复核，
+    源一变即失效（`invalidated`）。返回 `(evidence_id, fingerprint)`。"""
+    ev_uri = pathlib.Path(REPO, "src", "server", "work", "evidence.ts").as_uri()
+    se_uri = pathlib.Path(REPO, "src", "server", "work", "sourceEvidence.ts").as_uri()
+    work_dir = os.path.join(root, ".工作台", "work")
+    code = (
+        "const ev = await import(%s);"
+        "const se = await import(%s);"
+        "const m = se.buildSourceManifest(%s, %s);"
+        "const r = ev.putEvidence(%s, {content:%s, kind:'source_manifest', summary:%s,"
+        " created_by:'fixture-auditor', role:'auditor',"
+        " binding:{revision_kind:'code', revision:m.fingerprint},"
+        " source_manifest:%s, occurred_at:'2026-09-20T09:00:00+08:00'});"
+        "process.stdout.write(JSON.stringify({id:r.evidence_id, fp:m.fingerprint}));"
+    ) % (json.dumps(ev_uri), json.dumps(se_uri), json.dumps(root), json.dumps(list(rel_paths)),
+         json.dumps(work_dir), json.dumps(content), json.dumps(summary), json.dumps(list(rel_paths)))
+    res = subprocess.run(
+        ["node", "--import", "tsx", "--input-type=module", "-e", code],
+        cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=GIT_ENV,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        raise RuntimeError("source_manifest 证据写入失败：%s" % (
+            res.stderr.strip()[:400] or res.stdout.strip()[:400]))
+    out = json.loads(res.stdout.strip().splitlines()[-1])
+    return out["id"], out["fp"]
+
+
 def make_registry(home, records):
     write(os.path.join(home, "registry.json"),
           json.dumps({"version": 1, "projects": records}, ensure_ascii=False, indent=2) + "\n")
@@ -264,7 +303,7 @@ def start_vite(port, backend_port, log_path):
         if proc.poll() is not None:
             raise RuntimeError("vite 起不来（进程已退出）")
         try:
-            with urllib.request.urlopen("http://localhost:%d/" % port, timeout=5) as resp:
+            with DIRECT.open("http://localhost:%d/" % port, timeout=5) as resp:
                 if resp.status == 200:
                     return proc
         except Exception:
@@ -317,7 +356,7 @@ COVERAGE = [
 
 
 def seed_project(backend, pid, root, plan, *, code_rev, invalidate_task=None, later_rev="code-rev-2"):
-    """把夹具事实经**真实写入服务**提交：定义绑定 → 执行状态 → 结果提交 → 独立审计。
+    """把夹具事实经**真实写入服务**提交：定义绑定 → 认领 → 执行状态 → 结果提交（带证据）→ 独立审计。
 
     必需检查项从服务端投影现读（`missing`），不自己算——避免"夹具算错 check_id"变成假结论。
     invalidate_task：该卡先按 code_rev 判绿，再由一个新版本的提交把源修订推前（后面用 later_rev），
@@ -332,24 +371,39 @@ def seed_project(backend, pid, root, plan, *, code_rev, invalidate_task=None, la
     t1, t2, t3 = ids[0], ids[1], ids[2]
     backend.wo_command(cmd(pid, f"task:{t2}", "task.status_changed", {"status": "executing"},
                            f"{t2}:st-exec:v0613ui", expected=1))
-    # T-3 先"就绪"再"执行中"再"已交结果"（版本号逐次递增，事件源自己管版本）
+    # 独立审计要用的证据：带**源清单**（有限覆盖）——读侧按清单现读复核覆盖的源文件，源一变即失效。
+    # T-1 的清单覆盖 src/index.ts（下面真改它 → T-1 旧绿转待验证）；T-3 的清单覆盖 package.json（不变 → 保持有效）
+    ev1, fp1 = source_manifest_evidence(ROOTS[A] if pid == A else ROOTS[B], ["src/index.ts"],
+                                        f"夹具：{t1} 独立审计证据（源清单覆盖 src/index.ts）\n",
+                                        f"{t1} 独立审计证据（夹具·源清单）")
+    ev2, fp2 = source_manifest_evidence(ROOTS[A] if pid == A else ROOTS[B], ["package.json"],
+                                        f"夹具：{t3} 独立审计证据（源清单覆盖 package.json）\n",
+                                        f"{t3} 独立审计证据（夹具·源清单）")
+
+    # 2026-10-08 修复（V09-47 后置漂移）：`task.result_submitted` 现在一律按**一次真实交付提交**在锁内
+    # 核实——要当前认领 token/持有者/租约、依赖与定义绑定、以及可追溯的证据引用。夹具原先直接手写
+    # `task.result_submitted`（无认领、无证据）被 `result_submit_lockin_failed / CLAIM_NOT_YOURS` 正确拒绝。
+    # 这里**不放宽任何产品权限**，只把夹具补成**合法路径**：先经真实写入面 `task.claimed` 认领（带 token
+    # 与未到期租约），再提交带 `claim_token` + `evidence_refs` 的结果——判据一字未动。既不是"删 token 就
+    # 跳过检查"的早退，也不是把卡改成 `task.status_changed` 绕过交付判据（那条是"只置状态"的既有边界，
+    # 本夹具要正面覆盖真实交付提交，故走认领+证据）。
+    def _claim(tid, token, expected):
+        backend.wo_command(cmd(pid, f"task:{tid}", "task.claimed",
+                               {"run_id": f"run-{tid}", "attempt_id": "a1", "owner_id": "fixture-agent",
+                                "claim_token": token, "lease_expires_at": "2099-01-01T00:00:00+08:00"},
+                               f"{tid}:claimed:v0613ui", expected=expected))
+
+    def _submit(tid, token, ev, expected):
+        backend.wo_command(cmd(pid, f"task:{tid}", "task.result_submitted",
+                               {"claim_token": token, "owner_id": "fixture-agent",
+                                "evidence_refs": [ev], "deliverables": ["src/index.ts"],
+                                "definition_sha256": hashes[tid], "plan_revision": plan_rev},
+                               f"{tid}:st-submitted:v0613ui", expected=expected))
+
+    # 交付生命周期按真实顺序走：认领 → 执行中（T-3 先"就绪"再领）→ 交结果；版本号逐次递增由事件源管
     backend.wo_command(cmd(pid, f"task:{t3}", "task.status_changed", {"status": "ready"},
                            f"{t3}:st-ready:v0613ui", expected=1))
-    backend.wo_command(cmd(pid, f"task:{t3}", "task.status_changed", {"status": "executing"},
-                           f"{t3}:st-exec:v0613ui", expected=2))
-    backend.wo_command(cmd(pid, f"task:{t1}", "task.status_changed", {"status": "executing"},
-                           f"{t1}:st-exec:v0613ui", expected=1))
-    backend.wo_command(cmd(pid, f"task:{t1}", "task.result_submitted",
-                           {"definition_sha256": hashes[t1], "plan_revision": plan_rev},
-                           f"{t1}:st-submitted:v0613ui", expected=2))
-    backend.wo_command(cmd(pid, f"task:{t3}", "task.result_submitted",
-                           {"definition_sha256": hashes[t3], "plan_revision": plan_rev},
-                           f"{t3}:st-submitted:v0613ui", expected=3))
-    # 结果提交（绑定代码修订；T-3 的更晚 → 它带来"当前代码修订"）
-    ev1 = put_evidence(ROOTS[A] if pid == A else ROOTS[B], "夹具：实现自检输出\nexit 0\n",
-                       f"{t1} 实现自检（夹具）", code_rev)
-    ev2 = put_evidence(ROOTS[A] if pid == A else ROOTS[B], "夹具：实现自检输出（第二张卡）\nexit 0\n",
-                       f"{t3} 实现自检（夹具）", later_rev)
+    # 成果登记（两张卡的交付包）：独立审计据此按 check_id 出记录
     backend.wo_command(cmd(pid, f"submission:sub-{t1}", "audit.submission_submitted", {
         "goal": "夹具：第一张卡交付", "task_id": t1, "round": 1, "baseline": {},
         "changed_files": ["src/index.ts"], "commands": [{"command": "pnpm test", "exit_code": 0, "output_ref": None}],
@@ -364,18 +418,13 @@ def seed_project(backend, pid, root, plan, *, code_rev, invalidate_task=None, la
         "binding": {"revision_kind": "code", "revision": later_rev},
         "submitted_by": "fixture-agent",
     }, f"sub-{t3}:v0613ui", expected=None, at="2026-09-20T09:30:00+08:00"))
-    # 独立审计：按投影点名的缺口逐项覆盖（最多 3 轮；每轮都是真为它列出的 check_id 出独立记录）
-    for round_no in range(1, 4):
-        proj = projection_of(backend, pid)
-        todo = []
-        for tid, binding_rev, ev in ((t1, code_rev, ev1), (t3, later_rev, ev2)):
-            obj = proj.get(tid)
+    # 独立审计：按投影点名的缺口逐项覆盖（最多 4 轮；每轮都是真为它列出的 check_id 出独立记录）
+    def _audit_until(tid, binding_rev, ev, max_rounds=4):
+        for round_no in range(1, max_rounds + 1):
+            obj = projection_of(backend, pid).get(tid)
             if obj is None or obj["display_status"] == "verified" or not obj["missing"]:
-                continue
-            todo.append((tid, binding_rev, ev, [m["check_id"] for m in obj["missing"]]))
-        if not todo:
-            break
-        for tid, binding_rev, ev, check_ids in todo:
+                return
+            check_ids = [m["check_id"] for m in obj["missing"]]
             backend.wo_command(cmd(pid, f"audit:{tid}-r{round_no}", "audit.independent_audit_recorded", {
                 "task_id": tid, "round": round_no, "auditor": "fixture-auditor", "auditor_role": "auditor",
                 "author_id": "fixture-agent",
@@ -386,15 +435,25 @@ def seed_project(backend, pid, root, plan, *, code_rev, invalidate_task=None, la
                 "not_reported_scope": ["夹具未覆盖的并发场景"], "method_limits": ["夹具：单机串行"],
                 "binding": {"revision_kind": "code", "revision": binding_rev},
             }, f"audit-{tid}-r{round_no}:v0613ui", expected=None, actor="fixture-auditor", role="auditor"))
+
+    tok1, tok3 = f"tok-{t1}-v0613ui", f"tok-{t3}-v0613ui"
+    # T-1 先交结果 → 独立审计**释放 T-1**；T-3 的前置必须已释放（结果提交锁内判依赖，见 service.ts
+    # 的 assertResultSubmittedWriteCommand → evaluateSubmitResultChecks 的 dependencyRecheck）
+    _claim(t1, tok1, 1)
+    backend.wo_command(cmd(pid, f"task:{t1}", "task.status_changed", {"status": "executing"},
+                           f"{t1}:st-exec:v0613ui", expected=2))
+    _submit(t1, tok1, ev1, 3)
+    _audit_until(t1, fp1, ev1)
+    # T-3：前置（T-1）已释放后才走合法交付；否则锁内判据会以 DEPENDENCY_UNMET 正确拒绝
+    _claim(t3, tok3, 2)
+    backend.wo_command(cmd(pid, f"task:{t3}", "task.status_changed", {"status": "executing"},
+                           f"{t3}:st-exec:v0613ui", expected=3))
+    _submit(t3, tok3, ev2, 4)
+    _audit_until(t3, fp2, ev2)
     if invalidate_task is not None:
-        # 再交一版（绑定更新的代码修订）→ 当前代码修订前移 → 旧证据（绑旧修订）转失效
-        backend.wo_command(cmd(pid, f"submission:sub-{invalidate_task}-v2", "audit.submission_submitted", {
-            "goal": "夹具：改了一版（源变了）", "task_id": invalidate_task, "round": 2, "baseline": {},
-            "changed_files": ["src/index.ts"], "commands": [], "untested": [], "known_issues": [],
-            "evidence_refs": [ev1],
-            "binding": {"revision_kind": "code", "revision": later_rev},
-            "submitted_by": "fixture-agent",
-        }, f"sub-{invalidate_task}-v2:v0613ui", expected=None, at="2026-09-20T09:45:00+08:00"))
+        # 真改被清单覆盖的源（src/index.ts）→ T-1 的源清单现读复核转 invalidated → 旧绿转待验证、
+        # 旧结论留在历史里（T-3 的清单只覆盖 package.json，不受影响——只失效受影响对象）
+        write(os.path.join(ROOTS[A] if pid == A else ROOTS[B], "src", "index.ts"), "export const v = 3;\n")
     return t1, t2, t3
 
 
@@ -417,13 +476,45 @@ def node_states(page):
     )
 
 
+def launch_browser(p):
+    """真浏览器：优先 Playwright 自带 chromium；本机未装（ms-playwright 空）时退回系统 Edge。
+    两者都是真 Chromium 内核，判据不变（同 `scripts/verify-forward-baseline-ui.py` 的既有口径）。"""
+    chan = os.environ.get("TATAI_UI_BROWSER_CHANNEL", "")
+    if chan:
+        return p.chromium.launch(headless=True, channel=chan)
+    try:
+        return p.chromium.launch(headless=True)
+    except Exception as e:  # noqa: BLE001
+        info("自带 chromium 起不来（%s），退回系统 Edge" % str(e).splitlines()[0][:120])
+        return p.chromium.launch(headless=True, channel="msedge")
+
+
+def expand_detail_folds(page):
+    """把节点详情里**所有**折叠 `<details>` 按用户操作顺序逐个点开，再读全文。
+
+    为什么：详情各段"**短线摘要在外、全文在里**"——`ProjectGraphView.tsx` 渲染 `s.summary`，
+    把 `s.lines`（含出处段的"设计书章节：…/施工卡：…"与"基线：…；派生器 …"）收在每段自己的
+    `<details data-detail-original=…>`；第⑤段「技术资料与原始定位」是 `<details data-detail-technical>`；
+    「来源与证据」段也有一条折叠。折叠时 `inner_text` 取不到全文——**不是内容没了**，是没展开。
+    逐个点开 summary，断言一字未改、判据未放宽。"""
+    for _ in range(16):
+        folds = page.locator("[data-project-detail] details:not([open]) > summary")
+        if folds.count() == 0:
+            return
+        try:
+            folds.first.click(timeout=3000)
+        except Exception:
+            return
+        page.wait_for_timeout(120)
+
+
 def run_browser(vite_port, backend, t_ids):
     os.makedirs(SHOT_DIR, exist_ok=True)
     t1, t2, t3 = t_ids["a"]
     b1 = t_ids["b"][0]
     c1 = t_ids["c"][0]
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = launch_browser(p)
         page = browser.new_context(viewport={"width": 1600, "height": 950}).new_page()
         page_errors = []
         page.on("pageerror", lambda e: page_errors.append(str(e)))
@@ -515,6 +606,7 @@ def run_browser(vite_port, backend, t_ids):
         ok(len(cap_nodes) >= 1, "③ 前置：功能全景里有能力节点（%d 个）" % len(cap_nodes))
         page.locator('[data-project-node="%s"]' % cap_nodes[0]["id"]).click()
         page.wait_for_selector("[data-detail-section]", timeout=20000)
+        expand_detail_folds(page)
         cap_detail = page.locator("[data-project-detail]").inner_text()
         ok("设计书章节" in cap_detail, "③ 能力节点详情给出**设计书章节出处**（设计书侧可定位）")
         ok("基线" in cap_detail and "派生器" in cap_detail, "③ 出处段标明生效基线与派生器版本（可追溯，不是编的）")
@@ -526,6 +618,7 @@ def run_browser(vite_port, backend, t_ids):
         if c_node is not None:
             page.locator('[data-project-node="%s"]' % c_node["id"]).click()
             page.wait_for_selector("[data-detail-section]", timeout=20000)
+            expand_detail_folds(page)
             task_detail = page.locator("[data-project-detail]").inner_text()
             ok("施工卡" in task_detail,
                "③ 施工卡节点详情给出**施工图原文出处**（施工卡 + 路径）")
@@ -713,11 +806,18 @@ def run_browser(vite_port, backend, t_ids):
         overview = page.inner_text("body")
         ok(page.locator("[data-pending-decisions]").count() == 1,
            "⑪ 主工作面上能直接看到**待决事项**数量（不用翻聊天）")
-        bar = page.locator("[data-project-status-bar]").inner_text()
-        ok(page.locator("[data-project-status-bar]").count() == 1
-           and "当前目标" in bar and "有效版本" in bar,
-           "⑪ 工作面的状态条直接写清当前项目/当前目标/有效版本：%s" % bar.replace(chr(10), " ")[:80])
-        ok("bl-" in bar, "⑪ 状态条里的有效版本是**生效基线 id**（不是「不知道」，不让人自己去翻文件）")
+        bar = page.locator("[data-project-status-bar]")
+        # 2026-10-08：顶栏的「有效版本」落在折叠面板里（`details.tt-status-disclosure`，summary 是「已连接 ⌄」，
+        # `App.tsx` 顶栏），不展开 `inner_text` 取不到——按用户操作先点开再读，判据不变（项目/目标/有效版本都在条上）。
+        # 目标标签产品现用「正在推进：」（DESIGN §3.1 的「当前目标」同一语义）——断言接受两种写法，
+        # **不弱化**「必须说清当前目标与有效版本」这条意图（下面仍钉住有效版本必须是生效基线 id）。
+        page.locator("[data-status-save]").click()
+        page.wait_for_timeout(200)
+        bar_text = bar.inner_text()
+        ok(bar.count() == 1
+           and ("当前目标" in bar_text or "正在推进" in bar_text) and "有效版本" in bar_text,
+           "⑪ 工作面的状态条直接写清当前项目/当前目标/有效版本：%s" % bar_text.replace(chr(10), " ")[:80])
+        ok("bl-" in bar_text, "⑪ 状态条里的有效版本是**生效基线 id**（不是「不知道」，不让人自己去翻文件）")
         ok(any(k in overview for k in ("待验收", "验收")), "⑪ 主工作面能看到验收/待验收入口（可体验结果的去处）")
         ok(any(k in overview for k in ("目标", "当前改动", "改动")), "⑪ 主工作面能看到目标/当前改动入口")
         open_graph(A, "construction")

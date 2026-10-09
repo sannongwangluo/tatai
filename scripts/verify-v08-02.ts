@@ -20,8 +20,8 @@ import {
   MODULE_VERIFIED_SHORT,
   NO_STATUS_RECORD,
   PROJECT_VIEWS,
-  aggregateStatusOf,
   buildViewModel,
+  canonicalScopeStatusOf,
   canvasMembershipGapsOf,
   directStatusOf,
   noStatusRecordOf,
@@ -29,6 +29,7 @@ import {
   taskDerivedModuleStatus,
 } from "../src/ui/arch/projectGraph";
 import { NO_STATUS_RECORD_KEY, DISPLAY_STATUS_PALETTE, DISPLAY_STATUS_KEYS } from "../src/ui/arch/statusColor";
+import { scopeMemberLedgerOf } from "../src/arch/featureScope";
 
 let pass = 0;
 let fail = 0;
@@ -99,13 +100,15 @@ ok(
 );
 // 期望定向更新（V08-03 / DESIGN.md 附录 D，2026-09-23）：同 B2 段——能力由成员派生，
 // 成员非空且**全部**验证通过 ⇒ 能力验证通过；空集/无证据仍不判绿（判据未放宽）。
+// V09-55 返工：能力（scope）状态**只读 canonical 义务层投影**，画布不再本地按成员汇总；
+// 本夹具没有喂 `scope_projection` ⇒ 能力如实「未知」（不退回成员汇总造绿）。
 ok(
-  cap1.status.kind === "aggregated" && cap1.status.display === "verified",
-  `能力状态按成员派生：成员（模块与任务）全部验证通过 ⇒ 能力验证通过（实际 kind=${cap1.status.kind} display=${cap1.status.display}，附录 D）`,
+  cap1.status.display === null && cap1.status.unmapped_reason === "no_status_source",
+  `能力状态只读 canonical 投影：缺投影 ⇒ 未知（实际 kind=${cap1.status.kind} display=${cap1.status.display}；不本地造绿）`,
 );
 ok(
-  cap2.status.display === null && cap2.status.unmapped_reason === "no_members",
-  `没有成员的能力仍不着完成色，且原因是「没有关联成员」（reason=${cap2.status.unmapped_reason}）`,
+  cap2.status.display === null && cap2.status.unmapped_reason === "no_status_source",
+  `没有 canonical 投影的能力不着完成色（reason=${cap2.status.unmapped_reason}）`,
 );
 ok(
   vmFunctional.notes.every((n) => !n.includes("成员 = 关联的模块与任务") || true) &&
@@ -114,9 +117,49 @@ ok(
 );
 const vmArchitecture = buildViewModel({ view: "architecture", blueprint: bp, projection, module_status: derived.status });
 const archCap1 = vmArchitecture.nodes.find((n) => n.id === "plan:cap:01")!;
+// ── 2026-10-08 定向更新（判据**不放宽**，五要素留档）──
+//   旧期望 = `archCap1.members.join(",") === "plan:code:src-base,plan:task:T-1"`（V09-55 期间改出来的期望）。
+//   依据   = 与**同一文件**第 82–85 行 `PROJECT_VIEWS.architecture.member_kinds.join(",") === "module"` 自相矛盾，
+//            也与 `verify-v09-02` 夹具 D（cap:01 只含任务成员 ⇒ 架构分组成员长度 0）冲突；
+//            `git show HEAD:scripts/verify-v08-02.ts` 的原期望是 `"plan:code:src-base"`（注释：「系统架构的成员仍是「模块」」）；
+//            DESIGN §3.2 表格第三列：系统架构＝「审定的模块职责、接口/数据关系；叠加实测代码映射」，功能全景才是「…模块与任务」。
+//   新期望 = `archCap1.members.join(",") === "plan:code:src-base"`（架构分组成员**只含模块**）；
+//            另**新增**一条断言钉住「唯一成员账目仍然**视图无关**」（`scopeMemberLedgerOf` 里 cap:01 的成员仍含任务 T-1）——
+//            账目来源不变，变的是**视图按自己的 `member_kinds` 过滤**（V09-55 修的正是来源统一，不是成员 kind）。
+//   保留意图 = 「成员账目只有一个来源（featureScope）＋ 视图按 member_kinds 过滤」——两条都钉住，一条没少。
+//   判据不放宽 = 由「名单恰好等于某串」升级为「名单＝账目 ∩ {module} ∩ 蓝图节点」的**集合对账**，约束更强。
+const archLedger = scopeMemberLedgerOf(bp);
+const bpNodes = (bp as unknown as { nodes: { id: string; kind: string }[] }).nodes;
 ok(
-  archCap1.members.join(",") === "plan:code:src-base",
-  `系统架构的成员仍是「模块」（未被搅动：${archCap1.members.join("、")}）`,
+  archCap1.members.join(",") === "plan:code:src-base" &&
+    archCap1.members.every((m) => bpNodes.find((n) => n.id === m)?.kind === "module") &&
+    (archLedger["plan:cap:01"]?.member_ids ?? []).includes("plan:task:T-1") &&
+    (archLedger["plan:cap:01"]?.member_ids ?? []).includes("plan:code:src-base"),
+  `系统架构的成员＝账目 ∩ {module} ∩ 蓝图节点（${archCap1.members.join("、")}）——任务的**归属**仍在唯一账目里（${(archLedger["plan:cap:01"]?.member_ids ?? []).join("、")}），只是不进架构分组（§3.2 表格第三列）`,
+);
+// 负例（判据**不是空转**）：错 kind 仍必须失败——把名单混进一个**任务**成员，
+// 「架构分组只含 module」这一条立刻不成立（用同一份真实数据构造反例，不改产品代码、不改正例）。
+const wrongKindMembers = [...archCap1.members, "plan:task:T-1"];
+ok(
+  !wrongKindMembers.every((m) => bpNodes.find((n) => n.id === m)?.kind === "module"),
+  "负例：成员名单混进一个**任务**（plan:task:T-1）时「架构成员只含 module」不成立——判据不是空转",
+);
+// 判据不放宽（续·canonical scope）：架构视图的能力状态**只读 canonical 义务层投影**（V09-55）——
+// 「成员只含模块」这条过滤**不改变**状态读数：喂同一份 canonical 投影，架构视图读到的就是它（不是成员汇总）。
+const scopeProj = {
+  "plan:cap:01": { object_id: "plan:cap:01", mapping: "mapped", display_status: "in_progress", reasons: [] },
+} as never;
+const vmArchScoped = buildViewModel({
+  view: "architecture",
+  blueprint: bp,
+  projection,
+  module_status: derived.status,
+  scope_projection: scopeProj,
+});
+const archCap1Scoped = vmArchScoped.nodes.find((n) => n.id === "plan:cap:01")!;
+ok(
+  archCap1Scoped.status.display === "in_progress" && archCap1.members.join(",") === "plan:code:src-base",
+  `架构视图的能力状态只读 canonical 投影（喂 "in_progress" ⇒ 画布读到 ${String(archCap1Scoped.status.display)}），与「成员只含模块」这条过滤各归各位、互不搅动（V09-55）`,
 );
 
 // ═════════════════════════════ B2/B3/B4 ═════════════════════════════
@@ -167,29 +210,30 @@ const unmappedObject = directStatusOf({
   display_status: null,
   reasons: [{ code: "unmapped", text: "未映射：这个对象没有任务或验收映射——不空集判绿（DESIGN.md §4.2）" }],
 } as never);
-const noMembers = aggregateStatusOf([]);
-const membersNoStatus = aggregateStatusOf([null, undefined]);
+// V09-55 返工：能力（scope）层不再本地按成员汇总——没接入 canonical 投影时是 `no_status_source`；
+// 「没有成员 / 成员都没有结论」这类**模块层**原因仍在（`no_task_evidence`／`members_without_status`）。
+const scopeUnavailable = canonicalScopeStatusOf(null);
+const moduleNoTask = noStatusRecordOf("plan:code:nomod");
 const reasons = [
   noSource.unmapped_reason,
   unmappedObject.unmapped_reason,
-  noMembers.unmapped_reason,
-  membersNoStatus.unmapped_reason,
+  scopeUnavailable.unmapped_reason,
+  moduleNoTask.unmapped_reason,
 ];
 ok(
-  reasons.join(",") === "no_status_source,object_unmapped,no_members,members_without_status",
-  `四种原因各有各的枚举（${reasons.join(" / ")}）——原来统统只说「未映射」`,
+  new Set(reasons).size === 3 &&
+    reasons.includes("no_status_source") &&
+    reasons.includes("object_unmapped") &&
+    reasons.includes("no_task_evidence"),
+  `原因各自枚举、不一刀切（${reasons.join(" / ")}）——不再统统只说「未映射」`,
 );
 ok(
-  reasons.every((r, i) =>
-    [noSource, unmappedObject, noMembers, membersNoStatus][i].basis.includes(
-      ["暂无状态来源", "对象未映射", "没有关联成员", "成员都没有状态结论"][i],
-    ),
-  ),
-  "四种原因的**文案**各自点名（详情里能一眼看出是哪一种）",
+  noSource.basis.includes("暂无状态来源") && unmappedObject.basis.includes("对象未映射") && moduleNoTask.basis.includes("没有任务"),
+  "各原因的**文案**各自点名（详情里能一眼看出是哪一种）",
 );
 ok(
-  [noSource, unmappedObject, noMembers, membersNoStatus].every((s) => s.display === null),
-  "四种原因都**不着完成色**（不空集判绿，§4.2 底线未动）",
+  [noSource, unmappedObject, scopeUnavailable, moduleNoTask].every((s) => s.display === null),
+  "各原因都**不着完成色**（不空集判绿，§4.2 底线未动）",
 );
 
 // ═════════════════════════════ C2 ═════════════════════════════
@@ -263,7 +307,7 @@ ok(
   `同一任务指向多个能力 ⇒ **每个**能力分组都有它（cap:01=${fCap1.members.join("、")}；cap:02=${fCap2.members.join("、")}）——不再后写覆盖`,
 );
 ok(
-  fCap3.members.length === 0 && fCap3.status.display === null && fCap3.status.unmapped_reason === "no_members",
+  fCap3.members.length === 0 && fCap3.status.display === null && fCap3.status.unmapped_reason === "no_status_source",
   "没有被任何任务引用的能力仍如实空组、不着色（不为了全绿编造归属）",
 );
 const vmAMulti = buildViewModel({ view: "architecture", blueprint: bpMultiCap, projection, module_status: derivedMulti.status });

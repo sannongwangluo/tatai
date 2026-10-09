@@ -145,7 +145,21 @@ async function main(): Promise<void> {
   const defs = importTaskDefinitions(plan, { plan_revision: "rev-1" }).definitions;
   submitDefinitionImports(submitter, { project_id: "v0801-mig", change_id: "change-v0801", actor_id: "verify", role: "coordinator", definitions: defs });
   submitTaskStatus(submitter, { project_id: "v0801-mig", task_id: "T-1", change_id: "change-v0801", actor_id: "verify", role: "executor", expected_revision: 1, status: "executing" });
-  submitTaskStatus(submitter, { project_id: "v0801-mig", task_id: "T-2", change_id: "change-v0801", actor_id: "verify", role: "executor", expected_revision: 1, status: "result_submitted" });
+  // 夹具：T-2 的 `result_submitted` 是**历史/迁移状态**（不是一次新交付），走**既有状态边界**
+  // `task.status_changed` + `payload.status`（`migrate.ts` 把 v1 `done` 折成 `result_submitted` 的同一形态）；
+  // `task.result_submitted` 是交付提交事件，只由带合法认领 + 证据的提交写入（P2/V09-47），夹具不冒充交付。
+  submitter.submit({
+    schema_version: 2,
+    project_id: "v0801-mig",
+    change_id: "change-v0801",
+    entity_id: "task:T-2",
+    expected_revision: 1,
+    type: "task.status_changed",
+    actor_id: "verify",
+    role: "executor",
+    idempotency_key: "fixture-hist-status:v0801-mig:T-2:result_submitted:1",
+    payload: { status: "result_submitted" },
+  });
 
   const ledMig = readTaskLedger("v0801-mig");
   ok(

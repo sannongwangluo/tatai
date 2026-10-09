@@ -291,7 +291,12 @@ try {
     return live?.task_last_seq ?? null;
   };
   const seqBefore = await liveSeq();
-  const submit = await api(
+  // 夹具先导入正式定义，使用真实任务身份；这是夹具的防御性准备，不是非上报状态写的必要条件。
+  //   verifyTaskPhaseCommand 只核显式 report_phase；无该字段的迁移回放由 v06-03 单独验证。
+  //   T-1 是夹具施工图里真实存在的卡，这里先经**同一唯一写入面**（POST /api/work/command + 描述符令牌）
+  //   把它的定义导入（旧形态 `task.definition_imported`，与 verify-v06-09 夹具同形、不带 report_phase），
+  //   使后续 work 事件有合法的运行状态——不硬写账本、不绕过唯一写口。
+  const def = await api(
     "POST",
     "/api/work/command",
     {
@@ -300,6 +305,24 @@ try {
       change_id: "change-v0907",
       entity_id: "task:T-1",
       expected_revision: null,
+      type: "task.definition_imported",
+      actor_id: "v09-07-verify",
+      role: "executor",
+      idempotency_key: "v0907:T-1:def:1",
+      payload: { definition_sha256: "0".repeat(64), plan_revision: "0".repeat(64), definition_revision: 1 },
+    },
+    { "x-tatai-work-token": desc.token },
+  );
+  ok(def.status === 200 && def.body.ok === true, `② 前置：T-1 定义经唯一写入面导入成功（HTTP ${def.status}）`);
+  const submit = await api(
+    "POST",
+    "/api/work/command",
+    {
+      schema_version: 2,
+      project_id: MAIN,
+      change_id: "change-v0907",
+      entity_id: "task:T-1",
+      expected_revision: 1,
       type: "task.status_changed",
       actor_id: "v09-07-verify",
       role: "executor",

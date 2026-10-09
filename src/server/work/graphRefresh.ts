@@ -60,6 +60,7 @@ import {
   startParseProjectRun,
   type ArchModulesFile,
 } from "../../arch/parse";
+import { isJunkDir } from "../../arch/config";
 import { autoRebuildBlueprint } from "../../arch/blueprintAuto";
 import { blueprintDir, draftBlueprintOf, writeJsonAtomic, type BlueprintDraftResult } from "../../arch/blueprint";
 import { getProject } from "../registry";
@@ -424,6 +425,10 @@ function dependencyVerdict(ctx: VerdictContext, rel: string, action: ChangeLine[
 export function changeVerdict(line: ChangeLine, ctx: VerdictContext): ChangeVerdict | null {
   const posix: ChangeLine = { ...line, path: line.path.split(/[\\/]/).join("/") };
   if (posix.path === "" || posix.path.startsWith("/") || posix.path.split("/").includes("..")) return null;
+  // 2026-10-05：垃圾目录里的变化不可能改变模块划分/依赖（A1 采集就不收它们）——历史 changes.jsonl
+  // 里已落盘的 tmp 随机目录行（修复前写入的）在这里拦下，不再触发 structure_top 重画；
+  // 判据与 A1/watcher 同一份（isJunkDir＝具名段+*.egg-info+随机临时目录形状）。
+  if (posix.path.split("/").some((seg) => isJunkDir(seg))) return null;
   if (isTopLevelStructureChange(ctx.root, posix, ctx.arch)) {
     return {
       scope: "structure_top",

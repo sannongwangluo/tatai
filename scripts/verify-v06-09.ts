@@ -333,6 +333,17 @@ const taskEvent = (type: string, taskId: string, payload: Record<string, unknown
     payload,
   });
 
+/**
+ * 夹具：造"这张卡历史上交过结果"的**状态**（纯测试数据，不是一次新交付）。
+ * P2/V09-47 最终纠正：按**既有状态边界** `task.status_changed` + `payload.status` 写——与 `migrate.ts`
+ * 把 v1 `done` 折成 `result_submitted` 逐字同一形态（不带交付包、不宣称判据通过）。
+ * `task.result_submitted` 是一条**交付提交**事件：只由带合法认领 token + 可追溯证据的提交写入
+ * （锁内共享判据），夹具不冒充交付提交，也不要求产品为夹具放宽校验。
+ */
+const taskResultSubmitted = (taskId: string): void => {
+  taskEvent("task.status_changed", taskId, { status: "result_submitted" });
+};
+
 const portListening = (port: number): Promise<boolean> =>
   new Promise((resolve) => {
     const sock = net.connect({ port, host: "127.0.0.1" });
@@ -399,14 +410,14 @@ taskEvent("task.definition_imported", "T-1", { definition_sha256: sha256("T-1-de
 taskEvent("task.status_changed", "T-1", { status: "ready" });
 taskEvent("task.claimed", "T-1", { run_id: "run-1", attempt_id: "a1", owner_id: "kimi-code", claim_token: "tok-1", lease_expires_at: "2026-09-20T02:00:00+08:00" });
 taskEvent("task.status_changed", "T-1", { status: "executing" });
-taskEvent("task.result_submitted", "T-1", {});
+taskResultSubmitted("T-1");
 taskEvent("task.definition_imported", "T-2", { definition_sha256: sha256("T-2-def"), plan_revision: planRev, definition_revision: 1 });
-taskEvent("task.result_submitted", "T-2", {});
+taskResultSubmitted("T-2");
 taskEvent("task.definition_imported", "T-3", { definition_sha256: sha256("T-3-def"), plan_revision: planRev, definition_revision: 1 });
 taskEvent("task.claimed", "T-3", { run_id: "run-3", attempt_id: "a3", owner_id: "kimi-code", claim_token: "tok-3", lease_expires_at: "2026-09-20T02:00:00+08:00" });
 taskEvent("task.status_changed", "T-3", { status: "executing" });
 taskEvent("task.definition_imported", "T-4", { definition_sha256: sha256("T-4-def"), plan_revision: planRev, definition_revision: 1 });
-taskEvent("task.result_submitted", "T-4", {});
+taskResultSubmitted("T-4");
 
 // 缺陷事实
 const f1 = openFinding(submitter, {

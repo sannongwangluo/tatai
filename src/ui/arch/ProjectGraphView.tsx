@@ -42,10 +42,12 @@ import {
   EDGE_SEMANTICS_ORDER,
   NO_STATUS_RECORD,
   PROJECT_VIEWS,
+  UNRESOLVED_REAL_GAP_REASONS,
   VIEW_FILTERS,
-  aggregateStatusOf,
   applyViewFilter,
+  archStatusRecordOf,
   buildViewModel,
+  canonicalScopeStatusOf,
   detailSectionsOf,
   directStatusOf,
   emptyStateOf,
@@ -55,10 +57,10 @@ import {
   moduleStatusKeysOf,
   planCodeNodeIdOf,
   blueprintNodeStatusOf,
-  capabilityStatusOf,
   objectIdOf,
   scopeReportOf,
   taskDerivedModuleStatus,
+  technicalIdOf,
   type EdgeSemantics,
   type NodeStatus,
   type ProjectViewModel,
@@ -83,7 +85,7 @@ import {
   type ProvenanceAnnotation,
   type ProvenanceModel,
 } from "./provenance";
-import { GraphAttentionBar, IntraRelationChips, IntraRelationPanel, ObjectProvenanceLines, relationKindLabel, readableGraphLabel } from "./ProvenancePanel";
+import { GraphAttentionBar, IntraRelationChips, IntraRelationPanel, ObjectProvenanceLines, UnresolvedRelationsPanel, relationKindLabel, readableGraphLabel } from "./ProvenancePanel";
 import {
   projectMatchedNote,
   projectUnmatchedNote,
@@ -308,6 +310,12 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect, on
   const [provenance, setProvenance] = useState<ProvenanceModel | null>(null);
   /** V09-13：当前点开的**同组关系**（§3.2：图上可点开追来源；null = 没点开关系） */
   const [openRelation, setOpenRelation] = useState<string | null>(null);
+  /**
+   * 工具条上的「关系未画出」入口（§3.3「隐藏≠没有」）：本视图里解析不到可见分组的关系**逐条可查**。
+   * 真实缺口会让信息栏出现并给计数；只有合理折叠/分类排除时信息栏是健康态、不占常驻行，
+   * 这条入口保证合理结果**照样可达**，不被藏掉（点开才展开，不是常驻条）。
+   */
+  const [unresolvedOpen, setUnresolvedOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   /** 本次读取时间（详情「来源时间」里的"本机读取时间"，如实标注来源） */
@@ -395,6 +403,7 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect, on
     updateRef.current = null;
     setProvenance(null);
     setOpenRelation(null);
+    setUnresolvedOpen(false);
     setReceivedAt("");
     setFilter(EMPTY_FILTER);
     setShowAll(false);
@@ -458,8 +467,8 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect, on
   const moduleDerived = useMemo(
     () =>
       blueprint === null
-        ? { status: {}, by_object: {}, tasks_by_module: {} }
-        : taskDerivedModuleStatus({ blueprint, projection, declared_links: moduleLinks }),
+        ? { status: {}, by_object: {}, tasks_by_module: {}, plan_status: {} }
+        : taskDerivedModuleStatus({ blueprint, projection, declared_links: moduleLinks, scope_projection: projection }),
     [blueprint, projection, moduleLinks],
   );
 
@@ -472,6 +481,8 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect, on
       projection,
       mergedNodes: (merged?.nodes ?? []).map((n) => ({ id: n.id, plan_refs: n.plan_refs })),
       module_status: moduleDerived.status,
+      // V09-55 返工：能力（范围）状态只读 canonical 义务层投影（同一份投影；缺键 ⇒ 未知，不本地造绿）
+      scope_projection: projection,
       // V09-22：显示全部 = 概览上限换 full 口径（同一份蓝图与投影，不另造图事实源）
       overview_full: showAll,
     });
@@ -602,6 +613,27 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect, on
     return m;
   }, [model, merged, projection, blueprint, moduleDerived]);
 
+  /**
+   * 「关系未画出」名单里的端点 → 本视图画布上的**可见对象**（判据与画布同一份：`modelNodeById`
+   * 含本次画出的分组节点与技术画布上的静态模块；`technicalIdOf` 与画布同一份 plan→技术 id 换算）。
+   * 解析不到 ⇒ null：名单里**如实写「本视图画布上没有这个对象」**，不做假跳转（§3.3）。
+   */
+  const unresolvedVisibleIdOf = useCallback(
+    (planId: string): string | null => {
+      const technical = technicalIdOf(planId, (merged?.nodes ?? []).map((n) => ({ id: n.id, plan_refs: n.plan_refs })));
+      if (technical !== null && modelNodeById.has(technical)) return technical;
+      return modelNodeById.has(planId) ? planId : null;
+    },
+    [merged, modelNodeById],
+  );
+  /** 落空端点 → 可见对象显示名（null = 本视图画布上没有它） */
+  const unresolvedTargetLabelOf = useCallback(
+    (planId: string): string | null => {
+      const id = unresolvedVisibleIdOf(planId);
+      return id === null ? null : (modelNodeById.get(id)?.label ?? id);
+    },
+    [unresolvedVisibleIdOf, modelNodeById],
+  );
   const openDetail = useCallback(
     (id: string) => {
       setSelectedEdgeId(null);
@@ -613,6 +645,14 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect, on
       setBookmarks((prev) => pushBookmark(prev, entry));
     },
     [view, modelNodeById, onSelect, filter],
+  );
+  /** 点开「关系未画出」名单里的可见对象（解析不到可见对象时不调用，界面那时给的是原因文本） */
+  const openUnresolvedTarget = useCallback(
+    (planId: string): void => {
+      const id = unresolvedVisibleIdOf(planId);
+      if (id !== null) openDetail(id);
+    },
+    [unresolvedVisibleIdOf, openDetail],
   );
 
   // ── 定位（对齐键 = 稳定 ID；不重置本视图的筛选/坐标/选中之外的东西）──
@@ -820,36 +860,28 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect, on
   // V08-02 B2/B3/B4 + V08-06 ①：模块层状态 = ① 投影里真有 `module:*` 对象就用它；
   // ② 没有就按**实现映射/对账配对从任务状态派生**（附录 D，`moduleStatusKeysOf` 同时给
   //    `plan:code:<模块 id>`、`plan:mod:<稳定 ID>` 与技术模块 id 三套键）；
-  // ③ **能力节点**按成员派生（`capabilityStatusOf`，与三视图同一份口径）；
-  // ④ 都取不到才如实标「无状态记录」——不再让声明模块/能力在画布上落「无状态记录」。
+  // ③ **能力节点**状态**只读 canonical 义务层投影**（`canonicalScopeStatusOf`，与三个主视图、技术三图、
+  //    MCP/HTTP 读口同一判据；投影来自唯一义务层 `deriveObligations`/`projectStatuses`）；缺键 ⇒ 未知；
+  // ④ 都取不到才如实标「无状态记录」——不再让声明模块在画布上落「无状态记录」。
+  //
+  // V09-55 返工：能力状态**不再本地按成员汇总**（旧 `capabilityStatusOf` 是第二份绿公式）。画布的
+  // 能力分支与通用键表现在都读同一份 canonical 投影；解析顺序仍让能力分支前置，但那只是"谁来读"，
+  // 不再是"算哪一套"。失败集成由 canonical 给 `blocked`（不是橙封顶），缺输入给 unknown/missing。
   const archStatus = useMemo(() => {
     if (blueprint === null) return {};
     const derived = moduleDerived;
     const keys = moduleStatusKeysOf(derived);
-    const capMembers = new Map((model?.groups ?? []).map((g) => [g.key, g.members]));
-    const out: Record<string, string> = {};
-    for (const n of archGraph?.nodes ?? []) {
-      const hit = keys[n.id];
-      if (hit !== undefined) {
-        out[n.id] = hit;
-        continue;
-      }
-      if (n.id.startsWith("plan:cap:")) {
-        const st = capabilityStatusOf(
-          (capMembers.get(n.id) ?? []).map((m) => ({
-            id: m,
-            status: blueprintNodeStatusOf(m, { blueprint, projection, module_status: derived.status }),
-          })),
-        );
-        out[n.id] = st.display ?? (st.unmapped_reason === "no_task_evidence" ? NO_STATUS_RECORD : "unmapped");
-        continue;
-      }
-      const objectId = moduleObjectIdOf(n.id);
-      const direct = projection[objectId];
-      const st: NodeStatus = direct !== undefined ? directStatusOf(direct) : noStatusRecordOf(objectId);
-      out[n.id] = st.display ?? (st.unmapped_reason === "no_task_evidence" ? NO_STATUS_RECORD : "unmapped");
-    }
-    return out;
+    const keyOf = (st: NodeStatus): string => st.display ?? (st.unmapped_reason === "no_task_evidence" ? NO_STATUS_RECORD : "unmapped");
+    return archStatusRecordOf((archGraph?.nodes ?? []).map((n) => n.id), {
+      // 能力（`plan:cap:*`）状态只读 canonical 义务层投影（缺键 ⇒ 未知，不本地按成员汇总造绿）
+      capabilityStatusOf: (id) => keyOf(canonicalScopeStatusOf(projection[id])),
+      keysOf: (id) => keys[id],
+      directStatusOf: (id) => {
+        const objectId = moduleObjectIdOf(id);
+        const direct = projection[objectId];
+        return keyOf(direct !== undefined ? directStatusOf(direct) : noStatusRecordOf(objectId));
+      },
+    });
   }, [archGraph, projection, moduleDerived, model, blueprint]);
 
   return (
@@ -867,6 +899,13 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect, on
       data-project-delivery={provenance?.delivery.verdict ?? "unknown"}
       data-project-delivery-conclusion={provenance?.delivery.conclusion ?? ""}
       data-project-delivery-blocked={provenance !== null && !provenance.delivery.deliverable_allowed ? "1" : "0"}
+      // V09-02 账目恒等式：解析不到可见分组的关系逐条在场（不静默丢关系）——
+      // 总条数与其中**真实缺口**（待归属／缺节点）条数常驻可读；成因分类与逐条名单在 `notes`／
+      // `unresolved_relations`（与 MCP/HTTP 读口同一份）。合理折叠/分类排除**不计**入真实缺口。
+      data-project-unresolved={model?.unresolved_relations.length ?? 0}
+      data-project-unresolved-gaps={
+        (model?.unresolved_relations ?? []).filter((r) => UNRESOLVED_REAL_GAP_REASONS.includes(r.reason)).length
+      }
     >
       {/* V09-13（§3.2／§4.2／附录 E.9）＋ V09-20 回归修复（§3.11／§4.2，附录 E.20）：**六图的
           「来源与证据」信息栏**——交付阻断读数与模型提案待审线索（§4.1／附录 E.17／E.18）**合成一条**：
@@ -878,6 +917,11 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect, on
           delivery={provenance.delivery}
           leads={provenance.model_leads ?? []}
           nodeLeads={provenance.model_node_leads ?? []}
+          // V09-02 账目恒等式：把**全量**「关系未画出」接进这条栏的按需详情（含合理折叠/分类排除与真实缺口）；
+          // 真实缺口（待归属/缺节点）让栏出现并给计数，合理结果只进名单、不触发（§3.3／§4.5）。
+          unresolvedRelations={model?.unresolved_relations ?? []}
+          resolveUnresolvedTarget={unresolvedTargetLabelOf}
+          onOpenUnresolvedTarget={openUnresolvedTarget}
           anchor={`project-${view}`}
         />
       )}
@@ -999,7 +1043,35 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect, on
             返回概览
           </button>
         )}
+        {/* V09-02 账目恒等式（§3.3「隐藏≠没有」）：本视图解析不到可见分组的关系**逐条可查**——
+            工具条上的一个**入口**（不是常驻条：点开才展开）。真实缺口同时会让信息栏出现并给计数；
+            只有合理折叠/分类排除时信息栏是健康态、不占常驻行，这条入口保证它们照样可达、不被藏掉。 */}
+        {model !== null && model.unresolved_relations.length > 0 && (
+          <button
+            data-project-unresolved-entry={model.unresolved_relations.length}
+            data-project-unresolved-entry-gaps={
+              model.unresolved_relations.filter((r) => UNRESOLVED_REAL_GAP_REASONS.includes(r.reason)).length
+            }
+            title="关系未画出：本视图里解析不到可见分组的关系（合理折叠/分类排除 + 待归属/缺节点）逐条可查——不丢关系、不涂完成色、不表示业务失败（§3.3／§4.5）"
+            onClick={() => setUnresolvedOpen((v) => !v)}
+            className="rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-300 hover:bg-neutral-800"
+          >
+            列出全部未画出关系 {model.unresolved_relations.length} 条
+          </button>
+        )}
       </div>
+
+      {/* 「关系未画出」完整名单（点开才展开；与信息栏详情**同一份数据、同一个组件**，不各写一套） */}
+      {model !== null && unresolvedOpen && model.unresolved_relations.length > 0 && (
+        <div className="shrink-0 border-b border-neutral-800 px-3 py-1" data-project-unresolved-panel>
+          <UnresolvedRelationsPanel
+            relations={model.unresolved_relations}
+            anchor={`project-${view}`}
+            resolveTarget={unresolvedTargetLabelOf}
+            onOpenTarget={openUnresolvedTarget}
+          />
+        </div>
+      )}
 
       {/* 本视图的口径（分组口径 + 数量口径）：§3.3 的"5–15 个主要分组 / 不足 5 不凑数 / 超量聚合"都在这儿说清。
           V09-21 R3：限高内滚——长口径平铺实测占 151px 把画布挤到 150px（1280×800），
@@ -1188,6 +1260,16 @@ export function ProjectGraphView({ project, view, locate, onLocate, onSelect, on
               <p className="mt-1 text-[11px] text-neutral-500">
                 这条关系两端同属分组 {relationOf(openRelation)!.group_id}：图上不画自环，改在各分组节点上逐条列出（§3.2）
               </p>
+              {/* §4.2「解释文案按边类写死」的同一条关系口径：drawn 的关系在 `selectedEdge` 分支里显示；
+                  同组关系（真实数据上 design_interface 全部在这里）过去只显示出处行、**不显示边类口径**，
+                  于是「设计声明的归属关系，非运行接口」这句话在图上无处可见。这里补上同一份标注
+                  （`provenance.annotateObject` 的唯一实现，界面不另写文案）。 */}
+              {annotationOf(openRelation) !== null && (
+                <div className="mt-1" data-project-relation-provenance={openRelation}>
+                  <p className="text-[11px] text-neutral-300">{annotationOf(openRelation)!.evidence_state_label}</p>
+                  <ObjectProvenanceLines annotation={annotationOf(openRelation)!} />
+                </div>
+              )}
             </section>
           )}
           {sections === null ? (
@@ -1350,8 +1432,8 @@ export function statusCountsOf(nodes: readonly { status: NodeStatus }[]): Record
   return out;
 }
 
-/** 供验证脚本/页签容器构造"未映射"的汇总（占位导出，口径在 `projectGraph.aggregateStatusOf`） */
-export const unmappedStatus = (): NodeStatus => aggregateStatusOf([]);
+/** 供验证脚本/页签容器构造"未映射"的汇总（占位导出，口径在 `projectGraph.canonicalScopeStatusOf`） */
+export const unmappedStatus = (): NodeStatus => canonicalScopeStatusOf(null);
 
 /** 蓝图节点的短名（详情标题用；对外共享一份，免得两处各写） */
 export const blueprintNodeLabel = (n: BlueprintNode): string => n.name;

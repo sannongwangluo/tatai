@@ -18,7 +18,34 @@
 import { getProject, resolveDataDir } from "../server/registry";
 import { projectWithReleases } from "../server/work/entry";
 import { projectWorkDir, WsError } from "../server/workstation";
-import { eventsSnapshotOf, type EventsSnapshot } from "../server/work/statusProjection";
+import {
+  collectProjectFacts,
+  eventsSnapshotOf,
+  objectsFromFacts,
+  projectStatuses,
+  requiredChecksFromDefinitions,
+  type EventsSnapshot,
+  type ProjectFacts,
+  type StatusObjectInput,
+  type StatusProjection,
+  type StatusProjectionSet,
+} from "../server/work/statusProjection";
+import {
+  deriveObligations,
+  scopeVersionOf,
+  stableCheckDefinitionsByTask,
+  type FeatureObligationInput,
+} from "../server/work/obligations";
+import { activeBaseline, loadDocuments } from "../server/work/documents";
+import { foldRequirements } from "../server/work/requirements";
+import { parseFeatureDeclaration, parsePlanFeatureMap } from "../server/work/coverageModel";
+import {
+  scopeMemberLedgerOf,
+  scopeReadoutOf,
+  scopeStatusObjectsOf,
+  type ScopeCheckDefinitionRef,
+  type ScopeReadout,
+} from "./featureScope";
 import { graphUpdateOf } from "../server/work/graphRefresh";
 import { semanticStateOf, type SemanticStateView } from "./blueprintAuto";
 import {
@@ -33,12 +60,18 @@ import {
   type BlueprintNodeLead,
 } from "./blueprint";
 import { dataFlowLayerOf } from "./render";
+import {
+  dataFlowModelFromDeclaration,
+  resolveDataFlowDeclaration,
+  type ResolvedDataFlowDeclaration,
+} from "./dataflow";
 import { declaredLinksOf, readLastReconcile } from "./reconcile";
 import { buildMindTree, type MindTree } from "./mindmap";
 import { mergePlanningLayer, selectGraph, type SharedGraph } from "./shared-graph";
 import { ARCH_UNLIMITED_LIMITS, JUNK_DIR_SEGMENTS } from "./config";
 import { graphInputSha, sha256Hex, unlimitedGraphOf } from "./items";
 import { legacyAggregationOf, readModules, type ArchModulesFile } from "./parse";
+import { withDerivationScope } from "../server/work/derivationScope";
 import {
   buildViewModel,
   capabilityClassTableStateOf,
@@ -54,6 +87,7 @@ import {
   type ViewEdge,
   type ViewNode,
   type NodeStatus,
+  type DataFlowModel,
 } from "../ui/arch/projectGraph";
 import type { ProvenanceAnnotation, ProvenanceModel } from "../ui/arch/provenance";
 import { DISPLAY_STATUS_PALETTE, NO_STATUS_RECORD_KEY, statusStyle } from "../ui/arch/statusColor";
@@ -265,6 +299,8 @@ export interface GraphNodeEntry {
   id: string;
   label: string;
   kind: string;
+  /** Real project-relative drill path; absent for planning-only objects. */
+  path?: string;
   /** 概览分组键（分组节点＝自己；成员节点＝所属分组；施工依赖＝null） */
   group_key: string | null;
   members: string[];
@@ -340,6 +376,10 @@ export interface GraphPayload {
   edges: GraphEdgeEntry[];
   /** §3.2 同组关系可见性：两端落在同一分组关系**逐条列出**（不画自环、不伪造跨组边） */
   intra_relations: GraphEdgeEntry[];
+  /** Source-identical unresolved endpoints, with classification/aggregation exclusions distinguished from real gaps. */
+  unresolved_relations?: ProjectViewModel['unresolved_relations'];
+  /** Business canvas reads tech.nodes/edges/chains. Legacy nodes/edges/counts remain the separately labelled code-reference layer. */
+  primary_canvas?: { layer: 'business_data_flow'; source: 'tech'; nodes: number; edges: number; chains: number };
   /** 口径说明（视图口径 + 数量口径，逐条上屏；与界面 `buildViewModel(...).notes` 同一份） */
   notes: string[];
   /** 技术详情三图额外带：当前实现/目标口径的区分（数据流向图必带） */
@@ -391,6 +431,13 @@ export interface SixGraphSnapshot {
     ignored_dir_segments: string[];
   };
   graphs: Partial<Record<SixGraphKey, GraphPayload>>;
+  /**
+   * V09-55（B5 返工）：**范围（能力）的 canonical 义务层读数**（键 = 稳定 `scope_id`）。
+   * 六图的能力节点状态**只由它派生**（只读适配）；本读口与设计页/MCP `feature_ledger` 消费**同一份**
+   * 唯一义务层结论（`deriveObligations`/`projectStatuses`），`scope_revision` 含**成员＋检查定义**。
+   * 没有该投影的范围 `available:false` ⇒ 六图如实标未知，**不退回本地按成员汇总造绿**。
+   */
+  scope_readouts: Record<string, ScopeReadout>;
   /** 交付读数（§4.2：可请求验收／不可判定项目可交付；**仍不等于用户接受**） */
   delivery: {
     verdict: string;
@@ -702,10 +749,248 @@ export function parseSixGraphCursor(
 }
 
 /**
+ * V09-55（B5 适配层）：从 DESIGN 声明区 ＋ PLAN 功能映射表收集**正式输入**，装配成 canonical
+ * `FeatureObligationInput[]`——**只收集输入，不判状态**（判据在唯一义务层 `deriveObligations`/`projectStatuses`）。
+ *
+ * 与 MCP `feature_ledger`（B2）走同一份导入解析与同一份映射口径；解析失败一律返回空数组并**不静默冒充**
+ * （六图据此对缺失范围标未知，不本地造绿）。
+ */
+function featureObligationInputsOf(
+  projectId: string,
+  dataDir: string,
+  facts: ProjectFacts,
+  events: EventsSnapshot | null,
+): FeatureObligationInput[] {
+  try {
+    if (events === null) return [];
+    const docs = loadDocuments(projectId, dataDir);
+    const requirements = foldRequirements(events.events);
+    const declared = parseFeatureDeclaration(docs.design?.text ?? "", {
+      known_requirement_ids: new Set(Object.keys(requirements.requirements)),
+    });
+    if (!declared.found || declared.features.length === 0) return [];
+    const planMap = parsePlanFeatureMap(docs.plan?.text ?? "");
+    return declared.features.map((f) => {
+      const row = planMap.rows.find((r) => r.feature_id === f.item_id);
+      return {
+        feature_id: f.item_id,
+        task_ids: row?.task_ids ?? [],
+        required_check_ids: row?.required_check_ids ?? [],
+        integration_check_ids: row?.integration_check_ids ?? [],
+        scope_id: f.scope_raw === "null" ? null : f.scope_raw,
+        mapped: row !== undefined,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+/** PLAN 功能映射是否被**有效基线**批准（判据与 `feature_ledger` 同口径：生效基线的施工图内容哈希＝当前施工图） */
+function planMappingApprovedOf(projectId: string, dataDir: string, facts: ProjectFacts): boolean {
+  try {
+    const active = activeBaseline(projectId, dataDir);
+    if (active === null) return false;
+    return facts.revisions.plan !== null && active.plan_revision.content_sha256 === facts.revisions.plan;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 范围（能力）的 canonical 义务层结论（**唯一派生**）：任务/模块/依赖线 + 蓝图范围对象 + 新功能
+ * 范围**全部**并进**一次** `deriveObligations`（内部一次 `projectStatuses`）。
+ *
+ * 为什么要导出成函数：六图读口与 `GET /api/projects/:id/status-projection`（客户端画布）必须消费
+ * **同一份**结论，不能各自再拼一份 objects/checks 重跑投影——那样会漏掉功能对象转接的检查（实测假绿，
+ * B5 复审 11:26），也会让"同一 scope 同版本"跨接口对不上账。`feature_ledger` 走同一个 `deriveObligations`。
+ *
+ * 参数 `facts`/`events` 由调用方传入**同一份快照**（不重复读盘；DESIGN §2.6「一个事实、一次派生」）。
+ */
+export interface ScopeConclusion {
+  /** 本函数引入投影的**范围（能力）对象**（canonical `StatusObjectInput`；供读口并入 objects[] 表） */
+  objects: StatusObjectInput[];
+  /** 每个范围对象的 canonical 投影（键 = 对象稳定 id） */
+  projection: Record<string, StatusProjection>;
+  /** 上屏读数（只读适配 `scopeReadoutOf`；未接入 ⇒ available=false，不本地造绿） */
+  readouts: Record<string, ScopeReadout>;
+  /**
+   * 本次 `deriveObligations` 的**完整投影集**（任务/模块/依赖线/功能范围/蓝图范围对象同一份判据）。
+   * `GET /status-projection` 直接消费它（同一现读快照 → 一次派生），不再自己拼 objects/checks 重跑。
+   * `null` = 事实快照读不出来（本段没有派生）。
+   */
+  full: StatusProjectionSet | null;
+  /** 本段落自己的异常说明（调用方并入自己的 anomalies，不静默吞） */
+  anomalies: string[];
+}
+
+export function scopeConclusionOf(args: {
+  projectId: string;
+  dataDir: string;
+  blueprint: Blueprint | null;
+  facts: ProjectFacts | null;
+  events: EventsSnapshot | null;
+}): ScopeConclusion {
+  // 同 `sixGraphsOf`：整段跑在一次派生的只读复用作用域里（作用域随本次调用结束即丢，跨请求不缓存）。
+  return withDerivationScope(() => scopeConclusionInScope(args));
+}
+
+function scopeConclusionInScope(args: {
+  projectId: string;
+  dataDir: string;
+  blueprint: Blueprint | null;
+  facts: ProjectFacts | null;
+  events: EventsSnapshot | null;
+}): ScopeConclusion {
+  const { projectId, dataDir, blueprint: bp, facts: projectFacts, events: eventsSnapshot } = args;
+  const anomalies: string[] = [];
+  const scopeObjects: StatusObjectInput[] = [];
+  // ── 范围（能力）的 canonical 义务层投影（唯一判据 = projectStatuses；本函数只装配输入、只读适配） ──
+  //
+  // ① 蓝图正式关系（`plan:cap:*` 的成员）装配成 canonical `StatusObjectInput`（object_kind=capability，
+  //    children = 成员对象）；② 新功能范围（`cap-loop-*`）由 DESIGN 声明区＋PLAN 映射表装配成
+  //    `FeatureObligationInput`，经**唯一义务派生入口** `deriveObligations` 产出（与 MCP `feature_ledger`
+  //    同一份结论）；③ 二者合到**一次** `projectStatuses` 判——失败集成 ⇒ blocked、缺输入 ⇒ unknown/missing。
+  const scopeProjection: Record<string, StatusProjection> = {};
+  const scopeReadouts: Record<string, ScopeReadout> = {};
+  // 本次 deriveObligations 的完整投影集（供 status-projection 读口消费；同一快照、同一判据）
+  let full: StatusProjectionSet | null = null;
+  // 关键：**功能范围（cap-loop-*）不依赖蓝图** —— 没有已发布/草稿规划图时，DESIGN 声明区的功能
+  // 仍要如实派生，不能因为 `bp === null` 把整段隐没（B2 复审 11:58 D／「无已发布图时已有 feature 也要如实返回」）。
+  // 蓝图范围对象（plan:cap:*）才需要 blueprint。
+  if (projectFacts !== null) {
+    try {
+      const facts = projectFacts;
+      // 成员账目（仅蓝图范围需要）；检查定义指纹取自**唯一义务层**的定义表（与 feature-ledger 同一份 `task_checks`）。
+      const taskCheckDefs = stableCheckDefinitionsByTask(facts.definitions);
+      const baseLedger = bp === null ? {} : scopeMemberLedgerOf(bp);
+      const memberTasksOf = (scopeId: string): string[] =>
+        (baseLedger[scopeId]?.member_ids ?? [])
+          .filter((m) => m.startsWith("plan:task:"))
+          .map((m) => m.slice("plan:task:".length));
+      const checkDefinitionOf = (scopeId: string): ScopeCheckDefinitionRef[] => {
+        const refs: ScopeCheckDefinitionRef[] = [];
+        const seen = new Set<string>();
+        const push = (check_id: string, role: ScopeCheckDefinitionRef["role"]): void => {
+          if (seen.has(check_id)) return;
+          seen.add(check_id);
+          let fp: string | null = null;
+          for (const defs of Object.values(taskCheckDefs)) {
+            const hit = defs.find((d) => d.check_id === check_id);
+            if (hit !== undefined) {
+              fp = hit.definition_fingerprint;
+              break;
+            }
+          }
+          refs.push({ check_id, definition_fingerprint: fp ?? `missing:${check_id}`, role });
+        };
+        for (const def of facts.definitions) {
+          if (!memberTasksOf(scopeId).includes(def.task_id)) continue;
+          for (const c of taskCheckDefs[def.task_id] ?? []) push(c.check_id, "required");
+        }
+        for (const c of facts.integration_requirements.in_force ? facts.integration_requirements.by_object[scopeId] ?? [] : []) {
+          push(c.check_id, "integration");
+        }
+        return refs.sort((a, b) => a.check_id.localeCompare(b.check_id));
+      };
+      const featureInputs = featureObligationInputsOf(projectId, dataDir, projectFacts, eventsSnapshot);
+      // 范围（能力）对象先装配（成员是否在 canonical 对象表里，按 `objectsFromFacts` 的同一规则取：
+      // 任务在 `task_states` 里、模块看台账映射；这里不另判状态，只判"对象是否在场"）。
+      const canonicalObjectIds = new Set(
+        objectsFromFacts(projectId, dataDir, facts).map((o) => o.object_id),
+      );
+      const declaredIntegration = (scopeId: string): { check_id: string; label: string; required: boolean }[] =>
+        facts.integration_requirements.in_force ? facts.integration_requirements.by_object[scopeId] ?? [] : [];
+      // 没有蓝图 ⇒ 没有 plan:cap:* 范围对象；功能范围照常派生（不整段隐没）。
+      const legacyScopeObjects =
+        bp === null
+          ? []
+          : scopeStatusObjectsOf({
+              blueprint: bp,
+              memberObjectIn: (oid) => canonicalObjectIds.has(oid),
+              integrationOf: (scopeId) => declaredIntegration(scopeId),
+              integrationSourceOf: (scopeId) => {
+                const here = declaredIntegration(scopeId);
+                return {
+                  source: here.length > 0 ? "plan" : "none",
+                  revision: here.length > 0 ? facts.integration_requirements.plan_revision : null,
+                  blocked_reason: here.length === 0 ? facts.integration_requirements.not_in_force_reason : null,
+                };
+              },
+              checkDefinitionOf,
+            });
+      // **一次** deriveObligations：任务/模块/依赖线/功能范围 + 蓝图范围对象**同一份**判据、同一批检查记录。
+      // 只读适配从此只消费 `obls.projection`（不再自己拼一份 objects/checks 重跑 `projectStatuses`——
+      // 那样会漏掉功能对象转接的检查，实测假绿；B5 复审 11:26）。
+      const obls = deriveObligations({
+        project_id: projectId,
+        data_dir: dataDir,
+        facts: projectFacts,
+        integration_requirements: projectFacts.integration_requirements,
+        // 原始事件同一快照：唯一义务层据此做**逐条记录的定义绑定**（稳定键身份不被丢；B2 复审 11:58）。
+        ...(eventsSnapshot === null ? {} : { events: eventsSnapshot.events }),
+        ...(legacyScopeObjects.length === 0 ? {} : { extra_objects: legacyScopeObjects }),
+        ...(featureInputs.length === 0
+          ? {}
+          : {
+              features: featureInputs,
+              plan_mapping_approved: planMappingApprovedOf(projectId, dataDir, projectFacts),
+            }),
+      });
+      const all = obls.projection;
+      full = all;
+      scopeObjects.push(...legacyScopeObjects, ...Object.values(obls.features).map((f) => f.object));
+      for (const o of all.objects) scopeProjection[o.object_id] = o;
+      if (bp !== null) {
+        const ledger = scopeMemberLedgerOf(bp, { checkDefinitionOf });
+        for (const [id, l] of Object.entries(ledger)) scopeReadouts[id] = scopeReadoutOf(all.by_id[id] ?? null, l);
+      }
+      // 新功能范围（cap-loop-*）：不在蓝图账目里，读数口径同一份（canonical 投影；成员＝成员任务）。
+      // `scope_revision` 走**唯一算法** `scopeVersionOf`（成员＋实际定义指纹），与 feature_ledger 同值。
+      for (const f of featureInputs) {
+        if (scopeReadouts[f.feature_id] !== undefined) continue;
+        const version = scopeVersionOf({
+          scope_id: f.feature_id,
+          member_task_ids: f.task_ids,
+          required_check_ids: f.required_check_ids,
+          integration_check_ids: f.integration_check_ids,
+          task_checks: obls.task_checks,
+        });
+        scopeReadouts[f.feature_id] = scopeReadoutOf(all.by_id[f.feature_id] ?? null, {
+          scope_id: f.feature_id,
+          scope_revision: version.scope_revision,
+          members: version.members,
+          member_ids: version.members.map((m) => m.id),
+          checks: version.checks,
+        });
+      }
+    } catch (e) {
+      anomalies.push(
+        `范围（能力）canonical 义务层投影算不出来：${(e as Error).message}（能力节点按「无 canonical 投影」如实标未知，不本地造绿）`,
+      );
+    }
+  }
+  return { objects: scopeObjects, projection: scopeProjection, readouts: scopeReadouts, full, anomalies };
+}
+
+/**
  * 读六图完整当前状态（只读；不写盘、不调模型）。
  * 四种用法：① 全部六图（缺省）；② `graph=<六图之一>`；③ `node_id=<稳定 ID>`；④ `relation_id=<稳定关系 ID>`。
  */
+/**
+ * 六图 canonical builder（PLAN V09-22 起为 MCP/宿主/界面的唯一图事实源）。
+ *
+ * 2026-10-07 运行时阻塞修复：整体跑在**一次派生的只读复用作用域**里
+ * （`derivationScope`）——同一次构建内多个子派生（事实快照/来源标注/来源修订/义务层/来源清单复核）
+ * 对同一批只读输入只读一次、算一次。作用域随本次调用结束即丢，**跨请求不缓存**，
+ * 因此源的可见性、判据与状态语义逐字不变（源一变，下一次调用立刻现读现算）。
+ * 证据：E/runtime-profile-only/REPORT.md、E/runtime-final/COORDINATOR-HYPOTHESES.md。
+ */
 export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixGraphSnapshot {
+  return withDerivationScope(() => sixGraphsOfInScope(projectId, opts));
+}
+
+function sixGraphsOfInScope(projectId: string, opts: SixGraphOptions = {}): SixGraphSnapshot {
   const dataDir = opts.dataDir;
   const project = getProject(projectId, dataDir);
   if (!project) throw new WsError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`);
@@ -751,20 +1036,55 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
       eventsSnapshot = null; // 账本损坏等：不沿用任何旧快照，下游现读时照常失败（不静默吞）
     }
   }
-  const projection: Record<string, import("../server/work/statusProjection").StatusProjection> = {};
+  const projection: Record<string, StatusProjection> = {};
   let revisions: { design?: string | null; plan?: string | null; plan_definition?: string | null } = {};
+  // V09-55（B5 返工）：本次现读的**同一份事实快照**。基础投影与「范围（能力）canonical 义务层投影」
+  // 都从它派生（§2.6「一个事实、一次派生」）；events 复用走同一份 `eventsSnapshot`，不六次各读现源。
+  let projectFacts: ProjectFacts | null = null;
+  try {
+    projectFacts = collectProjectFacts(projectId, resolvedDataDir, eventsSnapshot === null ? {} : { events: eventsSnapshot });
+  } catch (e) {
+    anomalies.push(`事实快照读不出来：${(e as Error).message}（范围/能力状态按「无 canonical 投影」如实表达，不涂色）`);
+  }
   try {
     const proj = projectWithReleases({
       projectId,
       dataDir: resolvedDataDir,
       definitions: [],
       ...(eventsSnapshot === null ? {} : { events: eventsSnapshot }),
+      ...(projectFacts === null ? {} : { projectFacts }),
     });
     for (const o of proj.objects) projection[o.object_id] = o;
   } catch (e) {
     anomalies.push(`状态投影算不出来：${(e as Error).message}（逐对象状态按「无状态记录」如实表达，不涂色）`);
   }
+
+
+
+
+  // ── 范围（能力）的 canonical 义务层投影：与 `GET /status-projection` 读口**同一份**（共享函数） ──
+  const scopeConclusion = scopeConclusionOf({
+    projectId,
+    dataDir: resolvedDataDir,
+    blueprint: bp,
+    facts: projectFacts,
+    events: eventsSnapshot,
+  });
+  const scopeProjection = scopeConclusion.projection;
+  const scopeReadouts = scopeConclusion.readouts;
+  anomalies.push(...scopeConclusion.anomalies);
   const links = declaredLinksOf(readLastReconcile(projectId, dataDir).result ?? null);
+  /**
+   * 六图节点状态沿用的**唯一状态投影**：任务/模块/依赖线也必须与 `GET /status-projection`
+   * （`scope.full`）、MCP `feature_ledger`、客户端画布消费的**同一份** canonical 义务层
+   * （`deriveObligations` 的完整投影集）一致——结构拓扑仍取自蓝图（可旧），但**实时状态/版本
+   * 必须同版本**，不得拿「旧提交图的 task 主状态」＋「当前 scope 投影」混版（§2.6 一个事实一次派生）。
+   * 真机现场（2026-10-07）：tatai V09-51 六图 task 节点 `pending_verification`、canonical `verified`；
+   * 示例项目 T02.2/T06.1/T09.1 六图 `blocked`、canonical `pending_verification`。
+   * canonical 算不出来（事实快照读不出）时才退回旧投影；缺映射保持未知，不造绿。
+   */
+  const statusProjection: ProjectionIndex =
+    scopeConclusion.full === null ? (projection as ProjectionIndex) : (scopeProjection as ProjectionIndex);
 
   // 来源修订（快照标识用；与 project_entry 的修订同一来源）
   let sources: ReturnType<typeof readBlueprintSources> | null = null;
@@ -788,6 +1108,16 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
   // ＋ names.json/progress.json（V09-22 返工 F2：模块人话名/兼容状态也是实际图输入，改名后快照必须换 identity，否则同进程 full 拿旧名、旧游标被误当同快照）。
   // 同输入任意间隔两次调用得同一标识；modules.json/supplement.json 一变标识即变、旧游标拒。
   const { modulesSha, supplementSha, namesSha, progressSha } = graphInputSha(projectId, dataDir);
+  // V09-11（2026-10-04 声明解耦后）：**项目侧数据流声明也是本图的实际输入**——`data_flow.tech` 目标层由它派生。
+  // 声明内容一变（含缺失/坏声明/越界这类缺口变化）快照身份必须变，否则「声明变了 snapshot 没变、旧 cursor 误通过」。
+  // 指纹只认**内容**：内建＝源码内建声明内容 sha；项目侧＝声明文件 sha；缺口＝原因 sha——不用 mtime。
+  // 这一次读取结果随后直接供 `buildDataFlow` 复用（同一调用栈内不重读声明文件）。
+  let dfDeclaration: ResolvedDataFlowDeclaration | null = null;
+  try {
+    dfDeclaration = resolveDataFlowDeclaration(projectId, dataDir ? { dataDir } : {});
+  } catch (e) {
+    anomalies.push(`数据流声明身份读不出来：${(e as Error).message}（快照身份按可得部分给，不伪造）`);
+  }
   const snapshotId = `gs-${sha256Hex(
     [
       projectId,
@@ -799,6 +1129,7 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
       supplementSha,
       namesSha,
       progressSha,
+      dfDeclaration?.identity ?? "df:none",
     ].join("|"),
   ).slice(0, 16)}`;
   const effectiveVersion = baselineId ?? (revisions.plan_definition ?? revisions.plan ?? revisions.design ?? null);
@@ -915,16 +1246,19 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
     });
     const derived = taskDerivedModuleStatus({
       blueprint: bp,
-      projection: projection as ProjectionIndex,
+      projection: statusProjection,
       declared_links: links,
+      scope_projection: scopeProjection as ProjectionIndex,
     });
     // V09-22：full 模式把主视图的分组概览放开（`overview_full`，消费侧在 `buildViewModel`／任务书 §2.1）。
     const model = buildViewModel({
       view,
       blueprint: bp,
-      projection: projection as ProjectionIndex,
+      projection: statusProjection,
       mergedNodes: merged.graph.nodes.map((n) => ({ id: n.id, plan_refs: n.plan_refs })),
       module_status: derived.status,
+      // V09-55 返工：能力节点状态只读 canonical 义务层投影（同一份；缺键 ⇒ 未知）
+      scope_projection: scopeProjection as ProjectionIndex,
       overview_full: mode === "full",
     });
     /** V09-22：底层候选总数（分组/任务节点总数，含被概览折叠的）——区分「本图返回数」 */
@@ -968,6 +1302,7 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
       nodes: page.nodes,
       edges: page.edges,
       intra_relations: page.intra,
+      unresolved_relations: model.unresolved_relations,
       // 主视图没有共用数据层，采集侧 budget_exhausted 与 origin:chat 此处不可得（如实不标，不硬凑）
       notes: [...model.notes, ...completenessNotesOf({ mode, budget_exhausted: null, has_chat_nodes: false })],
     };
@@ -1063,16 +1398,24 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
     if (graph === null) return emptyGraphPayload("module_map", "技术详情共用数据层读不出来（见 anomalies）", mode);
     const sel = selectGraph("MODULE_BOX", graph);
     const derived =
-      bp === null ? null : taskDerivedModuleStatus({ blueprint: bp, projection: projection as ProjectionIndex, declared_links: links });
+      bp === null ? null : taskDerivedModuleStatus({ blueprint: bp, projection: statusProjection, declared_links: links, scope_projection: scopeProjection as ProjectionIndex });
     /** 技术模块 id 口径的 v2 派生上屏键（`moduleStatusKeysOf` 是唯一出处：同时给 plan:code:* 与裸模块 id） */
     const derivedKeys = derived === null ? {} : moduleStatusKeysOf(derived);
     const nodeRows = sel.nodes.map((n) => {
       const key: string = derivedKeys[n.id] ?? NO_STATUS_RECORD_KEY;
-      const st = derived === null ? undefined : (derived.status[`plan:code:${n.id}`] as NodeStatus | undefined);
+      // 2026-10-05 六图修复：非模块规划节点（plan:task:*/plan:cap:*）也要给出完整 NodeStatus
+      // （short/basis 用）——plan_status 与模块派生同一份（`moduleStatusKeysOf` 已并入键表）。
+      const st =
+        derived === null
+          ? undefined
+          : ((derived.status[`plan:code:${n.id}`] as NodeStatus | undefined) ??
+            derived.by_object[`module:${n.id}`] ??
+            derived.plan_status[n.id]);
       return {
         id: n.id,
         label: n.name,
         kind: n.kind,
+        ...(n.path ? { path: n.path } : {}),
         group_key: null,
         members: [],
         hidden_members: 0,
@@ -1093,30 +1436,40 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
         ),
       } satisfies GraphNodeEntry;
     });
-    const edgeRows = sel.edges.map((e) => ({
-      id: `${e.from}->${e.to}`,
-      from: e.from,
-      to: e.to,
-      kind: "static_import",
-      certainty: "observed",
-      semantics: "static_reference",
-      sources: [],
-      note:
-        "静态 import 聚合边（方向＝依赖方 → 被依赖方）：**当前实现**的代码关系层。" +
-        "它不是运行时调用、也不是业务数据流（§3.2／§11.2）",
-      object: objectStateOf(
-        `${e.from}->${e.to}`,
-        `${e.from} → ${e.to}`,
-        "static_import",
-        "edge",
-        null,
-        undefined,
-        "静态引用线保持中性来源样式、不着完成色（§4.2）",
-        annotationOfId(provenance, `${e.from}->${e.to}`),
-        effectiveVersion,
-        null,
-      ),
-    }));
+    const edgeRows = sel.edges.map((e) => {
+      // 2026-10-05 六图修复：规划边**不再冒充实测 static_import**——共用层并进的规划关系带
+      // origin:"plan" 与原关系类型（plan_kind/plan_certainty），这里按来源分流标注；静态边口径不变。
+      const isPlan = e.origin === "plan";
+      const edgeKind = isPlan ? (e.plan_kind ?? "plan_relation") : "static_import";
+      return {
+        id: `${e.from}->${e.to}`,
+        from: e.from,
+        to: e.to,
+        kind: edgeKind,
+        certainty: isPlan ? (e.plan_certainty ?? "declared") : "observed",
+        semantics: isPlan ? "plan_relation" : "static_reference",
+        sources: [],
+        note: isPlan
+          ? `规划层关系（${edgeKind}，审定图纸派生；端点已解析到共用层节点）：**声明关系**，` +
+              "不是实测的静态 import、更不是业务数据流（§3.2／§11.2；V06-05 边标记语义）"
+          : "静态 import 聚合边（方向＝依赖方 → 被依赖方）：**当前实现**的代码关系层。" +
+            "它不是运行时调用、也不是业务数据流（§3.2／§11.2）",
+        object: objectStateOf(
+          `${e.from}->${e.to}`,
+          `${e.from} → ${e.to}`,
+          edgeKind,
+          "edge",
+          null,
+          undefined,
+          isPlan
+            ? "规划声明线：中性来源样式、不着完成色（§4.2）——声明关系不代表实现已实测"
+            : "静态引用线保持中性来源样式、不着完成色（§4.2）",
+          annotationOfId(provenance, `${e.from}->${e.to}`),
+          effectiveVersion,
+          null,
+        ),
+      };
+    });
     const summaryOnly = opts.summary_only === true;
     const page = summaryOnly ? summaryPage(sel.nodes.length + sel.edges.length) : paginateGraph(nodeRows, edgeRows, [], offsetFor("module_map"), budgetLeft());
     totalObjects += page.total;
@@ -1174,7 +1527,11 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
     const meta = SIX_GRAPH_META.data_flow;
     const flow = (() => {
       try {
-        return dataFlowLayerOf(projectId, dataDir ? { dataDir } : {});
+        // 与快照身份读的是**同一份**声明：本函数开头已解析，这里不再重读文件（声明未变则逐字一致，
+        // 真变了快照也已换 id）。仅当开头解析抛错（dfDeclaration 为 null）才回退到现读一次。
+        return dfDeclaration !== null
+          ? dataFlowModelFromDeclaration(dfDeclaration)
+          : dataFlowLayerOf(projectId, dataDir ? { dataDir } : {});
       } catch (e) {
         anomalies.push(`数据流向图的目标语义层算不出来：${(e as Error).message}`);
         return null;
@@ -1182,7 +1539,7 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
     })();
     const summaryOnly = opts.summary_only === true;
     const derivedKeysFlow =
-      bp === null ? {} : moduleStatusKeysOf(taskDerivedModuleStatus({ blueprint: bp, projection: projection as ProjectionIndex, declared_links: links }));
+      bp === null ? {} : moduleStatusKeysOf(taskDerivedModuleStatus({ blueprint: bp, projection: statusProjection, declared_links: links, scope_projection: scopeProjection as ProjectionIndex }));
     const sel = graph === null ? null : selectGraph("DATA_FLOW", graph);
     const nodeRows: GraphNodeEntry[] =
       sel === null || summaryOnly
@@ -1191,6 +1548,7 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
             id: n.id,
             label: n.name,
             kind: n.kind,
+            ...(n.path ? { path: n.path } : {}),
             group_key: null,
             members: [],
             hidden_members: 0,
@@ -1212,30 +1570,40 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
     const edgeRows: GraphEdgeEntry[] =
       sel === null || summaryOnly
         ? []
-        : sel.edges.map((e) => ({
-            id: `${e.from}->${e.to}`,
-            from: e.from,
-            to: e.to,
-            kind: "static_import_direction",
-            certainty: "observed",
-            semantics: "static_reference",
-            sources: [],
-            note:
-              "**当前实现**：静态 import 依赖层的方向渲染（提供者 → 消费者），不是业务数据流。" +
-              "目标口径见本图 `tech.target_semantics`（§3.2／§11.2）",
-            object: objectStateOf(
-              `${e.from}->${e.to}`,
-              `${e.from} → ${e.to}`,
-              "static_import_direction",
-              "edge",
-              null,
-              undefined,
-              "静态引用线保持中性来源样式、不着完成色（§4.2）；**静态 import 只作线索，不得据此生成「已验证」的数据边**",
-              annotationOfId(provenance, `${e.from}->${e.to}`),
-              effectiveVersion,
-              null,
-            ),
-          }));
+        : sel.edges.map((e) => {
+            // 2026-10-05 六图修复：规划边按原关系类型出（不冒充实测 import 方向渲染）；
+            // 静态边保持「当前实现＝静态 import 方向渲染」口径不变。
+            const isPlan = e.origin === "plan";
+            const edgeKind = isPlan ? (e.plan_kind ?? "plan_relation") : "static_import_direction";
+            return {
+              id: `${e.from}->${e.to}`,
+              from: e.from,
+              to: e.to,
+              kind: edgeKind,
+              certainty: isPlan ? (e.plan_certainty ?? "declared") : "observed",
+              semantics: isPlan ? "plan_relation" : "static_reference",
+              sources: [],
+              note: isPlan
+                ? `规划层关系（${edgeKind}，审定图纸派生；端点已解析到共用层节点）：**声明关系**，` +
+                    "不是实测的静态 import 方向、更不是业务数据流。目标口径见本图 `tech.target_semantics`（§3.2／§11.2）"
+                : "**当前实现**：静态 import 依赖层的方向渲染（提供者 → 消费者），不是业务数据流。" +
+                  "目标口径见本图 `tech.target_semantics`（§3.2／§11.2）",
+              object: objectStateOf(
+                `${e.from}->${e.to}`,
+                `${e.from} → ${e.to}`,
+                edgeKind,
+                "edge",
+                null,
+                undefined,
+                isPlan
+                  ? "规划声明线：中性来源样式、不着完成色（§4.2）——声明关系不代表实现已实测"
+                  : "静态引用线保持中性来源样式、不着完成色（§4.2）；**静态 import 只作线索，不得据此生成「已验证」的数据边**",
+                annotationOfId(provenance, `${e.from}->${e.to}`),
+                effectiveVersion,
+                null,
+              ),
+            };
+          });
     const page = summaryOnly
       ? summaryPage((sel?.nodes.length ?? 0) + (sel?.edges.length ?? 0))
       : paginateGraph(nodeRows, edgeRows, [], offsetFor("data_flow"), budgetLeft());
@@ -1274,7 +1642,7 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
       edges: page.edges,
       intra_relations: [],
       notes: [
-        "**当前实现 ≠ 目标**：三张技术图当前共用同一份静态 import 依赖层（只有渲染取向不同）；数据流向图的**目标**是业务/项目数据的实际路径（§3.2）",
+        "业务数据流默认画布＝tech.nodes/edges/chains（primary_canvas 给该层数量）；兼容 nodes/edges/counts 保留独立「代码引用线索」层，静态 import 不代表业务数据已流通（§3.2）。",
         `来源分层（counts.by_origin）：本图可见真实实体＝代码模块 ${byOrigin.code} + 规划层 ${byOrigin.plan} + 聊天补全 ${byOrigin.chat}（__more__ 聚合占位不计入）；底层未聚合并集＝代码 ${byOriginUnderlying.code} + 规划 ${byOriginUnderlying.plan} + 聊天 ${byOriginUnderlying.chat}（counts.by_origin_underlying）——与方框图同一份共用数据层（§3.2「同一份数据」红线）`,
         flow === null
           ? "目标语义层本次算不出来（见 anomalies）"
@@ -1287,6 +1655,8 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
         }),
       ],
       tech: flow,
+      ...(flow === null ? {} : { primary_canvas: { layer: 'business_data_flow' as const, source: 'tech' as const,
+        nodes: flow.nodes.length, edges: flow.edges.length, chains: flow.chains.length } }),
     };
   };
 
@@ -1308,7 +1678,7 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
     const summaryOnly = opts.summary_only === true;
     // 共用层节点的状态与方框图**同一份**（v2 证据派生）；取不到才回落"无状态记录"（不回退 v1 自报四色）
     const derivedKeysForMind =
-      bp === null ? {} : moduleStatusKeysOf(taskDerivedModuleStatus({ blueprint: bp, projection: projection as ProjectionIndex, declared_links: links }));
+      bp === null ? {} : moduleStatusKeysOf(taskDerivedModuleStatus({ blueprint: bp, projection: statusProjection, declared_links: links, scope_projection: scopeProjection as ProjectionIndex }));
     const rows: GraphNodeEntry[] = (summaryOnly ? [] : flat).map(({ node, depth }) => ({
       id: node.id,
       label: node.label,
@@ -1425,6 +1795,7 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
   // ── 指定节点 / 指定关系：单对象读取（含它出现在哪几张图、分组、同组关系） ──
   let nodeFocus: unknown = null;
   let relationFocus: unknown = null;
+  const businessFlow = graphs.data_flow?.tech as DataFlowModel | null | undefined;
   if (opts.node_id !== undefined && opts.node_id.trim() !== "") {
     const want = opts.node_id.trim();
     const hits: { graph: SixGraphKey; entry: GraphNodeEntry; group_label: string | null }[] = [];
@@ -1438,9 +1809,12 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
       }
     }
     const annotations = provenance === null ? [] : Object.values(provenance.by_object).filter((a) => a.object_id === want);
+    const businessNode = businessFlow?.nodes.find(n => n.id === want);
     nodeFocus = {
       node_id: want,
-      found: hits.length > 0 || annotations.length > 0,
+      found: hits.length > 0 || annotations.length > 0 || businessNode !== undefined,
+      ...(businessNode === undefined ? {} : { business_appearances: [{ graph: 'data_flow', layer: 'business_data_flow', object: businessNode }],
+        business_edges: businessFlow!.edges.filter(e => e.from === want || e.to === want) }),
       appearances: hits.map((h) => ({ graph: h.graph, group_key: h.entry.group_key, group_label: h.group_label, object: h.entry.object })),
       intra_relations: (Object.keys(graphs) as SixGraphKey[]).flatMap((k) =>
         (graphs[k]?.intra_relations ?? []).filter((e) => e.from === want || e.to === want).map((e) => ({ graph: k, ...e })),
@@ -1451,7 +1825,7 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
       provenance: annotations,
       note:
         hits.length === 0 && annotations.length === 0
-          ? "六图里查不到这个稳定 ID（也未在任何模型的正式对象里）：如实报「查不到」，不猜一个近似节点"
+          ? (businessNode === undefined ? "六图里查不到这个稳定 ID（也未在任何模型的正式对象里）：如实报「查不到」，不猜一个近似节点" : "业务实体来源和验证态见 business_appearances；真实相邻数据关系见 business_edges")
           : "逐图给出该节点所在分组、同组关系与相邻关系；来源/映射/证据状态见 appearances[].object 与 provenance",
     };
   }
@@ -1471,14 +1845,22 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
       for (const e of g.intra_relations) if (relKey(e).includes(want)) hits.push({ graph: key, entry: e, where: "intra_relations" });
     }
     const annotations = provenance === null ? [] : Object.values(provenance.by_object).filter((a) => a.object_id === want);
+    const businessEdge = businessFlow?.edges.find(e => e.id === want || `${e.from}>${e.to}:${e.relation}` === want || `${e.from}|${e.to}|${e.relation}` === want);
+    const unresolved = (Object.keys(graphs) as SixGraphKey[]).flatMap(graph =>
+      (graphs[graph]?.unresolved_relations ?? []).filter(e => e.id === want || `${e.source}|${e.target}|${e.kind}` === want)
+        .map(e => ({ graph, ...e })));
     relationFocus = {
       relation_id: want,
-      found: hits.length > 0 || annotations.length > 0,
+      found: hits.length > 0 || annotations.length > 0 || businessEdge !== undefined || unresolved.length > 0,
+      ...(unresolved.length === 0 ? {} : { unresolved_appearances: unresolved }),
+      ...(businessEdge === undefined ? {} : { business_appearances: [{ graph: 'data_flow', layer: 'business_data_flow', ...businessEdge }] }),
       appearances: hits.map((h) => ({ graph: h.graph, where: h.where, ...h.entry })),
       provenance: annotations,
       note:
-        hits.length === 0 && annotations.length === 0
-          ? "六图里查不到这条关系（也未在任何模型的正式对象里）：如实报「查不到」"
+        unresolved.length > 0 && hits.length === 0
+          ? "关系存在但未绘为连线；逐图成因、端点与出处见 unresolved_appearances"
+          : hits.length === 0 && annotations.length === 0
+          ? (businessEdge !== undefined ? "业务关系的真实方向、出处和验证态见 business_appearances" : "六图里查不到这条关系（也未在任何模型的正式对象里）：如实报「查不到」")
           : "逐图给出该关系的两端、种类、语义、来源与当前状态（object 字段）",
     };
   }
@@ -1586,6 +1968,8 @@ export function sixGraphsOf(projectId: string, opts: SixGraphOptions = {}): SixG
       };
     })(),
     graphs,
+    /** V09-55（B5 返工）：范围（能力）的 canonical 义务层读数（唯一义务层产物；缺投影 ⇒ available:false） */
+    scope_readouts: scopeReadouts,
     delivery:
       provenance === null
         ? null
@@ -1717,11 +2101,18 @@ export interface SixGraphSummary {
  * 算到哪一版、哪里没验证、下一步读什么」放进接续入口，而**不内联整图**。
  */
 export function graphSummaryOf(projectId: string, opts: { dataDir?: string; events?: EventsSnapshot } = {}): SixGraphSummary {
-  const s = sixGraphsOf(projectId, {
-    ...(opts.dataDir === undefined ? {} : { dataDir: opts.dataDir }),
-    ...(opts.events === undefined ? {} : { events: opts.events }),
-    summary_only: true,
+  // 摘要模式同样整段跑在一次派生的只读复用作用域里（作用域随本次调用结束即丢，跨请求不缓存）。
+  return withDerivationScope(() => {
+    const s = sixGraphsOfInScope(projectId, {
+      ...(opts.dataDir === undefined ? {} : { dataDir: opts.dataDir }),
+      ...(opts.events === undefined ? {} : { events: opts.events }),
+      summary_only: true,
+    });
+    return summaryOfSnapshot(s);
   });
+}
+
+function summaryOfSnapshot(s: SixGraphSnapshot): SixGraphSummary {
   return {
     snapshot_id: s.snapshot_id,
     read_at: s.read_at,

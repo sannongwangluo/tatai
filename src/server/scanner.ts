@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { getProject } from "./registry";
+import { JUNK_DIR_RANDOM_TEMP_RE } from "../arch/config";
 import { sanitizeErrorMessage } from "./redact";
 import { WsError } from "./workstation";
 
@@ -357,7 +358,7 @@ async function scanTree(root: string, rt: ScanRuntime): Promise<TreeSummary> {
     let dirTruncated = false;
     for (const e of entries) {
       if (e.isDirectory()) {
-        if (IGNORED_SEGMENTS.has(e.name)) continue;
+        if (IGNORED_SEGMENTS.has(e.name) || JUNK_DIR_RANDOM_TEMP_RE.test(e.name)) continue;
         entriesSeen++;
         stack.push([path.join(dir, e.name), depth + 1]);
         continue;
@@ -499,7 +500,7 @@ function scanDocs(root: string): DocEntry[] {
       for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
         if (out.length >= MAX_DOCS_ENTRIES) break;
         if (e.isDirectory()) {
-          if (!IGNORED_SEGMENTS.has(e.name)) stack.push(path.join(dir, e.name));
+          if (!IGNORED_SEGMENTS.has(e.name) && !JUNK_DIR_RANDOM_TEMP_RE.test(e.name)) stack.push(path.join(dir, e.name));
         } else if (e.isFile() && /\.(md|txt)$/i.test(e.name)) {
           pushDoc(path.join(dir, e.name));
         }

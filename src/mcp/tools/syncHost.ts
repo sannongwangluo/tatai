@@ -71,7 +71,14 @@ export async function hostEntryView(
   projectId: string,
   dataDir: string,
   input: { role: string; known_revision?: string | null; resume_hint?: string | null; client_capabilities?: unknown },
-  opts: { preconditions?: boolean } = {},
+  opts: {
+    preconditions?: boolean;
+    /** V09-53（B3/§2.7）：向宿主只读入口索取逐 check 工作包（默认不请求＝宿主回包逐字不变） */
+    work_package?: boolean;
+    work_package_cursor?: string;
+    work_package_limit?: number;
+    work_package_expected_revision?: string;
+  } = {},
 ): Promise<HostEntryViewResult> {
   const r = await fetchHostEntryResult(
     dataDir,

@@ -20,6 +20,8 @@ import { nowIso } from "../time";
 import { withFileLock } from "../fileLock";
 import { appendJsonlLine } from "../lineStream";
 import { getProject } from "../registry";
+// P0/V09-45：本进程的构建身份（浏览器安全的共享判定，零 node 依赖）
+import { resolveBuildIdentity, type BuildIdentity } from "../../shared/buildIdentity";
 import { projectWorkDir, workstationDir } from "../workstation";
 import { parseRuntimeEntries } from "./runtimeEntries";
 import {
@@ -37,9 +39,13 @@ import {
 } from "./budget";
 import { foldChanges, changeIdsOf } from "./changes";
 import { assertIntentSourceValid, foldRequirements, requirementIdsOf } from "./requirements";
-import { REVISION_KINDS, type EvidenceBlob, type EvidenceInput, type RevisionKind } from "./evidence";
+import { REVISION_KINDS, foldFindings, type EvidenceBlob, type EvidenceInput, type RevisionKind } from "./evidence";
+import { assertNewAuditEvent } from "./auditValidation";
+import { validateCorrection, assertCorrectionFiles } from "./auditCorrection";
 import {
   gateClaimedPass,
+  foldAuditRecords,
+  AUDIT_ENTITY_PREFIXES,
   isVerificationSubject,
   passGateInputOf,
   recordMethodOf,
@@ -80,9 +86,22 @@ import {
 // V07-02 彩排闸：读侧同一份解析器（loadDocument→importTaskDefinitions→taskDefinitionHash）
 import { loadDocument } from "./documents";
 import { importTaskDefinitions, taskDefinitionHash } from "./plan";
-import { BLOCKED_NOT_CLAIMABLE_DETAIL_REASON, TASK_STATUS_LABELS, taskStatusOfEvents } from "./tasks";
+// P2/V09-47：预检把**同一份事件快照**传给判据（依赖重查折叠同一份，不再重读盘；见 submitChecks 头注）。
+import { eventsSnapshotOf } from "./statusProjection";
+import { BLOCKED_NOT_CLAIMABLE_DETAIL_REASON, TASK_STATUS_LABELS, readTaskStates, taskStatusOfEvents } from "./tasks";
 // V09-10（附录 F）：task.reopened 的写边界核实与 reopenTask 同一份判据（防直连写口旁路，C017 同类防线）
 import { verifyReopenCommand } from "./claims";
+// P2/V09-47（DESIGN §6.11）：结果提交的**锁内共享结果判据**——直连通用写口手写 task.result_submitted 也不能旁路；
+// 与 claims.submitTaskResult 及只读预检共用同一份判据（submitChecks.evaluateSubmitResultChecks）。
+import {
+  assertResultSubmittedWriteCommand,
+  evaluateSubmitResultChecks,
+  evaluateSubmitResultIdempotency,
+  parseResultSubmitInput,
+  type SubmitCheckRow,
+  type SubmitNotCheckedRow,
+  type SubmitResultChecksInput,
+} from "./submitChecks";
 // V09-23（DESIGN §2.10 / docs/sync-evidence-contract.md）：同步域命令的写边界核实（锁内按当前实际目标重算）
 // 与接续阻断判据。六个探针模块的注册由组合根负责（见 syncGraph.ts），service 是其中之一。
 import {
@@ -146,7 +165,25 @@ function resolveWorkbenchDir(projectId: string, dataDir: string): string {
  * 判据单一来源：foldRequirements/foldChanges 就是读侧重放与对象命令共用字段读取器的那两份
  * 纯函数，这里不新造第二套校验。
  */
-function assertEntityEventFoldable(events: WorkEvent[], cmd: WorkCommand, current: number): void {
+function assertEntityEventFoldable(events: WorkEvent[], cmd: WorkCommand, current: number, workDir: string): void {
+  if (cmd.entity_id.startsWith("finding:") || cmd.type.startsWith("finding.") || cmd.type.startsWith("audit.") || Object.values(AUDIT_ENTITY_PREFIXES).some((p) => cmd.entity_id.startsWith(p))) {
+    const candidate: WorkEvent = {
+      schema_version: cmd.schema_version, event_id: "<write-preflight>", project_id: cmd.project_id,
+      change_id: cmd.change_id, entity_id: cmd.entity_id, entity_revision: current + 1,
+      seq: events.length + 1, type: cmd.type, actor_id: cmd.actor_id, role: cmd.role,
+      occurred_at: cmd.occurred_at ?? "", received_at: "", idempotency_key: cmd.idempotency_key,
+      payload: cmd.payload ?? {},
+    };
+    if (cmd.type.startsWith("finding.") && !cmd.entity_id.startsWith("finding:")) throw new WorkError("EVENT_INVALID", "缺陷类型与实体不匹配（零写入）");
+    assertNewAuditEvent(events, candidate);
+    if (candidate.type === "audit.record_corrected") {
+      validateCorrection(events, candidate);
+      assertCorrectionFiles(candidate, path.resolve(workDir, "../.."));
+    }
+    foldFindings([...events, candidate]);
+    foldAuditRecords([...events, candidate]);
+    return;
+  }
   const fold = cmd.entity_id.startsWith("requirement:")
     ? foldRequirements
     : cmd.entity_id.startsWith("change:")
@@ -478,6 +515,96 @@ export interface WorkServiceOptions {
   assertWriteOwnership?: () => void;
 }
 
+/** P2/V09-47：只读预检的响应（`POST /api/work/preflight`；`supported_contract` 供能力协商） */
+export interface PreflightTaskResultResponse {
+  ok: true;
+  supported_contract: "preflight/v1";
+  read_only: true;
+  observed_versions: Record<string, unknown>;
+  checks: SubmitCheckRow[];
+  not_checked: SubmitNotCheckedRow[];
+  /**
+   * false = 命中幂等（duplicate/conflict）**没有重跑五查**——此时 `checks` 为空、`would_pass` 为 null，
+   * 不把原提交的版本/状态失败（或通过）冒充成"当前判据结论"。命中已提交时**不读 PLAN/证据**，
+   * 故 PLAN/证据此刻读不出来的情况下**仍能恢复原回执**。
+   */
+  checks_rechecked: boolean;
+  already_submitted: {
+    event_id: string;
+    seq: number;
+    entity_revision: number;
+    received_at: string;
+    duplicate: true;
+    /** 原提交的**非秘密**交付摘要（恢复原回执用；**绝不含** claim_token） */
+    result_summary: Record<string, unknown>;
+  } | null;
+  idempotency_status: "none" | "already_submitted" | "conflict";
+  /** 仅在 `checks_rechecked=true` 时有意义：此刻提交会被接受为 true；命中幂等时为 null（未重查） */
+  would_pass: boolean | null;
+  /** 若此刻提交会被拒时的错误码（未重查时为 null）；同键异内容时为 IDEMPOTENCY_CONFLICT */
+  rejection_code: string | null;
+  conflict: {
+    existing_event_id: string;
+    existing_seq: number;
+    existing_type: string;
+    result_summary: Record<string, unknown>;
+  } | null;
+  recheck_on_commit: true;
+  not_a_ticket: string;
+}
+
+/** 原提交的**非秘密**摘要（恢复原回执；白名单字段，claim_token 及其前缀绝不进入） */
+function resultSummaryOf(payload: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of [
+    "owner_id",
+    "owner_role",
+    "run_id",
+    "attempt_id",
+    "deliverables",
+    "evidence_refs",
+    "verification",
+    "untested",
+    "known_issues",
+    "diff_ref",
+    "result_revision",
+    "definition_sha256",
+    "plan_revision",
+    "ownership_basis",
+  ]) {
+    if (payload[k] !== undefined) out[k] = payload[k];
+  }
+  out.claim_token_present = typeof payload.claim_token === "string" && payload.claim_token !== "";
+  return out;
+}
+
+/** 命中幂等时的 not_checked 行：本就没有重跑五查（如实标"未重查"，不冒充通过/失败） */
+function idempotentNotRecheckedRow(kind: "already_submitted" | "conflict"): SubmitNotCheckedRow {
+  return {
+    kind: "idempotency_short_circuit",
+    reason:
+      kind === "already_submitted"
+        ? "命中同一幂等键且内容一致（duplicate）：**不重跑五查**，直接回原提交回执——原提交当时的判据结论不代表现在（任务版本/认领/租约/依赖/证据源都可能已变）"
+        : "命中同一幂等键但内容不同（conflict）：**不重跑五查**，按 IDEMPOTENCY_CONFLICT 拒绝——要改结果请走协调器 reopen 建新 attempt，或换一次新认领",
+  };
+}
+
+/**
+ * 只读预检入参解析：复用 `submitChecks.parseResultSubmitInput`——闭键 + 类型 + 必填 + **同一份**
+ * `validateWorkCommand`（与 `submit_task_result` 同源，**不试写**）。公开 `now` 明确拒（不许回拨时钟）。
+ */
+function preflightInputOf(raw: unknown): SubmitResultChecksInput {
+  const parsed = parseResultSubmitInput(raw);
+  if (!parsed.ok || parsed.input === null) {
+    throw new WorkError(
+      "INVALID_COMMAND",
+      `预检入参校验不通过（与 submit_task_result 同源、不试写）：${parsed.failures.join("；")}`,
+      { failures: parsed.failures },
+    );
+  }
+  return parsed.input;
+}
+
 export class WorkService {
   private readonly dataDir: string;
   private readonly faults: WorkServiceOptions["faults"];
@@ -496,6 +623,94 @@ export class WorkService {
    */
   assertWriteOwner(): void {
     if (this.assertWriteOwnership) this.assertWriteOwnership();
+  }
+
+  /**
+   * P2/V09-47（DESIGN §6.11）：结果提交前**只读预检**（`POST /api/work/preflight` 的唯一实现）。
+   *
+   * 只读：现读一份事件快照（`eventsSnapshotOf`＝只读缓存/全量，**不** recoverTail、不写快照/证据/事件、不续租、不自愈）；
+   * 判据与真实提交共用**同一份** `submitChecks.evaluateSubmitResultChecks`；命中同一幂等键时**先短路**（duplicate
+   * 回原回执、conflict 明确拒），**不再跑五查、也不读 PLAN/证据**——故 PLAN/证据读不出来时也能恢复原回执。
+   * 写者身份闸双层兜住：唯一写宿主（`workHost.handle` 的写方法所有权闸）+ 这里的 `assertWriteOwner`。
+   * **不接受 `now`**：运行时调用方不能回拨时钟延长租约（测试时钟只在进程内注入）。
+   */
+  preflightResult(raw: unknown): PreflightTaskResultResponse {
+    this.assertWriteOwner();
+    const input = preflightInputOf(raw);
+    const workDir = resolveWorkDir(input.project_id, this.dataDir);
+    // 事件快照：同一份读数既用于幂等前置，也随判据传下去（依赖重查折叠同一份，不再重读盘）。
+    const snapshot = eventsSnapshotOf(input.project_id, this.dataDir);
+    const events = snapshot.events;
+    const idem = evaluateSubmitResultIdempotency(events, input);
+    const notATicket =
+      "预检只读、不产生通行票：预检到提交之间任务版本/认领/租约/定义/证据源可能变化，提交时在唯一写入服务临界区内按当前事实重核（recheck_on_commit=true）；already_submitted 也不是产品验收";
+    const base = {
+      ok: true as const,
+      supported_contract: "preflight/v1" as const,
+      read_only: true as const,
+      recheck_on_commit: true as const,
+      not_a_ticket: notATicket,
+    };
+    // ① **真正短路**：命中幂等（duplicate/conflict）时不重跑五查、不读 PLAN/证据——直接把原回执/冲突给回去。
+    //    （旧实现无条件 evaluateSubmitResultChecks，会把旧提交的版本/状态失败输出到 already_submitted 上，
+    //     还会因此读 PLAN/证据；PLAN/证据读不出来时连原回执都恢复不了。）
+    if (idem.kind === "duplicate") {
+      const payload = (idem.event.payload ?? {}) as Record<string, unknown>;
+      return {
+        ...base,
+        observed_versions: {},
+        checks: [],
+        not_checked: [idempotentNotRecheckedRow("already_submitted")],
+        checks_rechecked: false,
+        already_submitted: {
+          event_id: idem.event.event_id,
+          seq: idem.event.seq,
+          entity_revision: idem.event.entity_revision,
+          received_at: idem.event.received_at,
+          duplicate: true,
+          result_summary: resultSummaryOf(payload),
+        },
+        idempotency_status: "already_submitted",
+        would_pass: null,
+        rejection_code: null,
+        conflict: null,
+      };
+    }
+    if (idem.kind === "conflict") {
+      const payload = (idem.event.payload ?? {}) as Record<string, unknown>;
+      return {
+        ...base,
+        observed_versions: {},
+        checks: [],
+        not_checked: [idempotentNotRecheckedRow("conflict")],
+        checks_rechecked: false,
+        already_submitted: null,
+        idempotency_status: "conflict",
+        would_pass: null,
+        rejection_code: "IDEMPOTENCY_CONFLICT",
+        conflict: {
+          existing_event_id: idem.event.event_id,
+          existing_seq: idem.event.seq,
+          existing_type: idem.event.type,
+          result_summary: resultSummaryOf(payload),
+        },
+      };
+    }
+    // ② 未命中幂等：按当前事实跑共享判据（同一份快照传下去，锁内/依赖重查同源）。
+    const state = readTaskStates(workDir, events).states[input.task_id] ?? null;
+    const outcome = evaluateSubmitResultChecks(input, state, { dataDir: this.dataDir, events: snapshot });
+    return {
+      ...base,
+      observed_versions: outcome.observed_versions,
+      checks: outcome.checks,
+      not_checked: outcome.not_checked,
+      checks_rechecked: true,
+      already_submitted: null,
+      idempotency_status: "none",
+      would_pass: outcome.ok,
+      rejection_code: outcome.ok ? null : outcome.code,
+      conflict: null,
+    };
   }
 
   /**
@@ -594,10 +809,12 @@ export class WorkService {
         if (!sameIntent(cmd, existing)) {
           throw new WorkError(
             "IDEMPOTENCY_CONFLICT",
-            `幂等键已用于另一份内容不同的命令：${cmd.idempotency_key}（原事件 ${existing.event_id}，序号 ${existing.seq}）。` +
+            // P2/V09-47 秘密安全纠正：幂等键可能内嵌认领 token（`task.result_submitted` 的键就是
+            // `<taskId>:…:${change_id}:${claim_token}`），**不回显它的原文**（错误码、判据与检查顺序不变）。
+            "本次命令的幂等键（若内嵌认领 token，一并隐藏、不回显）已用于另一份内容不同的命令" +
+              `（原事件 ${existing.event_id}，序号 ${existing.seq}）。` +
               "幂等键一旦用过就不能换内容重发——请换一个新键表达新改动",
             {
-              idempotency_key: cmd.idempotency_key,
               existing_event_id: existing.event_id,
               existing_seq: existing.seq,
               existing_fingerprint: fingerprintOfEvent(existing).slice(0, 16),
@@ -765,7 +982,7 @@ export class WorkService {
       // ②″ 需求/变更批次实体的写侧校验（§2.5 一致校验面，C-015 收口）：直连写口提交的
       // requirement.*/change.* 事件，追加前过与读侧重放同一份折叠判据——校验不过拒且零字节，
       // 不让"落盘即毒化该实体投影"的事件进入事件流（判据单一来源，见 assertEntityEventFoldable）。
-      assertEntityEventFoldable(events, cmd, current);
+      assertEntityEventFoldable(events, cmd, current, workDir);
 
       // ②ⅲ 需求事件的意图来源校验（§2.5 一致校验面/引用有效性）：直连通用写口提交的
       // requirement.registered/updated 若 `source.kind="intent"`，追加前按**注册表**定位该项目
@@ -838,6 +1055,18 @@ export class WorkService {
             { reason: "task_phase_verification_failed", entity_id: cmd.entity_id, type: cmd.type, failures: phaseVerify.failures },
           );
         }
+      }
+
+      // ②ⅺ 结果提交的**锁内共享结果判据**（P2/V09-47 写边界进一步核实）：直连通用写口手写
+      // `task.result_submitted` 也不能旁路——在唯一写入服务的临界区内、按**锁内事件**重算当前
+      // token/owner/lease/依赖/定义绑定/证据源（含带 source_manifest 的证据源漂移拒旧），
+      // 与 `claims.submitTaskResult` 及只读预检共用**同一份**只读判据（submitChecks.evaluateSubmitResultChecks；
+      // 依赖重查折叠**锁内事件快照**，不再重读一遍盘——见 ctx.events）。
+      // 预检/调用层到落盘之间版本/认领/租约/定义可能已变 ⇒ 在这里按当前事实**再判一次**（不通过零字节）。
+      // 注意：幂等重放与版本冲突在此之前已短路/拒绝，故这里只对"真正要落盘的这一次结果提交"生效。
+      // **没有"删 token 就跳过"的早退**：缺/空认领 token 或空证据一律被同一份判据拒（旧夹具按设计改真认领/证据）。
+      if (cmd.type === "task.result_submitted") {
+        assertResultSubmittedWriteCommand(events, cmd, { dataDir: this.dataDir, workDir });
       }
 
       // ③ 追加并持久化（fsync 后才回执）
@@ -954,6 +1183,9 @@ export class WorkService {
     data_dir: string;
     /** V06-09：已登记的业务事件词表（登记面在 types.ts#REGISTERED_EVENT_TYPES） */
     registered_event_types: string[];
+    /** P0/V09-45：本进程**启动时载入的**构建身份（`/api/work/health` 回它）。
+     *  取的是内嵌常量——**不是**每次请求读盘上的 build-stamp（§4.4：不读磁盘冒充进程身份）。 */
+    build_identity: BuildIdentity;
   } {
     return {
       service: "work",
@@ -961,6 +1193,7 @@ export class WorkService {
       pid: process.pid,
       data_dir: this.dataDir,
       registered_event_types: registeredEventTypes(),
+      build_identity: resolveBuildIdentity("server"),
     };
   }
 }
@@ -1194,6 +1427,36 @@ export async function handleWorkRequest(
       const knownRevision = (url.searchParams.get("known_revision") ?? "").trim();
       const resumeHint = (url.searchParams.get("resume_hint") ?? "").trim();
       const preconditions = url.searchParams.get("preconditions") === "true";
+      // V09-53（B3/§2.7）：宿主只读入口**可选**带回逐 check 工作包。默认（未给 `work_package=true`）时
+      // 回包与既有契约**逐字不变**；显式索取时才从**本次同一份**现读快照派生（与入口/图/同步同版）。
+      // 依赖参数（分页游标/limit/expected_revision）**只在 `work_package=true` 时可用**——给了却不索取
+      // 工作包是无效组合，显式 400（不静默忽略、不悄悄当默认）。
+      const workPackage = url.searchParams.get("work_package") === "true";
+      const rawWpExpected = url.searchParams.get("work_package_expected_revision");
+      const rawWpCursor = url.searchParams.get("work_package_cursor");
+      const rawWpLimit = url.searchParams.get("work_package_limit");
+      const wpDependencyGiven = rawWpExpected !== null || rawWpCursor !== null || rawWpLimit !== null;
+      if (!workPackage && wpDependencyGiven) {
+        sendJson(res, 400, {
+          code: "INVALID_COMMAND",
+          message: "work_package_expected_revision / work_package_cursor / work_package_limit 只在 work_package=true 时可用（不静默忽略无效组合）",
+          detail: { work_package: false, given: ["work_package_expected_revision", "work_package_cursor", "work_package_limit"].filter((k) => url.searchParams.get(k) !== null) },
+        });
+        return true;
+      }
+      let wpLimit: number | undefined;
+      if (workPackage && rawWpLimit !== null) {
+        const n = Number(rawWpLimit);
+        if (!Number.isInteger(n)) {
+          sendJson(res, 400, { code: "INVALID_COMMAND", message: `work_package_limit 必须是整数（收到 ${JSON.stringify(rawWpLimit)}）`, detail: {} });
+          return true;
+        }
+        wpLimit = n;
+      }
+      const wpCursor = (rawWpCursor ?? "").trim();
+      const wpExpected = (rawWpExpected ?? "").trim();
+      const workPackagePaging =
+        workPackage && (wpCursor !== "" || wpLimit !== undefined) ? { ...(wpCursor === "" ? {} : { cursor: wpCursor }), ...(wpLimit === undefined ? {} : { limit: wpLimit }) } : undefined;
       const rawCaps = url.searchParams.get("capabilities");
       let capabilities: unknown = undefined;
       if (rawCaps !== null) {
@@ -1223,6 +1486,9 @@ export async function handleWorkRequest(
               input,
               syncDiscoveryIssues: issues,
               ...(preconditions ? { preconditions: true } : {}),
+              ...(workPackage ? { workPackage: true } : {}),
+              ...(workPackagePaging === undefined ? {} : { workPackagePaging }),
+              ...(workPackage && wpExpected !== "" ? { workPackageExpectedRevision: wpExpected } : {}),
             }),
         );
         sendJson(res, 200, reconciled.value);
@@ -1234,6 +1500,26 @@ export async function handleWorkRequest(
           : describeReadJobError(e);
         sendJson(res, d.httpStatus, { code: d.code, message: d.message, detail: d.detail });
       }
+      return true;
+    }
+    // P2/V09-47（DESIGN §6.11）：结果提交前**只读预检** —— POST（token 不进 URL/查询串，避免日志与代理留痕），
+    // 与既有只读读口同一 `WORK_TOKEN_HEADER` 鉴权门；进路由后先 `assertWriteOwner`（回答"在可校验的写者身份下"），
+    // 非当前写者 → 503 SERVICE_UNAVAILABLE（调用方按 unavailable 处理，**不报通过**）。
+    // 该路由**声明只读**：不 appendEventDurable / 不 writeSnapshot / 不 putEvidence / 不续租 / 不 ensureWorkService / 不自愈。
+    if (method === "POST" && ctx.pathname === "/api/work/preflight") {
+      const text = await readBody(req);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch (e) {
+        sendJson(res, 400, {
+          code: "INVALID_COMMAND",
+          message: `请求体不是合法 JSON: ${(e as Error).message}`,
+          detail: {},
+        });
+        return true;
+      }
+      sendJson(res, 200, ctx.service.preflightResult(parsed));
       return true;
     }
     if (method === "POST" && ctx.pathname === "/api/work/command") {
@@ -1467,6 +1753,52 @@ export class WorkServiceClient {
   }
 
   /**
+   * P2/V09-47：向**唯一宿主**的只读预检路由 `POST /api/work/preflight` 取一次结果提交预检。
+   *
+   * **纯只读**：只用已有描述符，**绝不** ensure/拉起写者（不自愈）、不触发提交；宿主不支持该路由
+   * （404/405/契约不符）⇒ `unsupported`（调用方报 `UNSUPPORTED_BY_HOST`，**不回退**到提交路由）；
+   * 宿主不可达/明确 503 ⇒ `unavailable`；其它结构化错误 ⇒ `error` 原样上抛。
+   * 请求体**不含 `now`**（运行时调用方不能回拨时钟延长租约）；`claim_token` 走 POST body，不进 URL/查询串。
+   */
+  async preflightResultRemote(input: unknown): Promise<PreflightFetch> {
+    const desc = readServiceDescriptor(this.dataDir);
+    if (!desc) return { kind: "unavailable", reason: "唯一写服务描述符缺失（只读预检路由未发布）" };
+    let res: Response;
+    try {
+      res = await fetch(`http://${desc.host}:${desc.port}/api/work/preflight`, {
+        method: "POST",
+        headers: { "content-type": "application/json", [WORK_TOKEN_HEADER]: desc.token },
+        body: JSON.stringify(input),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (e) {
+      return { kind: "unavailable", reason: `唯一宿主只读预检路由不可达：${e instanceof Error ? e.message : String(e)}` };
+    }
+    if (res.status === 404 || res.status === 405) {
+      return { kind: "unsupported", reason: `宿主不支持只读预检路由（HTTP ${res.status}）` };
+    }
+    const payload = (await res.json().catch(() => null)) as
+      | (Partial<PreflightTaskResultResponse> & { code?: string; message?: string; detail?: Record<string, unknown> })
+      | null;
+    if (!res.ok) {
+      if (res.status === 503 || payload?.code === "SERVICE_UNAVAILABLE") {
+        return { kind: "unavailable", reason: payload?.message ?? `宿主只读预检路由不可用（HTTP ${res.status}）` };
+      }
+      return {
+        kind: "error",
+        code: typeof payload?.code === "string" && payload.code !== "" ? payload.code : `HTTP_${res.status}`,
+        message: typeof payload?.message === "string" && payload.message !== "" ? payload.message : `宿主只读预检路由返回 ${res.status}`,
+        detail: typeof payload?.detail === "object" && payload.detail !== null ? payload.detail : {},
+        httpStatus: res.status,
+      };
+    }
+    if (payload === null || payload.ok !== true || payload.supported_contract !== "preflight/v1") {
+      return { kind: "unsupported", reason: "宿主只读预检路由响应不完整或契约不符" };
+    }
+    return { kind: "ok", result: payload as PreflightTaskResultResponse };
+  }
+
+  /**
    * V09-27（DESIGN.md §2.6/§5.4）：把**证据正文**交给唯一写服务宿主落盘（内容寻址、不可变、读时复核哈希）。
    * 与描述符/唯一写者同源；服务不可达先自愈一次，仍不可达抛 SERVICE_UNAVAILABLE——
    * **绝不**在 stdio 进程本地写项目目录（那会造出第二个写者）。
@@ -1697,11 +2029,30 @@ export type HostEntryFetch =
   | { kind: "unreachable"; reason: string }
   | { kind: "error"; code: string; message: string; detail: Record<string, unknown>; httpStatus: number };
 
+/**
+ * P2/V09-47 只读预检取回结果：**四态分明**——`ok`（宿主支持且契约相符）/ `unsupported`（旧宿主：404/405/契约不符，
+ * 调用方报 `UNSUPPORTED_BY_HOST`、**不回退提交**）/ `unavailable`（描述符缺失/不可达/503，**不当地**通过）/
+ * `error`（宿主明确结构化错误，原样上抛）。
+ */
+export type PreflightFetch =
+  | { kind: "ok"; result: PreflightTaskResultResponse }
+  | { kind: "unsupported"; reason: string }
+  | { kind: "unavailable"; reason: string }
+  | { kind: "error"; code: string; message: string; detail: Record<string, unknown>; httpStatus: number };
+
 /** 取唯一宿主只读入口（区分可达/不可达/明确报错）。纯只读（只用描述符，不 ensure/拉起写者）。 */
 export async function fetchHostEntryResult(
   dataDir: string,
   input: { project_id: string; role: string; known_revision?: string | null; resume_hint?: string | null; client_capabilities?: unknown },
-  opts: { timeoutMs?: number; preconditions?: boolean } = {},
+  opts: {
+    timeoutMs?: number;
+    preconditions?: boolean;
+    /** V09-53：向宿主索取逐 check 工作包（默认不请求＝宿主既有回包逐字不变） */
+    work_package?: boolean;
+    work_package_cursor?: string;
+    work_package_limit?: number;
+    work_package_expected_revision?: string;
+  } = {},
 ): Promise<HostEntryFetch> {
   const desc = readServiceDescriptor(dataDir);
   if (!desc) return { kind: "unreachable", reason: "唯一写服务描述符缺失（读口未发布）" };
@@ -1711,6 +2062,14 @@ export async function fetchHostEntryResult(
   // 能力档必须随请求带到宿主（否则宿主按「仅可读取」算，next_action 会与调用方声明不一致）。
   if (input.client_capabilities !== undefined) qs.set("capabilities", JSON.stringify(input.client_capabilities));
   if (opts.preconditions === true) qs.set("preconditions", "true");
+  // V09-53：只有显式索取工作包才带这些参数（宿主按 `work_package=true` 才附；依赖参数与它同进同出）。
+  if (opts.work_package === true) {
+    qs.set("work_package", "true");
+    if (typeof opts.work_package_cursor === "string" && opts.work_package_cursor !== "") qs.set("work_package_cursor", opts.work_package_cursor);
+    if (typeof opts.work_package_limit === "number") qs.set("work_package_limit", String(opts.work_package_limit));
+    if (typeof opts.work_package_expected_revision === "string" && opts.work_package_expected_revision !== "")
+      qs.set("work_package_expected_revision", opts.work_package_expected_revision);
+  }
   try {
     const res = await fetch(`http://${desc.host}:${desc.port}/api/work/entry?${qs.toString()}`, {
       headers: { [WORK_TOKEN_HEADER]: desc.token },
@@ -1746,7 +2105,14 @@ export async function fetchHostEntryResult(
 export async function fetchHostEntry(
   dataDir: string,
   input: { project_id: string; role: string; known_revision?: string | null; resume_hint?: string | null; client_capabilities?: unknown },
-  opts: { timeoutMs?: number; preconditions?: boolean } = {},
+  opts: {
+    timeoutMs?: number;
+    preconditions?: boolean;
+    work_package?: boolean;
+    work_package_cursor?: string;
+    work_package_limit?: number;
+    work_package_expected_revision?: string;
+  } = {},
 ): Promise<import("./readJobs").EntryView | null> {
   const r = await fetchHostEntryResult(dataDir, input, opts);
   return r.kind === "ok" ? r.view : null;

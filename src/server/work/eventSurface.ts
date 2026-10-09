@@ -57,6 +57,7 @@ export const EVENT_SURFACE: Readonly<Record<string, string>> = {
   "audit.self_check_recorded": "mcp:record_work_evidence",
   "audit.independent_audit_recorded": "mcp:record_work_evidence",
   "audit.fix_recorded": "mcp:record_work_evidence",
+  "audit.record_corrected": "mcp:record_work_evidence",
   "audit.retest_recorded": "mcp:record_work_evidence",
   "audit.human_acceptance_recorded": "internal:audit(人工验收——用户在 Gate 页面触发，Agent 不代点)", // 只有用户能触发
   // ── 执行回执域（V06-11 外部执行器回执链；V09-27 起经 report_execution 可达） ──

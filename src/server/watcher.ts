@@ -7,6 +7,7 @@ import { warnCorruptLinesThrottled } from "./lineStream";
 import { sanitizeErrorMessage } from "./redact";
 import { nowIso } from "./time";
 import { WsError } from "./workstation";
+import { JUNK_DIR_RANDOM_TEMP_RE } from "../arch/config";
 
 // 文件监听器（H1）：对项目根挂 chokidar（DESIGN.md §3.9 无刷新更新的驱动源，§7.2 清单内选型，MIT），
 // 顺带把文件变更追加成 `<项目根>/.工作台/changes.jsonl`（§2.3.5 变更流水）。
@@ -313,7 +314,8 @@ const WORKBENCH_DOC_EXEMPTIONS: ReadonlySet<string> = new Set([
   ".工作台/plan.md",
 ]);
 
-function isIgnoredPath(testPath: string, root: string): boolean {
+/** 导出供回归脚本直测（与 graphRefresh.changeVerdict 同一惯例：判据纯函数、单测直接调） */
+export function isIgnoredPath(testPath: string, root: string): boolean {
   const rel = path.relative(root, path.resolve(testPath));
   if (rel === "") return false; // 项目根本体
   if (rel.startsWith("..") || path.isAbsolute(rel)) return true; // 根外
@@ -323,7 +325,9 @@ function isIgnoredPath(testPath: string, root: string): boolean {
   // `.工作台` 目录本体不能整段忽略：chokidar 对被忽略的目录**不下钻**，本体 ignored 了，
   // 里面被豁免的两个文件就永远轮不到判定。其余 `.工作台/**` 由下面的段名检查照旧拦下。
   if (posix === ".工作台") return false;
-  return rel.split(/[\\/]/).some((seg) => IGNORED_SEGMENTS.has(seg));
+  // 2026-10-05：随机名临时目录（Python tempfile 的 tmp+8 位随机串）与具名段一并忽略——
+  // 漏网时测试建删临时目录会持续触发 structure_top 图刷新并反复重写派生文件（现场实锤）。
+  return rel.split(/[\\/]/).some((seg) => IGNORED_SEGMENTS.has(seg) || JUNK_DIR_RANDOM_TEMP_RE.test(seg));
 }
 
 /**
@@ -348,7 +352,7 @@ async function boundedScan(root: string): Promise<ScanResult> {
     }
     let inDir = 0;
     for (const d of dirents) {
-      if (IGNORED_SEGMENTS.has(d.name)) continue;
+      if (IGNORED_SEGMENTS.has(d.name) || JUNK_DIR_RANDOM_TEMP_RE.test(d.name)) continue;
       inDir++;
       entries++;
       // 联接点不跟随（与 chokidar followSymlinks:false 同口径），否则扫描自己会绕进环里

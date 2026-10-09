@@ -59,6 +59,12 @@ const RELEASE_EXE = path.join(TAURI_DIR, "target", "release", "tatai.exe");
 // 2026-10-03（统一优化 V09-32/V09-33/V09-35/V09-39）定向订正：注册表新增 read_plan / expand_module /
 // project_index（DESIGN §6.8，契约 U3/U5），说明与清单同步为 **28 个**——判据一字不动
 // （仍是逐个点名的"恰好"，不放过、不放宽；**不**改成从注册表动态生成期望；语义由各自 verify 守）。
+// 2026-10-04（V09-41 紧凑简报 task_brief，独立集成复审 P1-1）定向订正：注册表新增 task_brief
+// （project_entry 的只读投影），说明与清单同步为 **29 个**——判据一字不动（仍是逐个点名的"恰好"）；
+// 语义由 verify:task-brief 守，本脚本只做身份/集合断言。
+// 2026-10-06（P2/V09-47 只读预检 preflight_task_result，最终集成）定向订正：注册表新增只读预检，
+// 说明与清单同步为 **30 个**——判据一字不动（仍是逐个点名的"恰好"，**不**改成从注册表动态生成期望）；
+// 语义/反例由 verify:preflight-task-result 守，本脚本只做身份/集合断言。
 const MCP_TOOL_NAMES = [
   "list_projects",
   "select_project",
@@ -79,6 +85,15 @@ const MCP_TOOL_NAMES = [
   "project_entry",
   "claim_task",
   "submit_task_result",
+  // 2026-10-06 P2/V09-47（DESIGN §6.11）：提交前**只读**预检 preflight_task_result——与 submit_task_result
+  // 同形输入、共用同一份判据，**不写字节、不自愈、不产生通行票**（旧宿主 unsupported，绝不回退成写入）。
+  // 同一个口径（V09-27/V09-28/V09-39/V09-41 先例）：**逐个点名登记**、数量判据仍是"恰好"；
+  // 语义/反例由 verify:preflight-task-result 守，本脚本只做身份/集合断言。
+  "preflight_task_result",
+  // 2026-10-04 V09-41（docs/efficiency-20261004.md）：接续紧凑简报 task_brief——project_entry 的只读投影，
+  // 复用同一次判定（不重算/不认领/不写账/不调模型）。同一个口径（V09-27/V09-28/V09-39 先例）：**逐个点名登记**、
+  // 数量判据仍是"恰好"；语义/反例由 verify:task-brief（handler + 纯函数投影）守，本脚本只做身份/集合断言。
+  "task_brief",
   "manage_requirement",
   "manage_change",
   "import_plan_definitions",
@@ -103,8 +118,13 @@ const MCP_TOOL_NAMES = [
   // 2026-10-03 V09-39（DESIGN §6.8／契约 U5/U5.1）：持久项目说明索引 project_index——
   // read/impact/coverage 只读本地，upsert/remove 经唯一宿主；语义由 verify:unified-index 守。
   "project_index",
+  // 2026-10-07 B2/V09-52（DESIGN §6.12）：功能清单**只读**读口 feature_ledger——同一 revision 事实快照 →
+  // 唯一义务派生 → feature_item[]（四维分开）；与 HTTP GET feature-ledger 同底层、同错误语义。只读、不写、
+  // 不自愈、不调模型。同一点名口径（V09-27/V09-28/V09-39 先例）：逐个点名登记、数量判据仍是"恰好"；
+  // 语义/反例由 verify:feature-ledger 守，本脚本只做身份/集合断言。
+  "feature_ledger",
 ] as const;
-const MCP_TOOL_COUNT = MCP_TOOL_NAMES.length; // 28
+const MCP_TOOL_COUNT = MCP_TOOL_NAMES.length; // 31
 
 const ok = (cond: boolean, label: string) => {
   console.log(`[verify] ${cond ? "PASS" : "FAIL"} ${label}`);
@@ -607,7 +627,7 @@ try {
   const extraTools = toolNames.filter((n) => !(MCP_TOOL_NAMES as readonly string[]).includes(n));
   ok(
     missingTools.length === 0 && extraTools.length === 0,
-    `⑦ 包内工具逐个点名对账（${MCP_TOOL_NAMES.length} 个：一期 8 + get_arch/ask_flash + V06-10 三件套 + C-015 三件套 + V07-02 rebind_task + V07-04 doctor + V09-19 get_project_graphs + V09-23 同步域三接口 register_sync_contract/scan_sync_evidence/read_sync_status + V09-27/V09-28 report_execution/record_work_evidence/manage_baseline + V09-32/33/35 read_plan/expand_module + V09-39 project_index）——缺 ${missingTools.join("/") || "无"}，多 ${extraTools.join("/") || "无"}`,
+    `⑦ 包内工具逐个点名对账（${MCP_TOOL_NAMES.length} 个：一期 8 + get_arch/ask_flash + V06-10 三件套 + C-015 三件套 + V07-02 rebind_task + V07-04 doctor + V09-19 get_project_graphs + V09-23 同步域三接口 register_sync_contract/scan_sync_evidence/read_sync_status + V09-27/V09-28 report_execution/record_work_evidence/manage_baseline + V09-32/33/35 read_plan/expand_module + V09-39 project_index + V09-41 task_brief + V09-47 preflight_task_result）——缺 ${missingTools.join("/") || "无"}，多 ${extraTools.join("/") || "无"}`,
   );
   const listed2 = await client.callTool({ name: "list_projects", arguments: {} });
   const projectsText = (listed2.content as { type: string; text?: string }[])[0]?.text ?? "";

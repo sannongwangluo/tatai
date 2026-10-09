@@ -9,7 +9,7 @@
 //   ③ 覆盖表逐条建账、显式列缺口：覆盖 U-01…U-08、已登记 req 条目与 G-1…G-6，
 //      G 行逐行带缺口标注（未施工／待对账／未开工／证据未闭合）；U-02 标「当前有效」；
 //   ④ 链上缺环如实报缺（反例）：覆盖行缺缺口标注/缺承接卡 ⇒ 机械校验报缺，不静默补全；
-//   ⑤ 门槛与回归：真实 PLAN 结构解析 44 行 / 0 问题（v06-02 结构部分不劣化）。
+//   ⑤ 门槛与回归：真实 PLAN 结构解析 90 行 / 0 问题（v06-02 结构部分不劣化；行数随当前 PLAN 卡数精确维护）。
 //
 // 隔离口径：真实账本与真实 PLAN 只读；夹具走临时 TATAI_HOME（os.tmpdir()）；收尾清理。
 import crypto from "node:crypto";
@@ -216,7 +216,31 @@ function main(): void {
     // 定向更新（2026-09-28，补证批次复核）：47 → 49——V09-20 回归修复与 V09-21 收口轮各落一卡后
     // 真实 PLAN 的施工卡数前进到 49（与状态投影 49 任务一致）；断言意图=「行数与解析器实测一致」，钉死旧数会把
     // 正常演进误报成红。
-    ok(rows.length === 49, `⑤ 真实 PLAN 解析 49 行施工卡（实测 ${rows.length}）`);
+    // 定向更新（2026-10-08，V09-61 测试维护；与 verify:v06-02 ② 同一条行数沿革）：**新期望 90**。
+    //   旧期望 = `rows.length === 49`（2026-09-28 补证批次复核的卡数；此后 V09-20…V09-61 正常演进）。
+    //   依据   = PLAN 第一张当前任务表已增至 90 行（2026-10-09 追加 V09-62 一行后），**源卡真存在**：V09-62 是当前最后一张卡
+    //            （`PLAN.md:54` 表行 + `### V09-61 …` 小节），与 verify:v06-02 ② 的 89 同源
+    //            （同一 `parsePlanTasks` / `validatePlanTasks` 现读，非估算、非拿现算值自证相等）。
+    //   判据不放宽 = 仍是「数量恰好 = 当前施工图卡数」：多一行少一行都红，**不放宽成 `>=`**；
+    //              下方用重复卡/缺卡两个负例证明解析器在「数量不对 + 结构坏」时必红。
+    //   保留意图 = 行数恰好钉死；V09-61 卡行在场且「交付目标 / 完成证据」非空；重复/缺卡都必红。
+    (() => {
+      const v61 = rows.find((t) => t.id === "V09-61");
+      const dupRows = [...rows, { ...(v61 ?? rows[rows.length - 1]) }];
+      const missingRows = rows.filter((t) => t.id !== "V09-61");
+      ok(
+        rows.length === 90 && v61 !== undefined && v61.goal.trim() !== "" && v61.evidence.trim() !== "",
+        `⑤ 真实 PLAN 解析 90 行施工卡（实测 ${rows.length}）；V09-61 卡行在场且目标/完成证据非空`,
+      );
+      ok(
+        dupRows.length !== 90 && validatePlanTasks(dupRows).some((i) => i.problem === "duplicate_id"),
+        `⑤ 负例：V09-61 重复一行 ⇒ 数量 ${dupRows.length}≠90 且解析器点名 duplicate_id（不放宽成 >=）`,
+      );
+      ok(
+        missingRows.length !== 90 && !missingRows.some((t) => t.id === "V09-61"),
+        `⑤ 负例：缺 V09-61 ⇒ 数量 ${missingRows.length}≠90（缺卡仍红）`,
+      );
+    })();
     ok(issues.length === 0, `⑤ validatePlanTasks 0 结构问题（实测 ${issues.length}）`);
 
     // 文档零改动自证

@@ -40,6 +40,8 @@ import urllib.request
 from playwright.sync_api import sync_playwright
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+# 测试只访问本次隔离的回环服务，显式直连，避免 ambient 代理把探活转成 502。
+DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 SHOT_DIR = os.environ.get(
     "TATAI_FB_SHOT_DIR", os.path.join(REPO, ".工作台", "verify", "forward-baseline-20261002", "ui")
 )
@@ -88,7 +90,7 @@ def http(url, method="GET", body=None, timeout=120):
     if data is not None:
         req.add_header("content-type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with DIRECT.open(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8")
             return resp.status, (json.loads(text) if text.strip().startswith(("{", "[")) else text)
     except urllib.error.HTTPError as e:
@@ -157,20 +159,23 @@ class Backend:
             cwd=REPO, env=env, stdout=open(log_path, "ab"), stderr=subprocess.STDOUT,
         )
 
-    def api(self, path, method="GET", body=None):
-        return http("http://127.0.0.1:%d%s" % (self.port, path), method, body)
+    def api(self, path, method="GET", body=None, timeout=120):
+        return http("http://127.0.0.1:%d%s" % (self.port, path), method, body, timeout)
 
-    def wait_health(self, timeout=120):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+    def wait_health(self, timeout=120, attempt_timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             if self.proc.poll() is not None:
                 raise RuntimeError("后端进程退出（日志见 ui-backend.log）")
             try:
-                if self.api("/health")[0] == 200:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if self.api("/health", timeout=min(attempt_timeout, remaining))[0] == 200:
                     return
             except Exception:
                 pass
-            time.sleep(0.3)
+            time.sleep(min(0.3, max(0.0, deadline - time.monotonic())))
         raise RuntimeError("后端 %d 未就绪" % self.port)
 
     def kill(self):
@@ -192,16 +197,21 @@ def start_vite(port, backend_port, log_path, cache_dir):
          "--port", str(port), "--strictPort"],
         cwd=REPO, env=env, stdout=open(log_path, "ab"), stderr=subprocess.STDOUT,
     )
-    deadline = time.time() + 120
-    while time.time() < deadline:
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise RuntimeError("vite 起不来（进程已退出，见 ui-vite.log）")
         try:
-            with urllib.request.urlopen("http://localhost:%d/" % port, timeout=5) as resp:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with DIRECT.open("http://localhost:%d/" % port, timeout=min(5, remaining)) as resp:
                 if resp.status == 200:
                     return proc
         except Exception:
-            time.sleep(0.5)
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    proc.kill()
+    proc.wait(timeout=10)
     raise RuntimeError("vite %d 未就绪" % port)
 
 
@@ -218,8 +228,8 @@ def text_of(page, selector):
 
 
 def wait_for(page, selector, timeout=12.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if page.locator(selector).count() > 0:
             return True
         page.wait_for_timeout(200)

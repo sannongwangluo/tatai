@@ -44,12 +44,15 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 SHOT_DIR = os.environ.get(
     "V0612_SHOT_DIR", os.path.join(REPO, ".工作台", "evidence", "V06-12", "1", "screenshots")
 )
+# 测试只访问本次隔离的回环服务，显式直连：ambient 代理会把 127.0.0.1 探活转成 502（同
+# `scripts/verify-forward-baseline-ui.py` 的既有口径）。判据不变，只是不让代理插手回环。
+DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 A = "v0612ui-a"
 B = "v0612ui-b"
 C = "v0612ui-nogit"
 KEEP = os.environ.get("V0612_KEEP_TMP") == "1"
 
-MAIN_NAV = ["项目图", "设计书", "施工图", "聊天", "实况与验收"]
+MAIN_NAV = ["交付总览", "项目图", "设计书", "施工图", "聊天", "实况与验收"]
 
 # 带空格与中文的路径（`-z` 解析的正题；页面上必须逐字显示）
 P_SPACE_CN = "资料 汇总/带 空格 与中文 的文件.txt"
@@ -107,7 +110,7 @@ def http(url, method="GET", body=None, timeout=120, headers=None):
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with DIRECT.open(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8")
             return resp.status, (json.loads(text) if text.strip().startswith(("{", "[")) else text)
     except urllib.error.HTTPError as e:
@@ -315,7 +318,7 @@ def start_vite(port, backend_port, log_path):
         if proc.poll() is not None:
             raise RuntimeError("vite 起不来（进程已退出）")
         try:
-            with urllib.request.urlopen("http://localhost:%d/" % port, timeout=5) as resp:
+            with DIRECT.open("http://localhost:%d/" % port, timeout=5) as resp:
                 if resp.status == 200:
                     return proc
         except Exception:
@@ -357,10 +360,23 @@ def as_int(value):
         return 0
 
 
+def launch_browser(p):
+    """真浏览器：优先 Playwright 自带 chromium；本机未装（ms-playwright 空）时退回系统 Edge。
+    两者都是真 Chromium 内核，判据不变（同 `scripts/verify-forward-baseline-ui.py` 的既有口径）。"""
+    chan = os.environ.get("TATAI_UI_BROWSER_CHANNEL", "")
+    if chan:
+        return p.chromium.launch(headless=True, channel=chan)
+    try:
+        return p.chromium.launch(headless=True)
+    except Exception as e:  # noqa: BLE001
+        info("自带 chromium 起不来（%s），退回系统 Edge" % str(e).splitlines()[0][:120])
+        return p.chromium.launch(headless=True, channel="msedge")
+
+
 def run_browser(vite_port):
     os.makedirs(SHOT_DIR, exist_ok=True)
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = launch_browser(p)
         page = browser.new_context(viewport={"width": 1600, "height": 950}).new_page()
         page_errors = []
         page.on("pageerror", lambda e: page_errors.append(str(e)))
@@ -389,13 +405,13 @@ def run_browser(vite_port):
             page.wait_for_selector("[data-version-reminder]", timeout=60000)
             wait_ready()
 
-        # ══════════ ① 入口挂在辅助入口、不新增主导航页；首次自动展开一次 ══════════
+        # ══════════ ① 入口挂在辅助入口、不新增主导航页（V09-62 的「交付总览」由该卡独占引入，非本卡）；首次自动展开一次 ══════════
         step["now"] = "① 辅助入口与首次提醒"
         open_project(A)
         main_labels = page.eval_on_selector_all(
             "nav[data-main-nav] button", "els => els.map(e => (e.innerText||'').trim())")
         ok(main_labels == MAIN_NAV,
-           "① 主导航仍是五页（版本提醒挂在辅助入口，不新增 Tab；实际 %s）" % main_labels)
+           "① 主导航恰为既定六页（「交付总览」由 V09-62 独占引入；版本提醒挂在辅助入口，不新增 Tab；实际 %s）" % main_labels)
         ok(page.locator("nav[data-main-nav] [data-version-reminder]").count() == 0,
            "① 版本提醒不在主导航里（§3.1 辅助入口）")
         ok(page.locator('nav[data-aux-nav] button[data-view="terminal"]').count() == 1,

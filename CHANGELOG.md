@@ -5,6 +5,29 @@
 - **产品版本口径以 [GitHub Releases](https://github.com/sannongwangluo/tatai/releases) 为准**；本文件不另存发布说明全文。
 - **提交执行结果 ≠ 独立审计通过 ≠ 用户验收**：标 `已交付` 只表示代码/服务已落地，不等于已审计、已验收。
 
+## [0.4.0] —— 2026-10-09
+
+> 状态：v0.4.0（2026-10-09）。安装包、构建戳与 sha256 以 [GitHub Releases](https://github.com/sannongwangluo/tatai/releases) 对应页为准；发布说明见 [`docs/releases/v0.4.0.md`](docs/releases/v0.4.0.md)。下面列出的能力与修复**已交付**（本版源码）；逐卡独立审计、**正式安装**与**用户验收**状态以 `PLAN.md` 卡行与事件账本为准。**提交执行结果 ≠ 独立审计通过 ≠ 用户验收；正式安装与人的可用性验收本轮尚未进行。**
+
+### 新增（已交付）
+
+- **默认交付总览（V09-62）**：人的默认入口从六图换成**交付总览**——一页核对本期功能、需求依据、技术验证、非作者审查、未解决问题与运行版本；详细检查与证据可展开。只有完整功能范围核查、功能验证、独立审查与运行版本核对都具备当前有效证据，页面才显示「可以开始人工试用」；缺证据、范围未定、旧版本或读取失败逐条点名。六图保留用于查结构与定位问题，章节方块颜色不再充当整项目交付结论。
+- **功能清单与四维读数（V09-51…V09-58）**：设计书旁的人话功能清单与四维读数（设计覆盖／实现／验证／用户接受**分开显示**）；同一判据的**只读**读口（HTTP `GET /api/projects/:id/feature-ledger`、MCP `feature_ledger`）——**不建第二张进度台账**；逐项工作包与 check 级交接。
+- **接续取材与会话事实更省（V09-41…V09-44、V09-46）**：`task_brief` 紧凑只读简报（理由索引＋按版本补取细节，`detail=full` 保留完整）；阶段材料按任务**精确取材**（`purpose` 分类；设计引用带 `resolution`／`source_ref`，定位到**当前版本**的章节与行范围，认不出即 `unresolved`、不当已读）。
+- **提交前只读预检（V09-47）**：MCP `preflight_task_result`（与 `submit_task_result` 同形输入）一次列清可预判缺项与锁内未查项；**不写任何字节、不是门禁/通行票**，旧宿主 `unsupported` 不回退。
+- **同步只读修复计划（V09-48）**：`read_sync_status`／`project_entry` 给现行批次的逐项只读修复计划；默认简报里是紧凑导航，`detail=full` 完整保留。
+- **运行部件构建身份（V09-45）**：`GET /health`、`GET /api/work/health` 与 MCP `doctor` 读回 `build_identity`（`release_id`／`build_id`、输入指纹、偏斜对照；旧包未内嵌一律**未知态**、不判一致）。**发布验收要求**：源码、随包后端、前端产物、桌面壳与安装器必须重建，并在受控安装后**实际读回**——**未安装不得写通过**。
+- **解析热路径等价优化（V09-50）**：真实绑定下依赖采集走原生 tree-sitter query，行为等价、非静默回退。
+
+### 变更
+
+- **MCP 工具面 28 → 31**：新增 `task_brief`、`preflight_task_result`、`feature_ledger`。工具数以 `src/mcp/tools/index.ts` 注册表为唯一来源（`pnpm verify:v09-05` 对账）。
+
+### 如实限制（本版未完成）
+
+- **正式安装与人的可用性验收尚未进行**：本版能力以源码与隔离验证为准；token 对照按「未测」登记，安装包与受控安装后的身份读回属发布流程（见 [`docs/releases/v0.4.0.md`](docs/releases/v0.4.0.md)）。
+- 其它限制沿用 0.3.0 条目（无自动更新、安装包只出 Windows、WebView2/node 不随包、远程默认关闭等）。
+
 ## [0.3.0] —— 2026-10-04
 
 > 状态：v0.3.0（2026-10-04）。安装包、构建戳与 sha256 以 [GitHub Releases](https://github.com/sannongwangluo/tatai/releases) 对应页为准；发布说明见 [`docs/releases/v0.3.0.md`](docs/releases/v0.3.0.md)。下面列出的能力与修复**已交付**；逐卡独立审计与用户验收状态以 `PLAN.md` 卡行与事件账本为准。**提交执行结果 ≠ 独立审计通过 ≠ 用户验收。**

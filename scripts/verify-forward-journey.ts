@@ -9,7 +9,7 @@
 // 隔离：mkdtemp 夹具项目 + 隔离 home + 随机端口；不碰真实 ~/.tatai、真实项目/账本/8787；收尾清进程与临时目录。
 //
 // 覆盖旅程（契约 F5 逐段）：
-//   0  工具面：真 stdio `tools/list` 能发现 **25** 个工具，schema 可调用（listTools 取到的 inputSchema 是对象）
+//   0  工具面：真 stdio `tools/list` 能发现 **31** 个工具，schema 可调用（listTools 取到的 inputSchema 是对象）
 //   1  无模型配置：现有两份图纸 → manage_baseline read（零副作用）
 //   2  技术审定激活：manage_baseline activate（固定 delegated_technical_review，不写 Gate）
 //   3  需求登记：manage_requirement register
@@ -169,6 +169,12 @@ const asObj = (j: unknown): Record<string, unknown> => (typeof j === "object" &&
 const revOf = (taskId: string): number => readTaskStates(workDir).states[taskId]?.revision ?? -1;
 const statusOf = (taskId: string): string => readTaskStates(workDir).states[taskId]?.status ?? "<none>";
 const evCount = (): number => { try { return readClaimEvents(workDir).length; } catch { return -1; } };
+// 零写入按实际字节核对；只有文件数不变不足以排除已有证据被覆盖。
+const evidenceBytesFingerprint = (): string => {
+  const dir = path.join(workDir, "evidence");
+  const files = fs.existsSync(dir) ? fs.readdirSync(dir).sort() : [];
+  return sha256(JSON.stringify(files.map((name) => [name, sha256(fs.readFileSync(path.join(dir, name)))])));
+};
 
 async function main(): Promise<void> {
   info(`V09-29 正向闭环完整旅程（真 stdio MCP + 真 index.ts；${process.platform} · node ${process.version}）`);
@@ -206,7 +212,12 @@ async function main(): Promise<void> {
       "project_entry", "claim_task", "submit_task_result", "manage_requirement", "manage_change",
       "import_plan_definitions", "read_design", "read_progress",
     ];
-    ok(tools.length === 25, `0-3 stdio tools/list 发现 25 个工具（收到 ${tools.length}）`, names);
+    // 2026-10-07 定向更新（五要素留档）：旧期望＝30｜依据＝本批 B2/V09-52 新增功能清单只读读口 feature_ledger
+    //   （DESIGN §6.12；注册表 `src/mcp/tools/index.ts` 里逐字记「工具面 30 → 31」）并入后实有 31 个
+    //   （真 stdio tools/list 逐个点名在场，见下一条 0-4）｜新期望＝31｜保留意图＝真 stdio 工具面必须与源码
+    //   注册表同数，工具静默丢失要立刻红｜判据不放宽：仍是精确钉值，未放宽成「≥30」或「关键工具在即可」。
+    //   （前一版 30 的五要素留档见 git 历史：旧期望 29 → preflight_task_result 并入 → 30。）
+    ok(tools.length === 31, `0-3 stdio tools/list 发现 31 个工具（收到 ${tools.length}）`, names);
     ok(expectedNames.every((n) => names.includes(n)), "0-4 关键工具都在 stdio 工具面（含 V09-27/V09-28 新入口）", expectedNames.filter((n) => !names.includes(n)));
     ok(tools.every((t) => typeof t.inputSchema === "object" && (t.inputSchema as { type?: string }).type === "object"), "0-5 每个工具的 inputSchema 都是可调用的对象 schema");
     ok(names.every((n) => !/^write_|^delete_/.test(n)), "0-6 权限红线：工具面没有 write_/delete_ 直写口");
@@ -254,6 +265,35 @@ async function main(): Promise<void> {
     ok(entryJson.next_action === "claim_task", "6-1 project_entry 给出 next_action=claim_task", { next_action: entryJson.next_action, codes: reasonCodes });
     ok(evCount() === evBeforeEntry, "6-2 project_entry 只读（不认领、不写事件）");
     ok(typeof taskRevision === "number", "6-3 理由里带 task_revision（claim_task 的 expected_revision）", claimReason ?? reasonCodes);
+    // 6-4/6-5（V09-53／D1 接通后）：**真宿主进程**（spawn 的 `src/server/index.ts` → 描述符 → `/api/work/entry`）
+    // 的回包也带逐 check 工作包——不是本地另算、也不是 `unsupported_by_host`。`versions`/`source` 在场即证明
+    // 这份入口来自宿主只读读口（本地回退路径不带这两项）。
+    ok(
+      entryJson.versions !== undefined && entryJson.source !== undefined,
+      "6-4 这次 project_entry 走的是真宿主只读读口（versions/source 在场，非本地回退）",
+      { versions: entryJson.versions !== undefined, source: entryJson.source !== undefined },
+    );
+    const hostWp = asObj(entryJson.work_package);
+    ok(
+      typeof hostWp.package_revision === "string" && hostWp.package_revision !== "" && Array.isArray(hostWp.checks) && hostWp.checks.length >= 1,
+      "6-5 真宿主进程的只读入口**带回逐 check 工作包**（D1 全链：查询参数 → readJobs → 同一份现读快照）",
+      { has: entryJson.work_package !== undefined, checks: (hostWp.checks as unknown[])?.length ?? null },
+    );
+    const wpChecks = (hostWp.checks as unknown[]) ?? [];
+    ok(
+      wpChecks.length >= 1 &&
+        wpChecks.every((c) => {
+          const o = asObj(c);
+          const n = asObj(o.next_operation);
+          return typeof n.tool === "string" && typeof n.operation === "string" && !(n.tool === "submit_task_result");
+        }),
+      "6-6 工作包逐项给的是**可执行**下一步（未开工不推 submit_task_result、不出现虚构操作）",
+      wpChecks.map((c) => {
+        const o = asObj(c);
+        const n = asObj(o.next_operation);
+        return `${o.check_id}:${String(n.tool)}.${String(n.operation)}`;
+      }),
+    );
 
     // ═══ 7. 领取 ═══
     const claim1 = await call(client, "claim_task", { project_id: PID, task_id: "T-1", role: "executor", change_id: CHG, expected_revision: taskRevision, owner_id: "agent-1", lease_ms: 1, workspace: path.join(PROJECT, ".工作台", "runs", "T-1", "manual1") });
@@ -361,13 +401,23 @@ async function main(): Promise<void> {
       { area: "failure_recovery", status: "checked", basis: "服务不可用" },
       { area: "trust_permission", status: "checked", basis: "越权反例" },
     ];
-    const auditFail = await call(client, "record_work_evidence", { op: "independent_audit", project_id: PID, role: "auditor", actor_id: "agent-3", change_id: CHG, record_id: "jz-au-1", auditor: "agent-3", author_id: "agent-2", conclusion: "fail", coverage, findings: ["T-1 边界用例未过"], not_reported_scope: ["未跑性能"] });
-    ok(auditFail.ok, "14-7 独立审计 conclusion=fail 落账（审计者≠作者）", auditFail.text.slice(0, 220));
-
-    // 缺陷台账（来源＝失败审计的发现）
+    // 写前校验（src/server/work/auditValidation.ts §失败独审）：conclusion=fail（或含 result=failed 的 check）**必须**
+    // 引用 foldFindings 里的**在册 finding ID**，自由文本会被唯一写入服务在落盘前拒绝（零字节）。故按**真实流程**：
+    // 先正式 open finding，再以其 id 登记失败审计——测试不改产品校验，只把夹具走成正式引用。
     const findOpen = await call(client, "record_work_evidence", { op: "finding", sub_op: "open", project_id: PID, role: "auditor", actor_id: "agent-3", change_id: CHG, severity: "user_visible_defect", source: "verify:forward-journey", expected: "t-1 边界通过", actual: "未通过", repro: "跑边界用例", evidence_sha256: evSha, object_id: "T-1" });
     const findingId = String(asObj(findOpen.json).finding_id ?? "");
-    ok(findOpen.ok && findingId !== "", "14-8 缺陷 open（带复现+证据）", findOpen.text.slice(0, 240));
+    ok(findOpen.ok && findingId !== "", "14-7 缺陷 open（带复现+证据；失败独审的前置在册引用）", findOpen.text.slice(0, 240));
+
+    // 负例（判据不放宽）：旧散文 findings 的失败独审**仍被**写前校验拒绝，且账本 / 证据库**零写入**。
+    const evBeforeProse = sha256(fs.readFileSync(path.join(workDir, "events.jsonl")));
+    const evFilesBeforeProse = evidenceBytesFingerprint();
+    const auditProse = await call(client, "record_work_evidence", { op: "independent_audit", project_id: PID, role: "auditor", actor_id: "agent-3", change_id: CHG, record_id: "jz-au-prose", auditor: "agent-3", author_id: "agent-2", conclusion: "fail", coverage, findings: ["T-1 边界用例未过"], not_reported_scope: ["未跑性能"] });
+    ok(!auditProse.ok && /EVENT_INVALID|finding 不存在/.test(auditProse.text), "14-8 负例：散文 findings 的失败独审被写前校验拒绝（不回落成自由文本）", auditProse.text.slice(0, 240));
+    ok(sha256(fs.readFileSync(path.join(workDir, "events.jsonl"))) === evBeforeProse, "14-9 负例零字节：事件账本内容未改变");
+    ok(evidenceBytesFingerprint() === evFilesBeforeProse, "14-10 负例零字节：证据库文件集合与内容均未改变");
+
+    const auditFail = await call(client, "record_work_evidence", { op: "independent_audit", project_id: PID, role: "auditor", actor_id: "agent-3", change_id: CHG, record_id: "jz-au-1", auditor: "agent-3", author_id: "agent-2", conclusion: "fail", coverage, findings: [findingId], not_reported_scope: ["未跑性能"] });
+    ok(auditFail.ok, "14-11 独立审计 conclusion=fail 落账（审计者≠作者；findings 引用在册 finding id）", auditFail.text.slice(0, 220));
 
     // ═══ 15. 返工重开（协调器）═══
     rev = revOf("T-1");

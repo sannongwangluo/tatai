@@ -809,6 +809,52 @@ try {
     ok(w3.origin === "incremental" && w3.folded_events === 0, `S2 内容未变：仍走增量、折 0 条（folded=${w3.folded_events}）`);
   }
 
+  // 回退全量也是一次新的真实读取：首次前缀检查稳定，不保证回退扫描稳定。
+  for (const trigger of ["prefix", "half-tail", "shrink"] as const) {
+    for (const persistent of [false, true]) {
+      const wd = workDirOf(`fallback-${trigger}-${persistent}`);
+      clearEventReadCache();
+      writeLedger(wd, GREEN);
+      readLedger(wd); // 先建立有效前缀缓存
+      const file = eventsPath(wd);
+      if (trigger === "prefix") {
+        fs.writeFileSync(file, fs.readFileSync(file, "utf8").replaceAll("executing", "cancelled"));
+      } else if (trigger === "half-tail") {
+        fs.writeFileSync(file, fs.readFileSync(file, "utf8").trimEnd());
+      } else {
+        writeLedger(wd, GREEN.slice(0, 2));
+      }
+      const originalFstat = fs.fstatSync;
+      let calls = 0;
+      let appended = 0;
+      let nextSeq = trigger === "shrink" ? 3 : GREEN.length + 1;
+      let code: string | null = null;
+      let result: ReturnType<typeof readLedger> | null = null;
+      // 仅本同步读取内拦截fstat：第1次扫描不动；第2次扫描结束才真实追加。
+      fs.fstatSync = ((...args: Parameters<typeof fs.fstatSync>) => {
+        calls += 1;
+        if (calls >= 4 && calls % 2 === 0 && (persistent || appended === 0)) {
+          const prefix = trigger === "half-tail" && appended === 0 ? "\n" : "";
+          fs.appendFileSync(file, prefix + JSON.stringify(ev(nextSeq++, `task:late${appended}`, 1, "blocked")) + "\n");
+          appended += 1;
+        }
+        return originalFstat(...args);
+      }) as typeof fs.fstatSync;
+      try { result = readLedger(wd); }
+      catch (e) { if (e instanceof WorkError) code = e.code; else throw e; }
+      finally { fs.fstatSync = originalFstat; }
+      ok(appended > 0, `P3 ${trigger}/${persistent} 真实改写发生在回退扫描期间`);
+      if (persistent) {
+        ok(code === "LEDGER_UNSTABLE" && result === null, `P3 ${trigger} 回退持续变化明确拒绝，不返回假稳定`);
+        ok(peekLedgerEntry(wd) === null, `P3 ${trigger} 拒绝后清除旧缓存`);
+      } else {
+        ok(code === null && result !== null && sameEventsChunked(result.events, oracle(wd)), `P3 ${trigger} 回退短暂变化重试后与完整真实内容一致`);
+      }
+      const quiet = readLedger(wd);
+      ok(sameEventsChunked(quiet.events, oracle(wd)), `P3 ${trigger}/${persistent} 停写后可恢复，缓存未污染`);
+    }
+  }
+
   // ════════ P. 持续追加（短读/文件在变）→ 重试后仍不稳定 → 明确 LEDGER_UNSTABLE，不返回混合事件 ════════
   console.log("[verify] ═══ P 持续追加 → 明确拒绝（不返回混合状态） ═══");
   {

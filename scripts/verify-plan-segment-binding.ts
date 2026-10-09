@@ -22,7 +22,7 @@ import os from "node:os";
 import path from "node:path";
 import { blueprintContextOf, blueprintSourcesFromTexts, deriveBlueprint, PLAN_PREFIX } from "../src/arch/blueprint";
 import { sourceRefLocateOf } from "../src/arch/blueprintValidate";
-import { buildSectionIndex, activateBaseline, designDefinitionText } from "../src/server/work/documents";
+import { buildSectionIndex, activateBaseline, designDefinitionText, readRevisionSnapshotText } from "../src/server/work/documents";
 import { importTaskDefinitions } from "../src/server/work/plan";
 import { taskDefinitionHash, definitionCanonical, sha256Hex as pureSha256Hex } from "../src/shared/planCardHash";
 import {
@@ -310,6 +310,109 @@ try {
     dataDir,
   );
   ok(bl.created === true && bl.baseline.baseline_id !== "", `夹具基线可激活（created=${bl.created}、advance=${JSON.stringify(bl.advance)}）——本变更不碰写入结构`);
+
+  // ═══════════ ⑦ 内容哈希绑定 → 定义哈希命名的不可变快照（真机 V09-45…V09-50 假 stale 口径） ═══════════
+  //
+  // 真机现场：施工图不可变对象**主名是定义哈希**（§2.6），检查记录绑的却是**内容哈希**；
+  // 旧修订（盘上只有定义名文件）拿内容哈希直读必成 null ⇒ 读侧回退整份比对 ⇒ 本卡没变也判 stale。
+  // 本节用独立夹具把这条口径钉死：绑定内容哈希 + 对象落在定义名下 + 只有别的卡变 ⇒ 仍分段通过；
+  // 缺档/篡改/本卡真变 ⇒ 仍 stale（负例，宁严不松）。
+  info("── ⑦ 施工图快照按定义哈希命名、检查绑内容哈希：经基线映射解析到同一对象（分段复核生效）");
+  {
+    const home7 = fs.mkdtempSync(path.join(os.tmpdir(), "tatai-plan-seg7-"));
+    const root7 = path.join(home7, "proj");
+    const wb7 = path.join(root7, ".工作台");
+    mkdirp(home7);
+    write(
+      path.join(home7, "registry.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          projects: [
+            {
+              id: "plan-seg7-fix",
+              name: "plan 快照口径夹具",
+              path: root7,
+              kind: "backend",
+              registered_at: "2026-09-27T00:00:00+08:00",
+              last_opened_at: "2026-09-27T00:00:00+08:00",
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+    );
+    const P7 = "plan-seg7-fix";
+    write(path.join(wb7, "design.md"), DESIGN_V1);
+    write(path.join(wb7, "plan.md"), PLAN_V1);
+    const svc7 = new WorkService({ dataDir: home7 });
+    submitDefinitionImports(svc7, {
+      project_id: P7,
+      change_id: "seg7-defs",
+      actor_id: "verify-plan-segment-binding",
+      role: "executor",
+      definitions: importTaskDefinitions(PLAN_V1).definitions,
+    });
+    const shaV1b = nodeSha256(PLAN_V1);
+    for (const taskId of ["T-1", "T-3"]) {
+      submitSelfCheck(svc7, {
+        project_id: P7,
+        change_id: "seg7-check",
+        actor_id: "verify-plan-segment-binding",
+        role: "executor",
+        record_id: `seg7-${taskId}-1`,
+        task_id: taskId,
+        checked_by: "verify-plan-segment-binding",
+        checks: [
+          {
+            check_id: `${taskId}::check:0`,
+            method: "夹具：绑内容哈希",
+            evidence_sha256: nodeSha256("夹具证据正文"),
+            verifies: "document",
+          },
+        ],
+        conclusion: "pass",
+        binding: { revision_kind: "plan", revision: shaV1b },
+      });
+    }
+    // 此时 plan.md = V1：激活基线把不可变副本按**定义哈希**落盘（主名口径）
+    const bl7 = activateBaseline(
+      P7,
+      { approved_by: "user", approval_basis: "夹具隔离审定（不代表真实用户 Gate）", approval_kind: "user_confirmed" },
+      home7,
+    );
+    const defV1 = bl7.baseline.plan_revision.definition_sha256;
+    ok(
+      readRevisionSnapshotText(P7, "plan", defV1, home7) === PLAN_V1,
+      `⑦ 不可变副本落在**定义名**下（plan-revisions/${defV1.slice(0, 8)}…）；定义名文件内容 = V1 原文`,
+    );
+    ok(
+      readRevisionSnapshotText(P7, "plan", shaV1b, home7) === null,
+      "⑦ 内容哈希名下**没有**文件（真机口径）——旧读法（按内容哈希直读）必得 null、回退整份",
+    );
+    // 改**另一张**卡（T-3）：当前源前进，本对象 T-1 的卡定义没变
+    write(path.join(wb7, "plan.md"), PLAN_V2);
+    const p7 = projectFromFacts(P7, home7).projection;
+    const eff7 = (id: string) => p7.by_id[id]?.evidence_basis.find((b) => b.check_id === `${id}::check:0`)?.effective;
+    ok(projectFromFacts(P7, home7).facts.binding_segments.snapshots.has(`plan:${shaV1b}`), `⑦ 内容哈希→定义名快照解析成功（键 plan:${shaV1b.slice(0, 8)}… 在场）`);
+    ok(eff7("T-1") === "passed", `⑦ 修后：绑内容哈希、快照在定义名下、只有别的卡变 → T-1 仍 passed（effective=${eff7("T-1")}）——分段复核救回，不再假 stale`);
+    ok(eff7("T-3") === "stale", `⑦ 本卡 T-3 真变 → stale（effective=${eff7("T-3")}）——负例仍有效`);
+    // 负例①：缺档（删掉解析出来的那份定义名对象）⇒ 回退整份比对 ⇒ T-1 也 stale
+    const snapRel7 = path.join(wb7, "plan-revisions", `${defV1}.md`);
+    fs.rmSync(snapRel7);
+    const effT1Missing = projectFromFacts(P7, home7).projection.by_id["T-1"]?.evidence_basis.find((b) => b.check_id === "T-1::check:0")?.effective;
+    ok(effT1Missing === "stale", `⑦ 缺档（删定义名对象）→ 回退整份比对 → T-1 stale（effective=${effT1Missing}）——宁严不松`);
+    // 负例②：篡改（同名对象写进别的正文，内容哈希对不上）⇒ 不算命中 ⇒ 回退整份 ⇒ stale
+    write(snapRel7, PLAN_V2);
+    const effT1Tampered = projectFromFacts(P7, home7).projection.by_id["T-1"]?.evidence_basis.find((b) => b.check_id === "T-1::check:0")?.effective;
+    ok(effT1Tampered === "stale", `⑦ 篡改（同名对象写别的正文，内容哈希核不上）→ T-1 stale（effective=${effT1Tampered}）——不拿主名顶替`);
+    // 负例③：恢复正确对象 ⇒ 分段复核恢复（证明上面两条是"对象不在/不对"，不是解析器不再工作）
+    write(snapRel7, PLAN_V1);
+    const effT1Restored = projectFromFacts(P7, home7).projection.by_id["T-1"]?.evidence_basis.find((b) => b.check_id === "T-1::check:0")?.effective;
+    ok(effT1Restored === "passed", `⑦ 恢复正确对象 → T-1 又 passed（effective=${effT1Restored}）——解析器按内容哈希核验，不是一次失败就永久失效`);
+    fs.rmSync(home7, { recursive: true, force: true });
+  }
 } catch (e) {
   ok(false, `验证中断：${(e as Error).message}`);
   console.error(e);

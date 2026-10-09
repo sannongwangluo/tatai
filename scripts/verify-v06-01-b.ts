@@ -482,13 +482,18 @@ const literalPick = Object.values(auditOf(fxLatest).submissions)
   .filter((s) => s.binding?.revision_kind === "code")
   .sort((a, b) => a.at.localeCompare(b.at))
   .at(-1)?.binding?.revision;
+// 定向更新（V09-29／契约 F4，2026-10-08 共同夹具修复批）：产品读口**默认** `revisions.code = null`
+//   （= "当前源码未知，代码检查一律待复核"；自报值不再当"当前代码版本"），自报的「最近一次 code 绑定修订」
+//   移到 `revisions.code_declared`（statusProjection.ts:2006-2007 / :2141 latestCodeBindingRevision）。
+//   ③-1 判据因此从 `revisions.code` 改锚到 `revisions.code_declared`——**判据不放宽**：仍是"真实时刻最晚
+//   的那次绑定"，且仍要求"字典序取最新会拿到时间非法的那条"这一反例自证（时间偏移目标照旧被测）。
 ok(
-  factsLatest.revisions.code === "code-real-later",
-  `③-1 revisions.code = 真实时刻最晚的那次提交所绑定的版本（${factsLatest.revisions.code}）`,
+  factsLatest.revisions.code_declared === "code-real-later",
+  `③-1 revisions.code_declared = 真实时刻最晚的那次提交所绑定的版本（${factsLatest.revisions.code_declared}）`,
 );
 ok(
-  literalPick === "code-illegal-time" && factsLatest.revisions.code !== literalPick,
-  `③-1 反例自证：字典序取最新会拿到时间非法的 ${literalPick}；实现给的是 ${factsLatest.revisions.code}`,
+  literalPick === "code-illegal-time" && factsLatest.revisions.code_declared !== literalPick,
+  `③-1 反例自证：字典序取最新会拿到时间非法的 ${literalPick}；实现给的是 ${factsLatest.revisions.code_declared}`,
 );
 
 // ── C1b 全为非法 → 拿不到当前版本（null，fail-closed） ──
@@ -504,9 +509,11 @@ submitSubmission(submitter, {
   submitted_by: "fixture-executor",
   binding: { revision_kind: "code", revision: "code-only-illegal" },
 });
+// 同上（V09-29／F4 定向更新）：全非法 ⇒ `code_declared` 也是 null（fail-closed）——
+//   改锚到 code_declared 后这条才真正在测"解析不出就不当当前版本"，而非恒 null 的空转。
 ok(
-  collectProjectFacts(fxBad.id, dataDir).revisions.code === null,
-  "③-2 提交时间全都解析不出来 → revisions.code = null（不把一个非法时间当成当前版本）",
+  collectProjectFacts(fxBad.id, dataDir).revisions.code_declared === null,
+  "③-2 提交时间全都解析不出来 → revisions.code_declared = null（不把一个非法时间当成当前版本）",
 );
 
 // ── C2 acceptances 取最新（真实调用点 acceptanceDimensionOf，记录来自真实事件流） ──

@@ -224,14 +224,39 @@ function makeFixture(
 const revOf = (fx: Fixture, taskId: string): number | null =>
   readTaskStates(fx.workDir).states[taskId]?.revision ?? null;
 
+/**
+ * 夹具：改任务执行状态。
+ *
+ * `result_submitted` 在这个夹具里是**历史/迁移状态**（造"这张卡已经交过结果"的现场），不是一次新交付：
+ * 按**既有状态边界** `task.status_changed` + `payload.status` 写（与 `migrate.ts` 把 v1 `done` 折成
+ * `result_submitted` 逐字同一形态，不带交付包、不宣称判据通过）。**`task.result_submitted` 是一条
+ * 交付提交事件**，只由带合法认领 token + 可追溯证据的提交写入（P2/V09-47 锁内共享判据）——夹具不冒充
+ * 交付提交，也不要求产品为回归放宽校验（本项**不测试新交付**）。
+ */
+let fixtureStatusSeq = 0;
 function setStatus(fx: Fixture, taskId: string, status: Parameters<typeof submitTaskStatus>[1]["status"], reason?: string) {
-  return submitTaskStatus(service, {
+  const expectedRevision = revOf(fx, taskId);
+  const common = {
     project_id: fx.id,
-    task_id: taskId,
     change_id: CHG,
     actor_id: executor,
-    role: "executor",
-    expected_revision: revOf(fx, taskId),
+    role: "executor" as const,
+    expected_revision: expectedRevision,
+  };
+  if (status === "result_submitted") {
+    fixtureStatusSeq += 1;
+    return service.submit({
+      schema_version: 2,
+      ...common,
+      entity_id: `task:${taskId}`,
+      type: "task.status_changed",
+      idempotency_key: `fixture-hist-status:${taskId}:result_submitted:${expectedRevision}:${fixtureStatusSeq}`,
+      payload: { status, ...(reason === undefined ? {} : { reason }) },
+    });
+  }
+  return submitTaskStatus(service, {
+    ...common,
+    task_id: taskId,
     status,
     ...(reason === undefined ? {} : { reason }),
   });

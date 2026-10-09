@@ -16,6 +16,7 @@ import { baselineRevalidateOf } from "../../server/work/entry";
 import { checkEventSurface, type SurfaceCheckResult } from "../../server/work/eventSurface";
 import { isMigratedProject, latestBackupId, tasksFileOf } from "../../server/work/migrate";
 import {
+  WORK_TOKEN_HEADER,
   WorkServiceClient,
   descriptorPidAlive,
   readServiceDescriptor,
@@ -23,6 +24,7 @@ import {
   type WorkServiceDescriptor,
 } from "../../server/work/service";
 import { projectWorkDir } from "../../server/workstation";
+import { compareBuildIdentities, resolveBuildIdentity, type BuildIdentity } from "../../shared/buildIdentity";
 import { errorResult, textResult, type McpTool } from "./types";
 
 /** 探活超时：体检要快，等 5s 才报"服务不可达"对"接手即摸底"没有意义 */
@@ -69,7 +71,34 @@ function descriptorReport(dataDir: string, desc: WorkServiceDescriptor | null): 
   };
 }
 
-/** 基线有效性（§2.9/§5.6）：生效基线 + 两份源图纸是否在激活后变过——判据与项目入口同一份 */
+/** 未知身份（P0/V09-45 §4.1）：读不到就如实 unknown + 原因，**绝不**猜成"一致"。 */
+function unknownIdentity(reason: string): BuildIdentity {
+  return { schema_version: 1, component: "server", embedded: false, reason };
+}
+
+/**
+ * P0/V09-45（§4.6）：经**宿主 `/api/work/health`** 读回唯一写服务的构建身份（server 部件）。
+ * 只读、有界、**不**自愈/不拉起（doctor 默认只读）；读不到就写 unknown 与原因。
+ * 注意：这里回的是**宿主进程**的身份，不是本 MCP 进程的——两者可能不同批（正因如此才要对照）。
+ */
+async function hostBuildIdentity(desc: WorkServiceDescriptor | null, timeoutMs: number): Promise<BuildIdentity> {
+  if (desc === null) return unknownIdentity("数据目录里没有服务描述符：读不到宿主构建身份");
+  try {
+    const res = await fetch(`http://${desc.host}:${desc.port}/api/work/health`, {
+      headers: { [WORK_TOKEN_HEADER]: desc.token },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return unknownIdentity(`宿主 /api/work/health 返回 HTTP ${res.status}：读不到宿主构建身份`);
+    const body = (await res.json().catch(() => null)) as { build_identity?: unknown } | null;
+    const bi = body?.build_identity;
+    if (bi === undefined || bi === null || typeof bi !== "object" || (bi as { embedded?: unknown }).embedded !== true) {
+      return unknownIdentity("宿主未回内嵌构建身份（旧宿主或源码直跑）：按未知处理，不判一致");
+    }
+    return bi as BuildIdentity;
+  } catch (e) {
+    return unknownIdentity(`读宿主构建身份失败：${e instanceof Error ? e.message : String(e)}`);
+  }
+}/** 基线有效性（§2.9/§5.6）：生效基线 + 两份源图纸是否在激活后变过——判据与项目入口同一份 */
 function baselineReport(projectId: string, dataDir: string): Record<string, unknown> & Section {
   const problems: string[] = [];
   let baseline: ProjectBaseline | null = null;
@@ -223,6 +252,12 @@ export function createDoctorTool(deps: DoctorDeps = {}): McpTool {
       if (!availability.available) {
         serviceProblems.unshift(`写入服务不可达：${availability.reason ?? "未知原因"}`);
       }
+      // P0/V09-45（Codex 纠正 4）：doctor 要**同时**报出本 MCP 进程自身加载的身份与宿主身份——
+      // 只报宿主会把"只换了磁盘、旧 MCP 进程仍是旧版"这一 P0 原问题漏掉。两者做偏斜三态比较，
+      // **任一侧未内嵌一律 unknown，不判一致**（判据唯一来源 src/shared/buildIdentity.ts）。
+      const mcpIdentity = resolveBuildIdentity("server");
+      const hostIdentity = await hostBuildIdentity(availability.descriptor, PROBE_TIMEOUT_MS);
+      const identitySkew = compareBuildIdentities(mcpIdentity, hostIdentity);
       const service: Record<string, unknown> & Section = {
         ok: availability.available && descriptor.ok !== false,
         reachable: availability.available,
@@ -231,6 +266,12 @@ export function createDoctorTool(deps: DoctorDeps = {}): McpTool {
         data_dir: dataDir,
         heal: healReport,
         descriptor,
+        // 本进程（MCP）自身身份：取自编译期内联常量；tsx 直跑/旧包 ⇒ unknown。
+        build_identity: mcpIdentity,
+        // 宿主（唯一写服务）身份：经 /api/work/health 只读回读。
+        host_build_identity: hostIdentity,
+        // MCP↔宿主偏斜三态：unknown 不算一致（UI 侧的 ui↔宿主比较由界面诊断负责）。
+        build_identity_skew: identitySkew,
         problems: serviceProblems,
       };
 

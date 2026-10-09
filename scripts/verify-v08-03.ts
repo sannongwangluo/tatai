@@ -15,9 +15,8 @@ import assert from "node:assert/strict";
 import {
   MODULE_VERIFIED_SHORT,
   PROJECT_VIEWS,
-  aggregateStatusOf,
   buildViewModel,
-  capabilityStatusOf,
+  canonicalScopeStatusOf,
   directStatusOf,
   noStatusRecordOf,
   taskDerivedModuleStatus,
@@ -229,25 +228,27 @@ ok(
   "模型推断（inferred）的实现映射边**不进成员账目**、也不参与「验证通过」判据（不给推断染绿/染红的机会）",
 );
 
-// 能力：由成员派生（架构视图成员＝模块；功能全景成员＝模块＋任务）
-console.log("[verify] ═══ ②b 能力：不另设验证，由本视图成员派生 ═══");
-const capMembers = (...items: [string, string | null][]) =>
-  items.map(([id, display]) => ({ id, status: { kind: "direct", display: display as never, projection: null, member_count: 0, basis: "" } as never }));
+// 能力：状态**只读 canonical 义务层投影**（V09-55 返工；不再本地按成员汇总出一套绿公式）
+console.log("[verify] ═══ ②b 能力：状态只读 canonical 义务层投影（判据不在此）═══");
+const capProj = (display: string | null, mapping: "mapped" | "unmapped" = "mapped") =>
+  ({ object_id: "cap", mapping, display_status: display, display_status_label: display, reasons: [] }) as never;
 ok(
-  capabilityStatusOf(capMembers(["m1", "verified"], ["m2", "verified"])).display === "verified",
-  "成员全部验证通过 ⇒ 能力验证通过（绿）",
+  canonicalScopeStatusOf(capProj("verified")).display === "verified",
+  "canonical 投影 verified ⇒ 能力 verified（原样读出，本层不判绿）",
 );
 ok(
-  capabilityStatusOf(capMembers(["m1", "verified"], ["m2", null])).display === "pending_verification" &&
-    capabilityStatusOf(capMembers(["m1", "verified"], ["m2", null])).basis.includes("没有状态记录"),
-  "成员里有「无状态记录」⇒ 能力不给绿（封在结果待验证，口径句点明有几个成员没有状态记录）",
+  canonicalScopeStatusOf(capProj("blocked")).display === "blocked",
+  "canonical 投影 blocked ⇒ 能力 blocked（不被改写、不降成橙）",
 );
 ok(
-  capabilityStatusOf(capMembers(["m1", "verified"], ["m2", "planned"])).display === "pending_verification",
-  "成员里有一张真 todo ⇒ 能力封在「结果待验证」级，绝不给绿（A 类真 todo 不染绿）",
+  canonicalScopeStatusOf(null).unmapped_reason === "no_status_source" && canonicalScopeStatusOf(null).basis.includes("canonical"),
+  "没有 canonical 范围投影 ⇒ 未知/未接入（不退回本地按成员汇总造绿）",
 );
-ok(capabilityStatusOf([]).unmapped_reason === "no_members", "没有成员 ⇒ 不空集判绿（没有关联成员）");
-ok(aggregateStatusOf([proj("verified")]).display === "pending_verification", "概览聚合节点仍按既有口径封顶（不动它的语义）");
+ok(
+  canonicalScopeStatusOf(capProj(null, "unmapped")).display === null &&
+    canonicalScopeStatusOf(capProj(null, "unmapped")).unmapped_reason === "object_unmapped",
+  "canonical 未映射 ⇒ 能力不着完成色（不空集判绿；判据在 canonical 义务层）",
+);
 
 // 视图层：三种视图的成员口径与状态来源
 const viewInput = { blueprint: bp, projection: P, module_status: derived.status } as never;

@@ -30,6 +30,7 @@ import { activeBaseline, buildSectionIndex, designDefinitionText, loadDocuments 
 import { importTaskDefinitions, type TaskDefinition } from "../server/work/plan";
 import { taskDefinitionHash } from "../shared/planCardHash";
 import { resolveDesignRef } from "../shared/designRef";
+import { namesDesignBook } from "../shared/designRefStrict";
 import { definitionHashOf, parsePlanTable } from "../server/work/planValidate";
 import { nowIso } from "../server/time";
 import { chatStructuredJson, type FlashMessage } from "../server/flash";
@@ -400,6 +401,15 @@ export interface BlueprintSources {
    * 单段声明 token 只有在这个清单里才算根级真实文件；为 `null` 时一律无法证实、不产生根模块映射。
    */
   repo_root_files: string[] | null;
+  /**
+   * 「外部文档引用」**存在性**清单（2026-10-08 修；`classifyDesignRefToken` 的第二参数据此注入）：
+   * 施工卡「设计依据」里出现的**项目根内相对文档路径**中，经实际读盘**确实存在**的那些（POSIX 相对
+   * 路径，排序去重）。用途只有一个——把「真实存在的项目文档引用」（如 `docs/loop-closure-20261007.md`）
+   * 与「真正缺失的文件」分开：前者登记为信息性 `non_design_ref_external_doc`、不阻断；后者仍按设计
+   * 章节定位、定位不到继续 `unresolved_design_ref` 报缺并阻断（**不许靠认不出就静默消掉缺文件**）。
+   * `null`/缺省 = 未采集（纯文本派生、历史重建没有仓库现场）⇒ 一律按旧口径，不认定为外部文档。
+   */
+  external_doc_paths?: string[] | null;
   names: Record<string, { name: string } | undefined>;
   manifest: BlueprintSourceManifestEntry[];
 }
@@ -424,6 +434,33 @@ export function stableSlug(key: string): string {
 }
 
 const pad2 = (n: number): string => String(n).padStart(2, "0");
+
+/** `realpathSync` 容错包装：解析失败（不存在/不可读/软链成环）返回 null，调用方按「无法证实」处理 */
+function realpathOrNull(p: string): string | null {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 相对路径 `rel`（POSIX，如 `docs/x.md`）指向的文件是否存在**且仍在项目根真路径内**：
+ * ① `statSync` 判为普通文件；② `realpathSync` 解出**真路径**（穿透 symlink/junction）；
+ * ③ 用 `path.relative(rootReal, …)` 判定落点未越出 `rootReal`（项目根 realpath）。
+ * 任一不满足即 false —— symlink/junction **逃出项目根**的引用一律不算项目内来源（2026-10-08 返工）。
+ */
+function realFileWithin(rootReal: string, projectRoot: string, rel: string): boolean {
+  try {
+    const abs = path.join(projectRoot, ...rel.split("/"));
+    if (!fs.statSync(abs).isFile()) return false;
+    const relReal = path.relative(rootReal, fs.realpathSync(abs));
+    if (relReal === "" || path.isAbsolute(relReal)) return false;
+    return relReal !== ".." && !relReal.startsWith(`..${path.sep}`);
+  } catch {
+    return false;
+  }
+}
 
 // ───────────────────────────────── 来源读取 ─────────────────────────────────
 
@@ -545,6 +582,28 @@ export function readBlueprintSources(projectId: string, dataDir?: string): Bluep
         : `${repoRootFiles.length} 个根级文件（implementation_map 根级真实文件判据）`,
   });
 
+  // 「外部文档引用」存在性采集（2026-10-08 修；同日返工加真 realpath 约束）：只对**设计依据 token 里
+  // 出现的候选文档路径**逐个实际读盘——**不遍历整仓**（有界 I/O：只证实"被引用的这份文档在不在项目里"，
+  // 不枚举目录树）。越界/绝对/盘符/上跳一律不认；读不到即不为外部文档（保持 unresolved 阻断）。
+  // **真 realpath 约束（返工）**：候选经 `realpathSync` 解析后必须仍落在**项目根真路径**内——symlink/
+  // junction 逃出项目根的一律不算项目内来源（不能把项目外文件借软链伪装成项目文档）。
+  // 为什么放在读侧：`deriveBlueprint` 是**纯派生**（不碰 fs），存在性只能在这里读进来再注入分类器。
+  const externalDocPaths: string[] = [];
+  {
+    const seen = new Set<string>();
+    const rootReal = realpathOrNull(project.path);
+    for (const t of plan?.tasks ?? []) {
+      for (const ref of t.design_refs) {
+        for (const p of externalDocPathsIn(ref)) {
+          if (seen.has(p)) continue;
+          seen.add(p);
+          if (rootReal !== null && realFileWithin(rootReal, project.path, p)) externalDocPaths.push(p);
+        }
+      }
+    }
+    externalDocPaths.sort();
+  }
+
   return {
     baseline_id: baseline?.baseline_id ?? null,
     design,
@@ -552,6 +611,7 @@ export function readBlueprintSources(projectId: string, dataDir?: string): Bluep
     declared_modules,
     code: { available: codeModules.length > 0, budget_exhausted: arch?.budget_exhausted ?? null, modules: codeModules },
     repo_root_files: repoRootFiles,
+    external_doc_paths: externalDocPaths,
     names: names.entries as Record<string, { name: string } | undefined>,
     manifest,
   };
@@ -605,11 +665,77 @@ export type DesignRefTokenClass =
   | "non_design_ref_report"
   | "non_design_ref_external_doc";
 
-export function classifyDesignRefToken(token: string): DesignRefTokenClass {
+/**
+ * 从一条设计依据 token 里取出**候选的项目内文档路径**（机械形态判据，纯解析，不碰 fs）：
+ * 以已知文档扩展名结尾、含路径分隔的片段，如 `` `docs/loop-closure-20261007.md` §2–§4 `` 里的
+ * `docs/loop-closure-20261007.md`。判据与 `designRefStrict.ts#FOREIGN_DOC_RE` 的文件名族同款
+ * （含中日韩文件名）；**只取形状**，是否存在由调用方注入的存在性判据裁决。
+ * 绝对路径/盘符/上跳一律排除（不认成项目内相对文档）。
+ *
+ * **整词边界（2026-10-08 返工）**：候选必须从**路径词的起点**截取，不能从中间起。`../docs/x.md`、
+ * `/docs/x.md`、`D:/docs/x.md` 里的 `..`／前导 `/`／盘符都是同一个路径词的组成部分，若像旧实现那样
+ * 从 `docs/` 起匹配，就会把它们**静默截掉**、把一个越界/绝对路径**误判成项目内合法相对路径**
+ * （安全闸看到的已是被截断的合法后缀，检查形同虚设）。故用**定长负向后顾**卡住左边界：匹配起点前
+ * 一个字符不得是路径字符（字母数字/`_`/`.`/分隔符/CJK），配合**贪婪**主体取到该路径词的**最后一个**
+ * 已知扩展名，从而得到**完整原 token**；安全闸再据完整词把绝对路径/盘符/上跳一律排除。
+ * `\` 也纳入路径字符（Windows 分隔符；`normalizeRepoPath` 会归一）。
+ */
+const EXTERNAL_DOC_PATH_RE =
+  /(?<![0-9A-Za-z_./\\:\u3400-\u9fff-])[0-9A-Za-z_./\\:\u3400-\u9fff-]*\.(?:markdown|jsonc|json|ya?ml|txt|csv|tsx|ts|jsx|js|mjs|cjs|py|toml|md)(?![0-9A-Za-z])/gu;
+
+export function externalDocPathsIn(token: string): string[] {
+  const out: string[] = [];
+  for (const m of token.matchAll(EXTERNAL_DOC_PATH_RE)) {
+    const p = safeExternalDocPath(m[0]);
+    if (p === null) continue;
+    if (!out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+function safeExternalDocPath(raw: string): string | null {
+  const p = normalizeRepoPath(raw);
+  return p === "" || p.startsWith("/") || p.includes(":") || p.split("/").includes("..") ? null : p;
+}
+
+export function classifyDesignRefToken(
+  token: string,
+  /** 外部文档**存在性**判据（注入；缺省 undefined = 未采集，不认定为外部文档）。传项目根内相对路径。 */
+  externalDocExists?: (relPath: string) => boolean,
+): DesignRefTokenClass {
   if (/req-[0-9A-Za-z][0-9A-Za-z-]*\d/.test(token) || /需求\s*[＝=]/.test(token)) return "non_design_ref_requirement";
   if (/报告\s*\d/.test(token)) return "non_design_ref_report";
   if (/AGENTS(?:\.md)?/.test(token) || token.includes(".工作台/")) return "non_design_ref_external_doc";
+  // 2026-10-08 修：**真实存在**的项目内外部文档引用（如 PLAN「设计依据」里的 `docs/*.md`）。
+  // 关键区分：只有实际读到文件才算外部文档——**文件不存在 ⇒ 不认定**，落回 design_section，
+  // 定位不到照旧 unresolved_design_ref 报缺并阻断（不许靠加正则把缺文件一起隐藏）。
+  // 指名设计书（DESIGN.md／设计书）的引用一律不在此列：它本就是设计来源，须继续按章节严格解析
+  // （`DESIGN §2.6（见 docs/foo.md）` 不得因括号里的外部文档而把明确设计节降为追溯）。
+  //
+  // **多引用判据 = 全体满足（2026-10-08 返工；原为 some，是漏网根因之一）**：
+  // 一条 token 里的**每一处**文档路径都必须「真实存在且非权威图纸源」，整条才降为外部文档。
+  //   · some 会把「一个存在 + 一个真缺」的混合引用整条吞成信息性 external_doc，**真缺文件从此不可见**
+  //     （`docs/exists.md + docs/missing.md` 不再报缺）；
+  //   · some 还会让 `PLAN.md §999 (docs/exists.md)` 这种**指名权威施工源**的引用，借括号里另一份
+  //     存在的普通文档被降级，**绕过权威 DESIGN/PLAN 的严格章节解析**。
+  // 改 every 后，只要有一处缺文件、或有一处是权威图纸源，整条落回 design_section ⇒ 该报缺的继续报缺、
+  // 权威引用继续严格定位（保守方向：宁可多报缺，不静默吞掉证据）。
+  if (externalDocExists !== undefined && !namesDesignBook(token)) {
+    // 不先过滤非法路径：合法与非法引用混在一条时，后者也必须保留阻断作用。
+    const paths = [...token.matchAll(EXTERNAL_DOC_PATH_RE)].map((m) => safeExternalDocPath(m[0]));
+    if (paths.length > 0 && paths.every((p) => p !== null && externalDocExists(p) && !isAuthoritativeSourcePath(p)))
+      return "non_design_ref_external_doc";
+  }
   return "design_section";
+}
+
+/**
+ * 权威图纸源文件（`DESIGN.md`／`PLAN.md`）**不是**外部文档——指名它们的设计依据必须继续按设计章节
+ * 严格解析，不得因「文件恰好存在」就降成外部追溯（同 `namesDesignBook` 的意图，覆盖施工图侧）。
+ */
+function isAuthoritativeSourcePath(p: string): boolean {
+  const base = (p.split("/").pop() ?? "").toLowerCase();
+  return base === "design.md" || base === "plan.md";
 }
 
 /** 非设计章节引用的类别名（omitted 登记与读数用同一份文案） */
@@ -770,6 +896,11 @@ export function deriveBlueprint(src: BlueprintSources, opts: DeriveOptions): Blu
   const edges: BlueprintEdge[] = [];
   const design = src.design;
   const plan = src.plan;
+  // 外部文档存在性（2026-10-08 修）：`readBlueprintSources` 读盘采集的真实存在文档路径 → 判据。
+  // 未采集（纯文本派生/历史重建，`null` 或缺省）时为 undefined ⇒ 分类器退回旧口径（不认定为外部文档）。
+  const externalDocSet = src.external_doc_paths == null ? null : new Set(src.external_doc_paths);
+  const externalDocExists =
+    externalDocSet === null ? undefined : (p: string): boolean => externalDocSet.has(normalizeRepoPath(p));
 
   const designRef = (section: { path: string; sha256: string }): BlueprintSourceRef => ({
     kind: "design_section",
@@ -897,7 +1028,7 @@ export function deriveBlueprint(src: BlueprintSources, opts: DeriveOptions): Blu
     const appendixRefs: string[] = [];
     for (const ref of task.design_refs) {
       if (design === null) break;
-      const cls = classifyDesignRefToken(ref);
+      const cls = classifyDesignRefToken(ref, externalDocExists);
       if (cls !== "design_section") {
         nonDesignRefs.push({ token: ref, cls });
         continue;
@@ -1089,6 +1220,8 @@ export function blueprintSourcesFromTexts(input: {
   names: BlueprintSources["names"];
   /** 仓库根级文件名清单（不给 = null = 未知：单段声明 token 一律不产生根模块映射） */
   repo_root_files?: string[] | null;
+  /** 外部文档存在性清单（不给 = null = 未采集：设计依据里的文档路径一律不认定为外部文档） */
+  external_doc_paths?: string[] | null;
 }): BlueprintSources {
   const manifest: BlueprintSourceManifestEntry[] = [];
   let design: BlueprintSources["design"] = null;
@@ -1136,6 +1269,7 @@ export function blueprintSourcesFromTexts(input: {
     declared_modules,
     code: input.code,
     repo_root_files: input.repo_root_files ?? null,
+    external_doc_paths: input.external_doc_paths ?? null,
     names: input.names,
     manifest,
   };
@@ -2141,7 +2275,13 @@ function cacheKeysOf(src: BlueprintSources, semantic: boolean): BlueprintBasedOn
     BLUEPRINT_GENERATOR_VERSION,
     semantic ? "sem" : "det",
   ].join("|");
-  const codeFingerprint = sha256(JSON.stringify([src.code.modules.map((m) => [m.id, m.path, m.file_count]), src.repo_root_files]));
+  const codeFingerprint = sha256(
+    JSON.stringify([
+      src.code.modules.map((m) => [m.id, m.path, m.file_count]),
+      src.repo_root_files,
+      src.external_doc_paths ?? null,
+    ]),
+  );
   return {
     model_key,
     full_key: `${model_key}|${codeFingerprint}`,

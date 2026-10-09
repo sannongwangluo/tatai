@@ -22,6 +22,7 @@
 //   ⑤ 不改 §4.1 派生口径（本模块只**读**投影给的字段，不重算状态，不写任何源）。
 
 import type { DisplayStatus, QualityDimension } from "../../server/work/statusProjection";
+import { capabilityDeclaredMembersOf } from "../../arch/featureScope";
 
 // ══════════════════ ① 来源种类（§3.2「每个模块与每条关系都要有需求、设计或代码来源」） ══════════════════
 
@@ -1096,18 +1097,9 @@ export function capabilityMembersOf(
   edges: readonly { source: string; target: string; kind: string }[],
   capabilityIds: ReadonlySet<string>,
 ): Record<string, string[]> {
-  const out: Record<string, string[]> = {};
-  const add = (member: string, cap: string): void => {
-    const list = out[cap] ?? [];
-    if (!list.includes(member)) list.push(member);
-    out[cap] = list;
-  };
-  for (const e of edges) {
-    if (e.kind === "design_interface" && capabilityIds.has(e.source)) add(e.target, e.source);
-    if (e.kind === "task_design_ref" && capabilityIds.has(e.target)) add(e.source, e.target);
-  }
-  for (const k of Object.keys(out)) out[k] = out[k].sort();
-  return out;
+  // V09-55：枚举实现移到 `featureScope`（成员账目唯一出处），这里保持**声明成员**语义不变
+  // （来源/证据标注与蓝图对账沿用；范围主状态用 `scopeMemberLedgerOf` 的「声明＋实测派生」）。
+  return capabilityDeclaredMembersOf(edges, capabilityIds);
 }
 
 // ══════════════════ ⑦ 机械判据（验证脚本正反两跑；每条违规码都有反例） ══════════════════

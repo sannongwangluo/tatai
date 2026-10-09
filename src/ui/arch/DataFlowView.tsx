@@ -46,7 +46,7 @@ const VERIFICATION_TONE: Readonly<Record<string, string>> = {
   missing: "text-rose-400",
 };
 
-function EvidenceList({ evidence }: { evidence: DataFlowEvidenceRef[] }) {
+export function EvidenceList({ evidence }: { evidence: DataFlowEvidenceRef[] }) {
   if (evidence.length === 0) return <p className="text-neutral-500">没有有效出处（缺证）</p>;
   return (
     <ul className="space-y-0.5">
@@ -267,7 +267,7 @@ export function DataFlowModelView({ model }: { model: DataFlowModel }) {
   );
 }
 
-function TargetSemanticsPanel({ projectId }: { projectId: string }) {
+export function useDataFlowModel(projectId: string) {
   const [model, setModel] = useState<DataFlowModel | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loads, setLoads] = useState(0);
@@ -300,6 +300,11 @@ function TargetSemanticsPanel({ projectId }: { projectId: string }) {
   useEffect(() => {
     reload();
   }, [projectId, token, reload]);
+  return { model, error, loads };
+}
+
+function TargetSemanticsPanel({ projectId }: { projectId: string }) {
+  const { model, error, loads } = useDataFlowModel(projectId);
   return <DataFlowTargetPanel model={model} error={error} loads={loads} />;
 }
 

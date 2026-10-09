@@ -48,6 +48,23 @@ REAL_ID = "tatai"
 REAL_ROOT = REPO
 BLOCKED_CONCLUSION = "不可判定项目可交付"
 REQUESTABLE_CONCLUSION = "可请求验收"
+# 2026-10-06 定向更新（五要素留档）：
+#   旧期望＝**可见摘要**里逐字出现上面这两条**正式**结论原文｜
+#   依据＝V09-20 追加段（2026-09-27 用户指令）定的现行口径就是**白话摘要**：正式结论仍以 DOM 属性
+#     `data-project-delivery-conclusion`（本文件 :675 读的那份）与读口 `delivery.conclusion`
+#     （:996 读的那份）在场，那两处判据一字未改；只有**展示文字**按
+#     `src/ui/arch/ProvenancePanel.tsx:38` 的白话映射表翻译（「不可判定项目可交付」→「还不能确认已做好」）
+#     ⇒ 凡是拿"可见文字"比对正式原文的断言（:506 那处）自该口径落地起必然不成立｜
+#   新期望＝可见摘要必须给出与结论**对应**的白话结论；映射表由测试自己持有（不 import 产品代码，
+#     免得拿产品对着产品验），**表里没有的结论值仍按原文比对**（新口径不放过）｜
+#   保留意图＝"默认摘要必须给出结论、不得被读成已验收"一条不动（同屏仍钉「阻断 N 项」）｜
+#   判据不放宽＝仍是可见文字的精确子串相等，且空期望仍判红（不许退化成"有字就算"）。
+PLAIN_CONCLUSION = {"不可判定项目可交付": "还不能确认已做好"}
+
+
+def plain_conclusion_of(formal: str) -> str:
+    """正式结论 → 可见白话结论；表里没有的照原样返回（仍按原文比对，不放过新口径）。"""
+    return PLAIN_CONCLUSION.get(formal or "", formal or "")
 
 passes = [0]
 fails = []
@@ -504,8 +521,11 @@ def run_browser(vite_port, backend, readings):
             # 同批定向更新：结论**按当前 verdict 蕴含式**判（不钉死某一种数据态）
             _v = page.get_attribute(scope_sel + " [data-delivery-readout]", "data-delivery-verdict")
             _expect = BLOCKED_CONCLUSION if _v == "blocked" else REQUESTABLE_CONCLUSION
-            ok(bool(summary_text) and _expect in summary_text,
-               "%s 屏默认摘要给出结论（verdict=%s；%r）" % (where, _v, summary_text))
+            # 2026-10-06：可见摘要按**白话口径**比对（五要素留档见文件头的 PLAIN_CONCLUSION 段）。
+            # 属性/读口两处（:675/:996）仍比对 `_expect` 正式原文，未跟着改成白话。
+            _expect_visible = plain_conclusion_of(_expect)
+            ok(bool(summary_text) and _expect_visible != "" and _expect_visible in summary_text,
+               "%s 屏默认摘要给出结论（verdict=%s，白话口径 %r；%r）" % (where, _v, _expect_visible, summary_text))
             # 注：默认行**允许**出现各档构成的短标签（如「证据失效 47」）——那是"简短原因"，不是平铺图例。
             # 判据落在**DOM 结构**上：默认摘要里不许有五档 chip、不许有逐条 reason/pending；另限行长。
             _chips_in_summary = page.locator(scope_sel + " [data-delivery-readout] summary [data-delivery-state-chip]").count()
@@ -632,6 +652,19 @@ def run_browser(vite_port, backend, readings):
                     page.locator('[data-arch-node="%s"]' % target).first.click()
                     page.wait_for_timeout(600)
                     sec = page.locator("[data-detail-section='provenance']")
+                    # 2026-10-06 定向更新（五要素留档）：
+                    #   旧期望＝该段 inner_text 里平铺出现「来源种类/映射/证据状态」＋括注 basis（len>120）｜
+                    #   依据＝来源/证据明细自 `9df895d`（2026-10-04 界面品牌统一批，
+                    #     `docs/ui-redesign-20261004.md:15`「技术 ID/类型/成员折叠可查」）起被**有意**折进
+                    #     `<details>`，默认收起 ⇒ 直接读只拿到摘要行（实测
+                    #     "来源与证据 用户待验 展开来源、检查证据与原始定位"），既有断言必然不成立｜
+                    #   新期望＝**先展开该 details 再读**（断言文字一字未改）｜
+                    #   保留意图＝「不许只给一个色块：必须能读到来源种类/映射/证据状态与判据句 basis」｜
+                    #   判据不放宽＝断言文字与长度门槛全部保留，只补上"读之前先展开"这一步。
+                    _det = sec.first.locator("details") if sec.count() == 1 else None
+                    if _det is not None and _det.count() > 0 and not _det.first.evaluate("(d) => d.open"):
+                        _det.first.locator("summary").first.click()
+                        page.wait_for_timeout(400)
                     detail_text = sec.first.inner_text() if sec.count() == 1 else ""
                     rec["detail_after_click"] = {"node": target, "provenance_section": sec.count() == 1,
                                                  "excerpt": detail_text[:300]}
@@ -850,6 +883,21 @@ def run_browser(vite_port, backend, readings):
         # 5) 数据流向图（逐跳标签 + 覆盖对账 + 交付阻断新读数）
         page.locator('[data-graph-mode="DATA_FLOW"]').click()
         page.wait_for_selector('[data-flow-legend]', timeout=40000)
+        # 2026-10-06 定向更新（五要素留档）：
+        #   旧期望＝`[data-flow-summary]` 以 **visible** 作为就绪门，且该门之后的内嵌 details 默认可点｜
+        #   依据＝`9df895d`（2026-10-04 界面品牌统一批）把技术说明整体折进 `src/ui/arch/DataFlowView.tsx:145`
+        #     的 `<details data-flow-material-details>`，而 `[data-flow-summary]`（:160）与
+        #     `[data-flow-coverage]`（:237）**都在它内部**、默认收起 ⇒ 就绪门 40s 超时；只把门放宽到
+        #     attached 也不行——紧接着的 `details[data-flow-coverage] > summary` 点击同样 30s 超时
+        #     （实测 Call log：resolved to `<summary>` 但 element is not visible）｜
+        #   新期望＝先点外层 `details[data-flow-material-details] > summary` 把它展开，**再**按原样等
+        #     `[data-flow-summary]` 可见｜
+        #   保留意图＝"图例与摘要都到场才继续"这条门一点不撤，且**恢复为 visible 严格门**（不是 attached）；
+        #     门后导图各屏断言与内嵌 details 的点击全部照跑｜
+        #   判据不放宽＝就绪门仍要求可见，只是补上"先展开外层"这一步；10-04 授权契约只要求
+        #     "错误与陈旧状态不得折叠隐藏"，技术说明本就允许收起。
+        page.locator("details[data-flow-material-details] > summary").click()
+        page.wait_for_timeout(400)
         page.wait_for_selector("[data-flow-summary]", timeout=40000)
         page.wait_for_timeout(1200)
         page.locator("details[data-flow-coverage] > summary").click()

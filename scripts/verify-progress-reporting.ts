@@ -180,6 +180,20 @@ async function main(): Promise<void> {
   ok(!noBasisReady.ok && /readiness_basis|依据/.test(noBasisReady.text), "无依据解阻 → 拒", noBasisReady.text.slice(0, 240));
   ok(eventCount() === beforeRej, "上述反例全部零字节（事件数不变）", { before: beforeRej, after: eventCount() });
 
+  // ═══ 3.5 未知顶级键边界：v2 闭键拒绝；v1 兼容保持；新增两工具现闭键 ═══
+  info("── 3.5 未知字段边界（v2 闭键 / v1 兼容）");
+  const beforeUnknown = eventCount();
+  const v2Unknown = await call("report_task_status", { project_id: PID, task_id: "T-1", status: "doing", expected_revision: rev, claim_token: token1, owner_id: "agent-1", role: "executor", change_id: CHG, unexpected_field: "x" }, ctx);
+  ok(!v2Unknown.ok && /unexpected_field/.test(v2Unknown.text), "v2 上报带未知顶级键 → 拒并点名", v2Unknown.text.slice(0, 240));
+  ok(!v2Unknown.text.includes(token1), "v2 未知键拒绝信息不回显 claim_token", v2Unknown.text.slice(0, 200));
+  const v1Unknown = await call("report_task_status", { project_id: LEGACY, task_id: "L-2", status: "doing", reporter: "x", legacy_extra: "keep" }, ctx);
+  ok(v1Unknown.ok, "v1 未迁移项目带未知键 → 原行为保持（兼容，不误判全体缺陷）", v1Unknown.text.slice(0, 200));
+  const exUnknown = await call("report_execution", { op: "heartbeat", bogus_exec_key: 1 }, ctx);
+  ok(!exUnknown.ok && /bogus_exec_key/.test(exUnknown.text), "report_execution 未知键 → 拒（现闭键，未改）", exUnknown.text.slice(0, 240));
+  const evUnknown = await call("record_work_evidence", { op: "store", bogus_ev_key: 1 }, ctx);
+  ok(!evUnknown.ok && /bogus_ev_key/.test(evUnknown.text), "record_work_evidence 未知键 → 拒（现闭键，未改）", evUnknown.text.slice(0, 240));
+  ok(eventCount() === beforeUnknown, "未知键用例（v2 拒 + v1 兼容写旧文件）§账本事件数不变", { before: beforeUnknown, after: eventCount() });
+
   // ═══ 4. 阻塞 → 阻塞卡不许新领 → 协调器有依据解阻 → 再领 ═══
   info("── 4. 阻塞与解阻闭环");
   const blocked = await call("report_task_status", { project_id: PID, task_id: "T-1", status: "blocked", reason: "等前置卡证据", expected_revision: rev, claim_token: token1, owner_id: "agent-1", role: "executor", change_id: CHG, request_id: "req-blocked-1" }, ctx);

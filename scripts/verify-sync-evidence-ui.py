@@ -18,12 +18,16 @@
   · **隔离真后端 + 真 vite**（动态空闲端口、临时 TATAI_HOME、夹具项目只落临时区）。
   · `GET /api/projects/:id/sync-status` 由本脚本用 `page.route` **替身**给出，因为 V09-23 后端读口
     与本卡并行施工；替身只造**返回体**，界面判据、DOM、交互全部真实。替身不写账、不调模型。
-  · 另有一段 **不替身** 的真实链路核对：放行请求打到真后端，**若后端尚未实现该路由**（404）则界面
-    必须显示「读取失败」且**不得显绿**——后端就绪后该段自动转 SKIP（如实标注，不假装通过）。
-  · 真实后端联调（真读口 + 真界面）由协调者在 V09-25 做，本脚本不冒充。
+  · 另有一段 **不替身** 的真实链路核对（M 段）：真后端读口 + 真界面端到端，覆盖**三态**——
+    真实未配置（夹具项目尚无契约）、真实配置通过（经隔离后端**唯一写口**登记真契约 + 投放真证据，
+    目标字节一致 ⇒ 真后端判 passed）、真实配置失败（改了被清单覆盖的目标字节 ⇒ 真后端判 failed）。
+    每态的界面应然状态**只按后端报告字段 + 契约 headline 规则独立算出**再与真 DOM 比对，
+    不用 `st in SYNC_UI_STATES`（恒真）或 `should_green = st == "passed"`（取界面自身＝自证）。
+  · 替身只造**返回体**，界面判据、DOM、交互全部真实；替身不写账、不调模型。M 段的新页不挂替身。
 
 不杀 8787、不动用户浏览器：后端/vite 全走动态空闲端口（vite 端口默认 5199，被占即拒跑）。
 """
+import hashlib
 import json
 import os
 import shutil
@@ -41,11 +45,20 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 SHOT_DIR = os.environ.get(
     "V0924_SHOT_DIR", os.path.join(REPO, ".工作台", "verify", "sync-evidence-20260930", "ui")
 )
+# 后端/vite 日志同样是本脚本的输出：默认落在 SHOT_DIR 下，**不再**追加进历史证据目录
+# `.工作台/verify/sync-evidence-20260930/`（旧版把 ui-backend.log/ui-vite.log 以 "ab" 追加到那里，
+# 会污染历史现场；调用方也可用 V0924_LOG_DIR 显式改到别处）。
+LOG_DIR = os.environ.get("V0924_LOG_DIR", os.path.join(SHOT_DIR, "_backend-logs"))
 KEEP = os.environ.get("V0924_KEEP_TMP") == "1"
-VITE_PORT = int(os.environ.get("V0924_VITE_PORT", "5199"))
+# 0 ⇒ 每次动态取一个空闲端口（默认）；显式给 V0924_VITE_PORT 才固定端口并做占用检查。
+VITE_PORT = int(os.environ.get("V0924_VITE_PORT", "0"))
 FIX_A = "v0924-sync-a"
 FIX_B = "v0924-sync-b"
 HANG_MS = 0  # 占位（延迟用「挂起 + 事后回包」实现，不用 sleep 阻塞 Playwright 事件循环）
+# 界面 `data-sync-state` 的合法值集（SyncVerdict ∪ {loading,error,scan_error}，见
+# src/ui/components/SyncEvidenceStatus.tsx 的 SyncUiState）。真实链路联验用它判「没渲染成意外态」。
+SYNC_UI_STATES = {"not_configured", "missing", "passed", "failed", "stale",
+                  "needs_review", "invalid", "incomplete", "loading", "error", "scan_error"}
 
 passes = [0]
 fails = []
@@ -97,13 +110,32 @@ def write(path, text):
     return path
 
 
+# 本脚本只访问隔离的本机服务：全部 loopback 请求必须绕过系统 HTTP 代理。
+# 系统代理（HTTP_PROXY/HTTPS_PROXY）会把 127.0.0.1 的回环请求也劫走——实测经代理拿回 HTTP 502，
+# 而 no_proxy 是否在场由调用方环境决定，不能依赖。故用空 ProxyHandler 的局部 opener：只影响本脚本，
+# 不改用户代理设置（V09-24 修复：后端健康检查曾因代理劫持在 120s 等待后误判「未就绪」）。
+LOCAL_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _ensure_loopback_no_proxy():
+    """把 loopback 显式并入 NO_PROXY：后端/vite 子进程继承本进程环境，别让它们把本机流量交给系统代理。
+    只改本脚本进程的环境，不动用户 shell/系统代理设置。"""
+    hosts = ("localhost", "127.0.0.1", "::1")
+    for key in ("NO_PROXY", "no_proxy"):
+        parts = [p for p in os.environ.get(key, "").split(",") if p]
+        os.environ[key] = ",".join(parts + [h for h in hosts if h not in parts])
+
+
+_ensure_loopback_no_proxy()
+
+
 def http(url, method="GET", body=None, timeout=120):
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, method=method, data=data)
     if data is not None:
         req.add_header("content-type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with LOCAL_HTTP.open(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8")
             return resp.status, (json.loads(text) if text.strip().startswith(("{", "[")) else text)
     except urllib.error.HTTPError as e:
@@ -442,6 +474,115 @@ class Backend:
             pass
 
 
+# ══════════════ 真后端写口（隔离 TATAI_HOME 内）：登记真契约 / 投放证据 ══════════════
+# M 段要覆盖「真实未配置 / 真实配置失败 / 真实配置通过」三态，配置态必须由**真后端**产生，不能用替身。
+# 登记走唯一写服：从隔离 TATAI_HOME 的服务描述符取 host/port/token，POST 真写口。只碰隔离库与隔离项目。
+
+def _descriptor(home):
+    with open(os.path.join(home, "work-service.json"), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def work_post(home, path, body):
+    """带描述符 token 的本机写口 POST（只打隔离后端）。返回 (status, body)。"""
+    desc = _descriptor(home)
+    url = "http://%s:%d%s" % (desc["host"], desc["port"], path)
+    req = urllib.request.Request(url, method="POST", data=json.dumps(body).encode("utf-8"))
+    req.add_header("content-type", "application/json")
+    req.add_header("x-tatai-work-token", desc["token"])
+    try:
+        with LOCAL_HTTP.open(req, timeout=90) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(text)
+        except Exception:  # noqa: BLE001
+            return e.code, text
+
+
+def sha_file(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def contract_sha256(contract):
+    """契约内容地址：用**产品自己的** syncContractSha256（经 tsx 调真模块）算，不在脚本里另造一套。"""
+    fd, tmp = tempfile.mkstemp(suffix=".contract.json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(contract, f, ensure_ascii=False)
+        env = dict(os.environ, TATAI_CONTRACT_FILE=tmp)
+        proc = subprocess.run(
+            ["node", "--import", "tsx", "--input-type=module", "-e",
+             "import {validateSyncContract, syncContractSha256} from './src/server/work/syncContract.ts';"
+             "import fs from 'node:fs';"
+             "const c=validateSyncContract(JSON.parse(fs.readFileSync(process.env.TATAI_CONTRACT_FILE,'utf8')));"
+             "process.stdout.write(syncContractSha256(c));"],
+            cwd=REPO, env=env, capture_output=True, text=True,
+        )
+        sha = proc.stdout.strip()
+        if proc.returncode != 0 or len(sha) != 64:
+            raise RuntimeError("契约内容地址计算失败：rc=%s out=%r err=%r"
+                               % (proc.returncode, proc.stdout[-300:], proc.stderr[-300:]))
+        return sha
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def register_real_contract(home, project_id, contract, sha):
+    """经隔离后端唯一写口登记真契约（幂等键与产品 buildRegisterContractCommand 同形）。"""
+    cmd = {
+        "schema_version": 2,
+        "project_id": project_id,
+        "change_id": "change-m-real-ui",
+        "entity_id": "sync:%s" % contract["batch_id"],
+        "expected_revision": None,
+        "type": "sync.contract_registered",
+        "actor_id": "v0924-ui",
+        "role": "designer",
+        "idempotency_key": "sync-contract:%s:%s" % (contract["batch_id"], sha[:24]),
+        "payload": contract,
+    }
+    return work_post(home, "/api/work/command", cmd)
+
+
+def project_root_of(home, pid):
+    with open(os.path.join(home, "registry.json"), "r", encoding="utf-8") as f:
+        reg = json.load(f)
+    for p in reg.get("projects") or []:
+        if p.get("id") == pid:
+            return p.get("path")
+    return None
+
+
+# ── 独立预期：只按**后端报告字段 + 契约 headline 规则**算界面应然状态，**不读界面自己的 data-sync-state** ──
+# 与 src/ui/components/SyncEvidenceStatus.tsx 的 headlineStateOf/isGreen 同一份**契约**（不是同一个读数），
+# 用来消灭复审指出的自证：`st in SYNC_UI_STATES` 恒真、`should_green = st == "passed"` 取 UI 自身。
+
+def expected_headline(rep):
+    if rep.get("scan_error") is not None:
+        return "scan_error"
+    overall = rep.get("overall")
+    if overall not in ("passed", "not_configured"):
+        return overall
+    if (rep.get("collection") or {}).get("complete") is not True:
+        return "incomplete"
+    if not rep.get("configured") and overall == "not_configured":
+        return "not_configured"
+    if not rep.get("configured") or overall == "not_configured":
+        return "invalid"
+    return "passed"
+
+
+def expected_green(rep):
+    return (expected_headline(rep) == "passed" and rep.get("scan_error") is None
+            and (rep.get("collection") or {}).get("complete") is True)
+
+
 def start_vite(port, backend_port, log_path):
     env = dict(os.environ)
     env["TATAI_DEV_API_PORT"] = str(backend_port)
@@ -455,7 +596,7 @@ def start_vite(port, backend_port, log_path):
         if proc.poll() is not None:
             raise RuntimeError("vite 起不来（进程已退出，见 ui-vite.log）")
         try:
-            with urllib.request.urlopen("http://localhost:%d/" % port, timeout=5) as resp:
+            with LOCAL_HTTP.open("http://localhost:%d/" % port, timeout=5) as resp:
                 if resp.status == 200:
                     return proc
         except Exception:
@@ -540,17 +681,19 @@ def goto_project(page, base, pid, wait=1500):
 def launch_browser(p):
     """真浏览器：优先 Playwright 自带 chromium；本机未装（ms-playwright 空）时退回系统 Edge。
     本机实测 chromium 包未下载，而 Edge 是系统自带——两者都是真 Chromium 内核，不改变判据。"""
+    # 浏览器同样不该把 loopback 交给系统代理（与脚本其它回环请求同口径）。
+    args = ["--no-proxy-server", "--proxy-bypass-list=*"]
     chan = os.environ.get("V0924_BROWSER_CHANNEL", "")
     if chan:
-        return p.chromium.launch(headless=True, channel=chan), "channel=%s" % chan
+        return p.chromium.launch(headless=True, channel=chan, args=args), "channel=%s" % chan
     try:
-        return p.chromium.launch(headless=True), "bundled-chromium"
+        return p.chromium.launch(headless=True, args=args), "bundled-chromium"
     except Exception as e:  # noqa: BLE001
         info("自带 chromium 起不来（%s），退回系统 Edge" % str(e).splitlines()[0][:120])
-        return p.chromium.launch(headless=True, channel="msedge"), "channel=msedge"
+        return p.chromium.launch(headless=True, channel="msedge", args=args), "channel=msedge"
 
 
-def run_browser(vite_port, backend):
+def run_browser(vite_port, backend, home):
     base = "http://localhost:%d" % vite_port
     os.makedirs(SHOT_DIR, exist_ok=True)
 
@@ -825,8 +968,8 @@ def run_browser(vite_port, backend):
 
         # ── L 不加页签、不动既有导航 ──
         step["now"] = "L 不加大页签"
-        ok(page.locator("[data-main-nav] button").count() == 5,
-           "主导航仍是 5 页（实到 %d）" % page.locator("[data-main-nav] button").count())
+        ok(page.locator("[data-main-nav] button").count() == 6,
+           "主导航仍是 6 页（V09-62 新增「交付总览」后：交付总览 + 既有 5 页；实到 %d）" % page.locator("[data-main-nav] button").count())
         ok(page.locator("[data-aux-nav] button").count() == 2,
            "辅助入口仍是 2 项（实到 %d）" % page.locator("[data-aux-nav] button").count())
         ok(page.locator("[data-project-status-bar]").count() == 1,
@@ -939,23 +1082,103 @@ def run_browser(vite_port, backend):
         ok(toggle.get_attribute("aria-expanded") == "false",
            "收起后 aria-expanded 回到 false（%r）" % toggle.get_attribute("aria-expanded"))
 
-        # ── M 真实链路（不替身）：后端就绪后自动转 SKIP ──
-        step["now"] = "M 真实链路核对（不替身）"
+        # ── M 真实链路（不替身）：真后端读口 + 真界面端到端同源，覆盖「未配置 / 配置失败 / 配置通过」三态 ──
+        step["now"] = "M 真实链路核对（不替身，三态）"
         # 用**新开的一页**做真实链路：page.route 是每页注册的，新页不带替身，口径干净
         # （不用 page.unroute —— 实测它在这里没能摘掉替身，会拿旧替身读数冒充真实链路）。
+        # 复审修订（2026-10-08）：预期状态**只**由真后端报告字段 + 契约 headline 规则独立算出，
+        # 不再用 `st in SYNC_UI_STATES`（恒真）或 `should_green = st == "passed"`（取 UI 自身＝自证）；
+        # 配置两态由**真写口登记真契约 + 真证据**产生，然后逐态核对界面与独立预期同值。
         _s, health = backend.api("/health")
-        status, _body = backend.api("/api/projects/%s/sync-status" % FIX_A)
-        if status == 200:
-            skip("真实后端读口已实现（HTTP %d）：本脚本的真实链路核对交由 V09-25 联调，此处不重复断言" % status)
+        real = browser.new_context(viewport={"width": 1680, "height": 1000}).new_page()
+        open_project(real, base, FIX_A, wait=2500)
+        proj_a_root = project_root_of(home, FIX_A)
+
+        def real_report():
+            st, body = backend.api("/api/projects/%s/sync-status" % FIX_A)
+            rep = body.get("sync") if isinstance(body, dict) else None
+            return st, rep
+
+        def assert_real_case(tag, expect_overall, expect_configured, shot):
+            """真后端读口 → **独立**算预期（后端报告字段 + 契约 headline 规则）→ 真界面同值才判过。"""
+            status, rep = real_report()
+            ok(status == 200 and isinstance(rep, dict),
+               "M(%s)：真后端读口可达且给报告（HTTP %r，形状=%s）"
+               % (tag, status, "dict" if isinstance(rep, dict) else type(rep).__name__))
+            if not (status == 200 and isinstance(rep, dict)):
+                return
+            ok(rep.get("overall") == expect_overall and bool(rep.get("configured")) == expect_configured,
+               "M(%s)：真后端**确实**处于该态（configured=%r / overall=%r，期望 %s/%s）"
+               % (tag, rep.get("configured"), rep.get("overall"), expect_configured, expect_overall))
+            exp_state = expected_headline(rep)
+            exp_green = expected_green(rep)
+            real.locator("[data-sync-refresh]").click()
+            deadline = time.time() + 15
+            while time.time() < deadline and sync_attr(real, "data-sync-state") != exp_state:
+                real.wait_for_timeout(200)
+            ui_state = sync_attr(real, "data-sync-state")
+            ui_green = sync_attr(real, "data-sync-green")
+            ok(ui_state in SYNC_UI_STATES,
+               "M(%s)：真界面状态键落在契约值集内（state=%r）" % (tag, ui_state))
+            ok(ui_state == exp_state,
+               "M(%s)：真界面状态 == 按后端报告**独立**算出的契约状态（UI=%r，独立预期=%r；"
+               "读口 overall=%r/scan_error=%r/collection=%r）"
+               % (tag, ui_state, exp_state, rep.get("overall"), rep.get("scan_error"), rep.get("collection")))
+            ok(ui_green == ("1" if exp_green else "0"),
+               "M(%s)：真界面显绿 == 按后端报告**独立**算（UI=%r，独立预期=%r）"
+               % (tag, ui_green, "1" if exp_green else "0"))
+            coll = "complete" if (rep.get("collection") or {}).get("complete") is True else "incomplete"
+            ok(sync_attr(real, "data-sync-configured") == ("1" if rep.get("configured") else "0")
+               and sync_attr(real, "data-sync-batches") == str(len(rep.get("batches") or []))
+               and sync_attr(real, "data-sync-collection") == coll,
+               "M(%s)：真界面 configured/batches/collection 与真读口逐字段一致（%r/%s/%s）"
+               % (tag, sync_attr(real, "data-sync-configured"), sync_attr(real, "data-sync-batches"),
+                  sync_attr(real, "data-sync-collection")))
+            real.screenshot(path=os.path.join(SHOT_DIR, shot))
+
+        # M1 真实未配置：夹具项目尚无契约（真后端 configured=false / overall=not_configured）
+        assert_real_case("M1 未配置", "not_configured", False, "11-real-not-configured.png")
+
+        # M2 真实配置通过：经真写口登记真契约 + 投放真证据（file_hash 目标字节一致 ⇒ 真后端判 passed）
+        if proj_a_root is None:
+            ok(False, "M2：从隔离注册表取不到夹具项目根，无法登记真契约")
         else:
-            real = browser.new_context(viewport={"width": 1680, "height": 1000}).new_page()
-            open_project(real, base, FIX_A, wait=2500)
-            st = sync_attr(real, "data-sync-state")
-            ok(st == "error", "真实后端**尚无**该读口（HTTP %r）⇒ 界面显示读取失败而非假装未配置（state=%r）"
-               % (status, st))
-            ok(sync_attr(real, "data-sync-green") == "0", "真实 404 下**不显绿**")
-            real.screenshot(path=os.path.join(SHOT_DIR, "11-real-404-not-green.png"))
-            real.close()
+            batch = "v0924-real-1"
+            design_rel = ".工作台/design.md"
+            target_rel = "src/index.ts"
+            design_sha = sha_file(os.path.join(proj_a_root, *design_rel.split("/")))
+            target_sha = sha_file(os.path.join(proj_a_root, *target_rel.split("/")))
+            contract = {
+                "schema_version": 1, "batch_id": batch, "project_id": FIX_A,
+                "title": "V09-24 真实链路联验（隔离夹具）",
+                "sources": [{"path": design_rel, "sha256": design_sha}],
+                "items": [{"id": "i-code", "label": "夹具源码字节与登记一致", "required": True,
+                           "check": {"type": "file_hash", "path": target_rel, "sha256": target_sha}}],
+                "blocks_entry": True,
+            }
+            c_sha = contract_sha256(contract)
+            cst, cbody = register_real_contract(home, FIX_A, contract, c_sha)
+            ok(cst == 200 and isinstance(cbody, dict) and cbody.get("ok") is True,
+               "M2：经隔离后端唯一写口登记真契约（HTTP %r，seq=%s）"
+               % (cst, (cbody or {}).get("seq") if isinstance(cbody, dict) else None))
+            ev_dir = os.path.join(proj_a_root, ".工作台", "work", "sync-inbox")
+            os.makedirs(ev_dir, exist_ok=True)
+            evidence = {
+                "schema_version": 1, "batch_id": batch, "project_id": FIX_A,
+                "contract_sha256": c_sha, "completed": True,
+                "items": [{"id": "i-code", "result": "passed",
+                           "artifacts": [{"path": design_rel, "sha256": design_sha}]}],
+            }
+            with open(os.path.join(ev_dir, "%s.evidence.json" % batch), "w", encoding="utf-8") as f:
+                json.dump(evidence, f, ensure_ascii=False, indent=2)
+            assert_real_case("M2 配置通过", "passed", True, "11-real-passed.png")
+
+            # M3 真实配置失败：改了被清单覆盖的目标字节 ⇒ 真后端按当前实际目标判 failed（不是换个名字的通过）
+            with open(os.path.join(proj_a_root, *target_rel.split("/")), "a", encoding="utf-8", newline="") as f:
+                f.write("// V09-24 UI 联验：目标字节已变（应当被判失败）\n")
+            assert_real_case("M3 配置失败", "failed", True, "11-real-failed.png")
+
+        real.close()
         info("后端 health=%r" % (health,))
 
         browser.close()
@@ -968,23 +1191,23 @@ def main():
     proj_a = make_fixture(tmp, FIX_A)
     proj_b = make_fixture(tmp, FIX_B)
     make_registry(home, [(FIX_A, "V09-24 同步夹具 A", proj_a), (FIX_B, "V09-24 同步夹具 B", proj_b)])
-    log_dir = os.path.join(REPO, ".工作台", "verify", "sync-evidence-20260930")
-    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
     backend_port = free_port()
+    vite_port = VITE_PORT or free_port()
     backend = None
     vite = None
     try:
-        if port_busy(VITE_PORT):
-            print("[ui] FAIL vite %d 已被占用：本脚本不抢端口（先停掉占用者或用 V0924_VITE_PORT 换端口）" % VITE_PORT)
+        if VITE_PORT and port_busy(vite_port):
+            print("[ui] FAIL vite %d 已被占用：本脚本不抢端口（先停掉占用者或用 V0924_VITE_PORT 换端口）" % vite_port)
             sys.exit(1)
         step["now"] = "起后端"
-        backend = Backend(home, backend_port, os.path.join(log_dir, "ui-backend.log"))
+        backend = Backend(home, backend_port, os.path.join(LOG_DIR, "ui-backend.log"))
         backend.wait_health()
         info("后端就绪：127.0.0.1:%d（TATAI_HOME=%s）" % (backend_port, home))
         step["now"] = "起 vite"
-        vite = start_vite(VITE_PORT, backend_port, os.path.join(log_dir, "ui-vite.log"))
-        info("vite 就绪：http://localhost:%d" % VITE_PORT)
-        run_browser(VITE_PORT, backend)
+        vite = start_vite(vite_port, backend_port, os.path.join(LOG_DIR, "ui-vite.log"))
+        info("vite 就绪：http://localhost:%d" % vite_port)
+        run_browser(vite_port, backend, home)
     except Exception as e:  # noqa: BLE001
         ok(False, "运行期出错（%s 阶段）：%s" % (step["now"], e))
     finally:

@@ -42,6 +42,7 @@ import {
   type FindingSeverity,
   type FindingState,
   type RevisionKind,
+  findingIsOpen,
 } from "./evidence";
 import {
   auditEntityId,
@@ -66,7 +67,9 @@ import {
   buildSectionIndex,
   readRevisionSnapshotText,
   revisionSnapshotExists,
+  planContentSnapshotIndex,
 } from "./documents";
+import { withDerivationScope } from "./derivationScope";
 import { importTaskDefinitions, parseIntegrationRequirements, type TaskDefinition } from "./plan";
 import { taskDefinitionHash } from "../../shared/planCardHash";
 import { resolveDesignRef, type DesignSectionLike } from "../../shared/designRef";
@@ -79,6 +82,17 @@ import {
   type SourceManifestVerdict,
 } from "./sourceEvidence";
 import type { EvidenceFacts } from "../../ui/arch/provenance";
+
+/**
+ * 逐对象「明确阻塞」的缺陷判据（canonical `blockingProblem` 的缺陷项，**原位抽取、语义完全等价**）：
+ * 未收口 ∧ 非用户接受风险 ∧（必须拦截 ∨ 未证实/风险未排除）。
+ * 纯谓词、无副作用；交付总览的全局阻断缺陷**复用同一判据**，不另造更宽/更窄的口径（§3.16／§5.5）。
+ */
+export function findingBlocksObject(
+  f: Pick<FindingState, "status" | "must_block" | "unverified">,
+): boolean {
+  return findingIsOpen(f) && f.status !== "accepted_risk" && (f.must_block || f.unverified);
+}
 
 // ── 六态与优先级（§4.2 表 + 其后一段的优先级口径） ──
 
@@ -169,14 +183,16 @@ export interface SupersededEvidence {
  * （DESIGN.md §4.2 可解释性 + §3.2 结论可追溯）。**它是事实的摘录，不是新的事实源。**
  */
 export interface EvidenceBasis {
+  pending?: import("./auditCorrection").PendingHuman;
+  correction_refs?: string[];
   check_id: string;
   label: string;
   /** 记录来自哪条事件实体（`check:<id>` / `audit:<id>`）；测试直接构造的检查为 null */
   record_ref: string | null;
   /** 记录里声明的结果（原始值，未复核） */
-  result: "passed" | "failed";
+  result: "passed" | "failed" | "not_checked";
   /** 复核后的有效性（§5.6 ＋ 附录 E.3.2 分档：绑定不符/退出码矛盾 → stale/unknown） */
-  effective: "passed" | "failed" | "stale" | "unknown";
+  effective: "passed" | "failed" | "stale" | "unknown" | "not_checked";
   /** 被测版本：这条记录绑定的源修订 */
   bound_revision: { revision_kind: RevisionKind; revision: string };
   /** 复核基准：该 kind 的当前源修订（拿不到 → null，按 unknown 处理） */
@@ -295,9 +311,13 @@ export interface RequirementInput {
 }
 
 export interface CheckInput {
+  human_gate?: import("./audit").AcceptanceRecord;
+  pending?: import("./auditCorrection").PendingHuman;
+  correction_refs?: string[];
+  correction_seq?: number;
   check_id: string;
   object_id: string;
-  result: "passed" | "failed";
+  result: "passed" | "failed" | "not_checked";
   actor_id: string;
   role: string;
   /** 记录时声明的独立性；投影会复核，作者自报一律降级（见 `effectiveIndependence`） */
@@ -699,7 +719,7 @@ export function bindingStale(binding: EvidenceBinding, ctx: BindingStaleContext)
 
 export interface CheckEffectiveness {
   check_id: string;
-  effective: "passed" | "failed" | "stale" | "unknown";
+  effective: "passed" | "failed" | "stale" | "unknown" | "not_checked";
   /** 为什么（人话，直接进 reasons/missing） */
   why: string;
   /** 旧结论（转待验证时保留） */
@@ -762,6 +782,9 @@ export function checkEffectiveness(
     evidence_sha256: check.evidence_sha256,
     independence_notes: notes,
   };
+  if (check.result === "not_checked") {
+    return { ...base, effective: "not_checked", why: check.pending ? `尚未检查：${check.pending.reason}；责任 ${check.pending.role}；依据 ${check.pending.basis}` : "尚未检查：原记录没有合法的明确结果", superseded: null };
+  }
   if (check.result === "passed") {
     // V09-01：写侧与读侧同一份分档判据（E.3.2 第一/二档 ＋ E.3.3 绑定相符）
     const verdict = gateClaimedPass({
@@ -817,6 +840,12 @@ export function checkEffectiveness(
     return { ...base, effective: "unknown", why: `检查「${check.check_id}」${v.reason}`, superseded: null };
   }
   if (now === null) {
+    // B3+B4 收口 D2（共享读模型层）：**失败结论不因「当前修订拿不到」被弱化成 unknown**——
+    // 失败不随源漂移失效、独立失败永远压住作者通过（§5.6／附录 E.3.4）。这条分支本是为
+    // 「通过不得默认通过」写的；`result === "failed"` 照旧算失败，不沿用「拿不到当前值 ⇒ unknown」。
+    if (check.result === "failed") {
+      return { ...base, effective: "failed", why: "", superseded: null };
+    }
     return {
       ...base,
       effective: "unknown",
@@ -1299,6 +1328,8 @@ function projectOne(
       label: req.label,
       record_ref: check.record_ref ?? null,
       result: check.result,
+      ...(check.pending ? { pending: check.pending } : {}),
+      ...(check.correction_refs?.length ? { correction_refs: check.correction_refs } : {}),
       effective: eff.effective,
       bound_revision: { revision_kind: check.binding.revision_kind, revision: check.binding.revision },
       current_revision: revisionOf(revisions, check.binding.revision_kind),
@@ -1380,7 +1411,7 @@ function projectOne(
   const acceptedLimitFinding = openFindings.some((f) => f.status === "accepted_risk");
   const blockingProblem =
     execution === "blocked" ||
-    openFindings.some((f) => (f.must_block || f.unverified) && f.status !== "accepted_risk") ||
+    openFindings.some((f) => findingBlocksObject(f)) ||
     missing.some((m) => m.why.includes("已确认失败"));
 
   const mapping = mappingOf(resolved);
@@ -1780,9 +1811,27 @@ const noBindingSegments = (): BindingSegmentFacts => ({
 const snapshotSegmentsCache = new Map<string, BindingSnapshotSegments>();
 
 /**
+ * plan 绑定（内容哈希）→ **实际命中的不可变对象名**（进程内；用于"这份快照还在不在"的廉价复查）。
+ *
+ * 为什么必须记住对象名而不是只记内容哈希：施工图不可变对象的**主名是定义哈希**（§2.6），
+ * 同一定义下的另一份正文才叫内容哈希（§2.9）。`binding.revision` 是内容哈希，拿它当文件名去
+ * `existsSync` 只有在"这份正文是该定义下的首份"时才对得上；否则文件名其实是定义哈希。
+ * 记下解析出来的对象名，复查才查的是**真正读过的那份**（不是另一个候选名）。
+ * 键＝`${projectId}\u0000plan:${内容哈希}`（同一内容的对象名虽是确定的，但"哪个候选名在盘上"
+ * 是各项目自己的事实，跨项目复用会把别人的对象当成自己的）。
+ */
+const planSnapshotObjectKeyCache = new Map<string, string>();
+
+/**
  * 从审计记录里收集 plan/design 绑定，读它们对应的不可变快照并**预解析**成分段基准
  *（plan → 卡哈希表；design → 章节表）。键＝`${kind}:${revision}`；读不到/解析不了的文件
  * **不放键**（复核据此回退整份比对，不静默放行）。每个不同修订只解析一次（进程内命中缓存）。
+ *
+ * plan 绑定绑的是**内容哈希**，而快照对象主名是**定义哈希**：这里经
+ * `documents.planContentSnapshotIndex`（内容哈希 → 对象候选名 + 核内容哈希，口径与
+ * `obligations.planSnapshotReader` **同一份**）解析后再读——否则旧修订（盘上只有定义名文件）
+ * 直读成 null、回退整份比对，把本可分段救回的「本卡没变」误判 stale（V09-45…50 真机假 stale）。
+ * 设计书对象名本就是内容哈希，直读即可（`revisionObjectCandidates`：设计没有第二档）。
  */
 function bindingSnapshotsOf(
   projectId: string,
@@ -1790,13 +1839,47 @@ function bindingSnapshotsOf(
   audit: AuditRecords,
 ): Map<string, BindingSnapshotSegments> {
   const out = new Map<string, BindingSnapshotSegments>();
+  let planIndex: ReturnType<typeof planContentSnapshotIndex> | null = null;
+  const planIndexOf = (): ReturnType<typeof planContentSnapshotIndex> =>
+    (planIndex ??= planContentSnapshotIndex(projectId, dataDir));
   for (const c of checksFromAudit(audit)) {
     const kind = c.binding.revision_kind;
     if ((kind !== "plan" && kind !== "design") || c.binding.revision === "") continue;
     const key = `${kind}:${c.binding.revision}`;
     if (out.has(key)) continue;
-    // 先廉价确认快照仍在盘上：缓存过的也要每次确认，否则"快照被删"不会回退整份比对（宁严不松）。
-    if (!revisionSnapshotExists(projectId, kind, c.binding.revision, dataDir)) {
+
+    if (kind === "plan") {
+      // 记忆按**项目**分开：对象名虽是内容的确定函数，但"哪个候选名在盘上"是项目各自的事实
+      //（同定义哈希下可能另一份正文占着主名），跨项目复用会把别人的对象当成自己的。
+      const memoKey = `${projectId}\u0000${key}`;
+      // 廉价复查：缓存过的也要每次确认**真正读过的那份**快照还在盘上，否则"快照被删"不会回退整份比对（宁严不松）。
+      const knownKey = planSnapshotObjectKeyCache.get(memoKey);
+      if (knownKey !== undefined) {
+        if (revisionSnapshotExists(projectId, "plan", knownKey, dataDir)) {
+          const hit = snapshotSegmentsCache.get(key);
+          if (hit !== undefined) {
+            out.set(key, hit);
+            continue;
+          }
+        }
+        // 盘上没了 / 段缓存丢了：清掉记忆，按下面重新解析
+        planSnapshotObjectKeyCache.delete(memoKey);
+        snapshotSegmentsCache.delete(key);
+      }
+      const read = planIndexOf().read(c.binding.revision);
+      if (read === null) {
+        snapshotSegmentsCache.delete(key);
+        continue;
+      }
+      planSnapshotObjectKeyCache.set(memoKey, read.object_key);
+      const parsed: BindingSnapshotSegments = { cards: planCardHashesOf(read.text) };
+      snapshotSegmentsCache.set(key, parsed);
+      out.set(key, parsed);
+      continue;
+    }
+
+    // design：对象名就是内容哈希，直读（读不到就回退整份比对）
+    if (!revisionSnapshotExists(projectId, "design", c.binding.revision, dataDir)) {
       snapshotSegmentsCache.delete(key);
       continue;
     }
@@ -1805,10 +1888,9 @@ function bindingSnapshotsOf(
       out.set(key, hit);
       continue;
     }
-    const text = readRevisionSnapshotText(projectId, kind, c.binding.revision, dataDir);
+    const text = readRevisionSnapshotText(projectId, "design", c.binding.revision, dataDir);
     if (text === null) continue;
-    const parsed: BindingSnapshotSegments =
-      kind === "plan" ? { cards: planCardHashesOf(text) } : { sections: designSectionsOf(text) };
+    const parsed: BindingSnapshotSegments = { sections: designSectionsOf(text) };
     snapshotSegmentsCache.set(key, parsed);
     out.set(key, parsed);
   }
@@ -1869,6 +1951,17 @@ export function eventsOfSnapshot(
 
 /** 读现场事实（事件 + 图纸定义 + 生效基线）；读不出来如实标 `unreadable`，不假装是空状态 */
 export function collectProjectFacts(
+  projectId: string,
+  dataDir: string,
+  opts: { code_revision?: string | null; events?: EventsSnapshot } = {},
+): ProjectFacts {
+  // 2026-10-07 运行时阻塞修复：整段跑在一次派生的只读复用作用域里——图纸源读取与解析、
+  // 不可变修订对象读+核哈希、源清单逐文件复核、git 忽略探针在同一次派生内只算一次（跨请求不缓存）。
+  // 证据：E/runtime-profile-only/REPORT.md（独立 CPU profile）、E/runtime-final/COORDINATOR-HYPOTHESES.md。
+  return withDerivationScope(() => collectProjectFactsInScope(projectId, dataDir, opts));
+}
+
+function collectProjectFactsInScope(
   projectId: string,
   dataDir: string,
   opts: { code_revision?: string | null; events?: EventsSnapshot } = {},
@@ -1944,12 +2037,42 @@ export function collectProjectFacts(
 }
 
 /**
+ * 用**指定版本**的施工图快照重建 `ProjectFacts` 里属于施工图的部分（定义 / 集成检查要求 /
+ * 修订 / 分段基准的当前卡表）。
+ *
+ * 为什么必须重建而不是"换一份 text 变量"：读取历史/基线版本时，任务定义与集成检查要求必须来自
+ * **那一版**施工图；否则历史读数会拿当前的卡定义与当前集成要求判绿（借当前绿，§2.9 不许混版）。
+ * 事实里的**事件侧**（审计/任务状态/缺陷）不在这里换——它们由调用方按所选版本的时间窗**裁事件**
+ * 后再取（见 `featureLedger.ts`），两者合起来才是"该版本的完整事实"。
+ *
+ * `facts.baseline` 不动（生效基线由调用方按所选版本决定后另行传入 `withIntegrationRequirementsInForce`）。
+ */
+export function withPlanSnapshot(
+  facts: ProjectFacts,
+  args: { plan_text: string; plan_revision: string | null; plan_definition: string | null },
+): ProjectFacts {
+  const definitions = importTaskDefinitions(args.plan_text).definitions;
+  const integration = integrationRequirementsFromPlan(args.plan_text, args.plan_revision);
+  return {
+    ...facts,
+    definitions,
+    revisions: { ...facts.revisions, plan: args.plan_revision, plan_definition: args.plan_definition },
+    integration_requirements: withIntegrationRequirementsInForce(integration, facts.baseline),
+    binding_segments: {
+      ...facts.binding_segments,
+      // 当前卡表换成所选版本的：分段失效复核据此按**那一版**的卡哈希判，而不是拿今日图纸冒充
+      current_plan_cards: planCardHashesOf(args.plan_text),
+      design_refs_of: new Map(definitions.map((d) => [d.task_id, d.design_refs])),
+    },
+  };
+}
+
+/**
  * 施工图 → 集成检查要求（补修 C）。
  * 只做**读取与归组**，生效判据（有效基线）留给调用方——本函数拿不到基线上下文。
  * 结构问题一律进 `issues`（读侧据此"不据此判绿"，绝不静默当"没有要求"）。
  */
-export function integrationRequirementsFromPlan(
-  planText: string,
+export function integrationRequirementsFromPlan(  planText: string,
   planRevision: string | null,
 ): ProjectIntegrationRequirements {
   const parsed = parseIntegrationRequirements(planText);
@@ -2283,7 +2406,10 @@ export function requiredChecksFromDefinitions(
     const list: { check_id: string; label: string }[] = [];
     if (def.acceptance != null) {
       def.acceptance.checks.forEach((c, i) => {
-        list.push({ check_id: `${def.task_id}::check:${i}`, label: c.text });
+        // B2/V09-52（DESIGN.md §2.5.1）：检查文本起始的稳定键 `chk-*`（允许 `**`/`__` 加粗包装）作 check_id；
+        // 无前缀的旧检查保持**位置型** id（既有项目行为逐字不变）。稳定键的定义指纹与显式映射见 obligations.ts。
+        const stable = /^\s*(?:\*\*|__)?\s*(chk-[A-Za-z0-9][A-Za-z0-9._-]*)/.exec(c.text)?.[1] ?? null;
+        list.push({ check_id: stable ?? `${def.task_id}::check:${i}`, label: c.text });
       });
     }
     if (def.evidence_requirement != null && def.evidence_requirement !== "") {
@@ -2397,9 +2523,17 @@ export function projectFromFacts(
     graph_revision?: { graph: string; current: string } | null;
     facts_unreadable?: string | null;
     code_revision?: string | null;
+    /**
+     * 事件账本快照（V09-47 写边界）：给定时**只折叠这份快照**（来源 `work_dir` 必须与本次一致，
+     * 不一致由 `eventsOfSnapshot` 回退现读）。锁内写边界用它，保证依赖重查与锁内 `loadEvents` 同源。
+     */
+    events?: EventsSnapshot;
   } = {},
 ): { facts: ProjectFacts; projection: StatusProjectionSet } {
-  const facts = collectProjectFacts(projectId, dataDir, { code_revision: opts.code_revision ?? null });
+  const facts = collectProjectFacts(projectId, dataDir, {
+    code_revision: opts.code_revision ?? null,
+    ...(opts.events === undefined ? {} : { events: opts.events }),
+  });
   const objects = objectsFromFacts(projectId, dataDir, facts, opts);
   // V09-29（契约 F4）：带源清单现读复核的检查输入（其余照旧）——真实读路径与 `entry.ts` 同口径
   const checks = checksFromFacts(facts);
@@ -2523,8 +2657,12 @@ export function checksFromAudit(records: AuditRecords): CheckInput[] {
         check_id: c.check_id,
         object_id: au.task_id ?? "",
         result: c.result,
+        pending: c.pending,
+        correction_seq: c.correction_seq,
+        human_gate: Object.values(records.acceptances).filter(a=>a.task_id===au.task_id).sort((a,b)=>(b.seq??0)-(a.seq??0))[0],
+        correction_refs: [...(au.correction_refs ?? []), ...(c.correction_refs ?? [])],
         actor_id: au.auditor,
-        role: au.auditor_role,
+        role: au.human_recorded ? "user" : au.auditor_role === "user" ? "auditor" : au.auditor_role,
         independence: "independent",
         binding: au.binding ?? { revision_kind: "plan", revision: "" },
         evidence_sha256: c.evidence_sha256,
@@ -2744,6 +2882,19 @@ export function pickCheckRecords(
     ) {
       out.set(c.check_id, c);
     }
+  }
+  // 人验未做不能被旧pass或作者新自检覆盖；真实后续非作者检查有出口，仍须当前证据有效。
+  for (const pending of checks.filter(c => c.result === "not_checked" && c.pending && (c.correction_seq ?? c.ledger_seq) !== undefined)) {
+    const pendingSeq = pending.correction_seq ?? pending.ledger_seq!;
+    const selected=out.get(pending.check_id);
+    if (!selected || selected.object_id !== pending.object_id || selected.result === "failed") continue;
+    const gate=selected.human_gate;
+    const gateSatisfied=pending.pending?.role!=="user" || (gate?.decision==="accept" && (gate.seq??0)>pendingSeq &&
+      gate.task_id===pending.object_id && gate.baseline.plan_revision!=null && gate.baseline.design_revision!=null &&
+      gate.baseline.plan_revision===revisions?.plan && gate.baseline.design_revision===revisions?.design);
+    const laterPass=gateSatisfied && selected.result === "passed" && selected.role === "user" && (selected.ledger_seq ?? 0)>pendingSeq &&
+      pickIndependenceOf(selected,authorIds)==="independent" && revisions !== undefined && checkEffectiveness(selected,revisions,authorIds??new Set(),segments).effective==="passed";
+    if(!laterPass && (selected.correction_seq??0)<=pendingSeq) out.set(pending.check_id,pending);
   }
   // 展示追溯：最终上屏的记录若经显式复测闭环解除了失败，把被解除的 record_id 带出
   // （克隆标注，历史记录与事件一字不改；按 object_id+check_id+record_ref 三重命中，不跨界点名）。

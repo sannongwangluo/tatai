@@ -10,7 +10,7 @@ why 必须跑真浏览器（PLAN.md V06-08 检查项 3）："实际切换三个�
 来源不误合并、采纳未实现不显示完工"——这些只能在实际 DOM 与真实 HTTP 上验，渲染函数级断言不算。
 
 三条检查项逐条落到断言组（组号与 PLAN 卡面一一对应）：
-  ① 主导航 = 项目图/设计书/施工图/聊天/实况与验收；终端移出用户主导航（维护诊断保留）；
+  ① 主导航 = 交付总览/项目图/设计书/施工图/聊天/实况与验收（V09-62 起新增「交付总览」为默认入口）；终端移出用户主导航（维护诊断保留）；
      不加"下一步用什么工具/模型/档位"卡。
   ② 项目级草稿/选中/滚动隔离；待议可提出/采纳/驳回/被替代（带理由与关联修订/任务）且只追加
      decisions.jsonl；前端只给项目自己登记过的 http(s) 场景当链接；纯后端给可读场景。
@@ -40,13 +40,51 @@ import urllib.request
 from playwright.sync_api import sync_playwright
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-SHOT_DIR = os.path.join(REPO, ".工作台", "verify", "v06-08")
+# 输出目录**可配置、兼容默认**：不设 = 原来的 `.工作台/verify/v06-08`（历史产物照旧），
+# 独立复验/返工跑时指向私有唯一目录，避免覆盖历史 log/截图（同 `verify-v06-08-f-ui.py` 的 V0608F_SHOT_DIR）。
+SHOT_DIR = os.environ.get("V0608_SHOT_DIR") or os.path.join(REPO, ".工作台", "verify", "v06-08")
 A = "v0608ui-a"
 B = "v0608ui-b"
 SELF = "v0608ui-self"
 KEEP = os.environ.get("V0608_KEEP_TMP") == "1"
 
-MAIN_NAV = ["项目图", "设计书", "施工图", "聊天", "实况与验收"]
+# 本脚本只访问隔离的本机服务（后端/vite 都在 127.0.0.1）：回环请求必须绕过系统 HTTP 代理，
+# 而 no_proxy 是否在场由调用方环境决定、不能依赖。故把 loopback 显式并入 NO_PROXY——只改本进程
+# 环境（后端子进程与 vite 子进程都会继承），不动用户的 shell/系统代理设置。
+def _ensure_loopback_no_proxy():
+    hosts = ("localhost", "127.0.0.1", "::1")
+    for key in ("NO_PROXY", "no_proxy"):
+        parts = [p for p in os.environ.get(key, "").split(",") if p]
+        os.environ[key] = ",".join(parts + [h for h in hosts if h not in parts])
+
+
+_ensure_loopback_no_proxy()
+
+
+def launch_browser(p, args=None):
+    """起**系统已装**的 Chromium 内核浏览器（Edge）；不触发 Playwright 浏览器下载。
+
+    本机 Playwright 自带 chromium 未下载时，`p.chromium.launch()` 会尝试下载（本卡禁止）。
+    这里优先用系统 Edge（可经 TATAI_UI_BROWSER / TATAI_EDGE_PATH 指定），并显式直连、不走代理；
+    两处都不可用时才回落 Playwright 自带 chromium（保留原行为作最后兜底）。"""
+    argv = list(args or []) + ["--no-proxy-server", "--proxy-server=direct://", "--proxy-bypass-list=*"]
+    env_bin = os.environ.get("TATAI_UI_BROWSER", "").strip() or os.environ.get("TATAI_EDGE_PATH", "").strip()
+    candidates = ([env_bin] if env_bin else []) + [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            info("浏览器 executable_path=%s" % cand)
+            return p.chromium.launch(headless=True, executable_path=cand, args=argv)
+    try:
+        info("浏览器 channel=msedge（系统已装 Edge，不下载）")
+        return p.chromium.launch(headless=True, channel="msedge", args=argv)
+    except Exception as e:  # noqa: BLE001
+        info("msedge 起不来（%s），退回 Playwright chromium" % str(e).splitlines()[0][:120])
+    return p.chromium.launch(headless=True, args=argv)
+
+MAIN_NAV = ["交付总览", "项目图", "设计书", "施工图", "聊天", "实况与验收"]
 APPENDIX_B = "## 附录 B：待议记录"
 
 fails = []
@@ -225,6 +263,34 @@ def put_evidence(root, content, summary, kind="acceptance"):
     return sha
 
 
+def store_evidence(backend, project, *, kind, content, summary, binding,
+                   source_manifest=None, created_by="fixture", role="agent", source_ref=None):
+    """经**唯一写服务宿主**的真实 HTTP 写口落一份证据正文（内容寻址、读时复核哈希）。
+
+    与 `put_evidence()` 的区别：`put_evidence()` 是测试自己按格式往盘上写文件（夹具用），
+    **会绕过唯一写者**；涉及"源清单载体/服务端现读指纹/正式引用"的验收必须走这里——
+    指纹由服务端现读算、正文由宿主落盘，测试不自己造结论、也不裸写。返回宿主回执 evidence 字典。
+    """
+    body = {
+        "project_id": project,
+        "kind": kind,
+        "content": content,
+        "summary": summary,
+        "created_by": created_by,
+        "role": role,
+        "binding": binding,
+        "source_ref": source_ref,
+    }
+    if source_manifest is not None:
+        body["source_manifest"] = source_manifest
+    status, resp = backend.api(
+        "/api/work/reporting/evidence", "POST", body, headers={"x-tatai-work-token": backend.work_token()}
+    )
+    if status != 200 or not isinstance(resp, dict) or "evidence" not in resp:
+        raise RuntimeError(f"宿主证据写口失败 HTTP {status}：{str(resp)[:300]}")
+    return resp["evidence"]
+
+
 # ══════════════════════════════ 后端 ══════════════════════════════
 
 class Backend:
@@ -258,8 +324,9 @@ class Backend:
         return body
 
     def wait_health(self, timeout=60):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        # 单调钟：墙钟前跳不该让"后端就绪"判定提前超时（同 wait_revision 的 2026-10-08 修法）
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             if self.proc.poll() is not None:
                 raise RuntimeError("后端进程退出，日志见 " + str(self.proc.args))
             try:
@@ -279,9 +346,13 @@ class Backend:
             pass
 
 
-def start_vite(port, backend_port, log_path):
+def start_vite(port, backend_port, log_path, cache_dir=None):
     env = dict(os.environ)
     env["TATAI_DEV_API_PORT"] = str(backend_port)
+    if cache_dir:
+        # 并发跑验证脚本会与真实环境的 node_modules/.vite 打架：把 vite 缓存指到隔离目录
+        # （vite.config.ts 认 TATAI_VITE_CACHE_DIR；缺省不设 = 维持原有行为）
+        env["TATAI_VITE_CACHE_DIR"] = cache_dir
     proc = subprocess.Popen(
         ["node", os.path.join("node_modules", "vite", "bin", "vite.js"), "dev", "--port", str(port), "--strictPort"],
         cwd=REPO,
@@ -289,8 +360,8 @@ def start_vite(port, backend_port, log_path):
         stdout=open(log_path, "ab"),
         stderr=subprocess.STDOUT,
     )
-    deadline = time.time() + 120
-    while time.time() < deadline:
+    deadline = time.monotonic() + 120  # 单调钟：墙钟前跳不该让 vite 就绪判定提前超时
+    while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise RuntimeError("vite 起不来（进程已退出）")
         try:
@@ -338,14 +409,40 @@ def seed_project_facts(backend, pid):
 
 
 def seed_states(backend, pid, plan):
-    """T-1 结果已提交（带证据）、T-2 执行中、T-3 就绪。"""
+    """T-1 结果已提交（带证据、经真实认领）、T-2 执行中、T-3 就绪。
+
+    2026-10-08 夹具债修复（F-UI-DEBT-1）：`task.result_submitted` 现在在**唯一写服务锁内**按"交付提交"
+    核实——要求**当前有效认领 token** 与**可追溯的证据引用**（DESIGN §2.7/§5.5/§6.7；产品侧
+    `result_submit_lockin_failed` / `CLAIM_NOT_YOURS`）。旧夹具只裸提交 `{definition_sha256, plan_revision}`
+    ⇒ 播种阶段就 400。这里按产品口径走**真实链路**，**不绕交付锁**（不放宽产品校验、不裸写 `events.jsonl`）：
+
+      1) `task.claimed` 落一个**带 claim_token 的有效认领**（token 进账本，后续提交必须与它一致）；
+      2) 证据正文经**唯一宿主写口**（`store_evidence` → `POST /api/work/reporting/evidence`）落盘，
+         取回内容寻址 sha 作**正式引用**；
+      3) `task.result_submitted` 带同一 `claim_token` + `evidence_refs=[sha]`，按当前任务修订原子提交。
+
+    设备状态轴（T-2 执行中 / T-3 就绪）逐字保留原行为。
+    """
     ids = [d["task_id"] for d in plan["definitions"]]
     t1, t2, t3 = ids[0], ids[1], ids[2]
     backend.wo_command(cmd(pid, f"task:{t1}", "task.status_changed", {"status": "executing"},
                            f"{t1}:st1:v0608ui", expected=1))
+    ev = store_evidence(backend, pid, kind="acceptance",
+                        content=f"夹具：{t1} 结果交付自检输出\nexit 0\n",
+                        summary=f"{t1} 结果交付自检证据（夹具）",
+                        binding={"revision_kind": "code", "revision": "fixture-code-rev-1"},
+                        created_by="fixture")
+    claim_token = f"fixture-claim-{t1}"
+    backend.wo_command(cmd(pid, f"task:{t1}", "task.claimed",
+                           {"run_id": "fixture-run", "attempt_id": "attempt-1", "owner_id": "fixture",
+                            "claim_token": claim_token, "lease_expires_at": "2031-01-01T00:00:00+08:00"},
+                           f"{t1}:claim:v0608ui", expected=2))
     backend.wo_command(cmd(pid, f"task:{t1}", "task.result_submitted",
-                           {"definition_sha256": plan["definition_hashes"][t1], "plan_revision": plan["content_sha256"]},
-                           f"{t1}:st2:v0608ui", expected=2))
+                           {"definition_sha256": plan["definition_hashes"][t1],
+                            "plan_revision": plan["content_sha256"],
+                            "claim_token": claim_token, "result_revision": "fixture-code-rev-1",
+                            "evidence_refs": [ev["sha256"]]},
+                           f"{t1}:st2:v0608ui", expected=3))
     backend.wo_command(cmd(pid, f"task:{t2}", "task.status_changed", {"status": "executing"},
                            f"{t2}:st1:v0608ui", expected=1))
     backend.wo_command(cmd(pid, f"task:{t3}", "task.status_changed", {"status": "ready"},
@@ -377,7 +474,7 @@ def run_browser(vite_port, backend_port, backend, roots, t_ids):
     t1, t2, t3 = t_ids["a"]
     x1 = t_ids["b"][0]
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = launch_browser(p)  # 系统 Edge（Playwright 自带 chromium 本机未下载，见 launch_browser）
         page = browser.new_context(viewport={"width": 1600, "height": 950}).new_page()
         page_errors = []
         page.on("pageerror", lambda e: page_errors.append(str(e)))
@@ -412,7 +509,7 @@ def run_browser(vite_port, backend_port, backend, roots, t_ids):
             page.wait_for_selector("[data-acceptance-view]", timeout=30000)
             page.wait_for_timeout(400)
 
-        # ══════════════ ① 主导航 = 五页；终端移出主导航；不加工具/模型/档位卡 ══════════════
+        # ══════════════ ① 主导航 = 六页（V09-62 起含「交付总览」）；终端移出主导航；不加工具/模型/档位卡 ══════════════
         step["now"] = "① 主导航"
         page.goto(f"{base}/#p/{A}", wait_until="domcontentloaded")
         page.wait_for_selector('button[data-view="arch"]', timeout=60000)

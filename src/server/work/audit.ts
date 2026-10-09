@@ -18,6 +18,7 @@
 // 复用既有审计工作链：本模块**不新建审计中心**，只把已有五环（找错→找丑→修复→终审→回写）
 // 的事实按上述事件类型落进唯一写入者，供界面/审计脚本读回。
 import { nowIso } from "../time";
+import { applyAuditCorrections, type PendingHuman } from "./auditCorrection";
 import { SCHEMA_VERSION, WorkError, type WorkEvent, type WorkReceipt } from "./types";
 import { loadEvents } from "./eventStore";
 import type { WorkSubmitter } from "./tasks";
@@ -43,6 +44,7 @@ export const AUDIT_EVENT_TYPES = [
   "audit.fix_recorded",
   "audit.retest_recorded",
   "audit.human_acceptance_recorded",
+  "audit.record_corrected",
 ] as const;
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number];
 
@@ -54,6 +56,7 @@ export const AUDIT_ENTITY_PREFIXES = {
   "audit.fix_recorded": "fix:",
   "audit.retest_recorded": "retest:",
   "audit.human_acceptance_recorded": "acceptance:",
+  "audit.record_corrected": "audit-correction:",
 } as const satisfies Record<AuditEventType, string>;
 
 export const auditEntityId = (type: AuditEventType, recordId: string): string =>
@@ -182,13 +185,21 @@ export interface SelfCheckRecord {
 
 export interface AuditCoverageOfCheck {
   check_id: string;
-  result: "passed" | "failed";
+  result: "passed" | "failed" | "not_checked";
+  pending?: PendingHuman;
+  correction_refs?: string[];
+  correction_seq?: number;
   evidence_sha256: string | null;
   /** 该检查覆盖的范围（补修 C 可选字段；空 = 没声明范围） */
   scope: string[];
 }
 
 export interface IndependentAuditRecord {
+  /** Original event envelope, never payload.auditor_role. Used only for genuine human checks. */
+  human_recorded?: boolean;
+  original_checks?: AuditCoverageOfCheck[];
+  original_findings?: string[];
+  correction_refs?: string[];
   record_id: string;
   task_id: string | null;
   round: number;
@@ -255,6 +266,7 @@ export interface RetestRecord {
 }
 
 export interface AcceptanceRecord {
+  seq?: number;
   record_id: string;
   task_id: string | null;
   batch_id: string | null;
@@ -597,6 +609,7 @@ export function foldAuditRecords(events: WorkEvent[]): AuditRecords {
       case "audit.independent_audit_recorded": {
         const ind = (p.independence ?? {}) as Record<string, unknown>;
         records.independent_audits[id] = {
+          human_recorded: e.role === "user" && e.actor_id === p.auditor,
           record_id: id,
           task_id: strOrNull(p.task_id),
           round: typeof p.round === "number" ? p.round : 1,
@@ -613,7 +626,8 @@ export function foldAuditRecords(events: WorkEvent[]): AuditRecords {
                 .filter((c) => typeof c?.check_id === "string")
                 .map((c) => ({
                   check_id: String(c.check_id),
-                  result: (c.result === "failed" ? "failed" : "passed") as "passed" | "failed",
+                  result: (c.result === "failed" ? "failed" : c.result === "passed" ? "passed" : "not_checked") as AuditCoverageOfCheck["result"],
+                  ...(c.pending ? { pending: c.pending as PendingHuman } : {}),
                   evidence_sha256: strOrNull(c.evidence_sha256),
                   // 补修 C：可选范围字段；缺省是空数组
                   scope: strArr(c.scope),
@@ -691,6 +705,7 @@ export function foldAuditRecords(events: WorkEvent[]): AuditRecords {
           );
         }
         records.acceptances[id] = {
+          seq: e.seq,
           record_id: id,
           task_id: strOrNull(p.task_id),
           batch_id: strOrNull(p.batch_id),
@@ -714,6 +729,7 @@ export function foldAuditRecords(events: WorkEvent[]): AuditRecords {
     }
   }
   records.ignored_entities = [...ignored].sort();
+  applyAuditCorrections(records, events);
   return records;
 }
 
@@ -860,7 +876,7 @@ export interface IndependentAuditInput extends AuditWriteContext {
   read_author_summary_first?: boolean;
   model_note?: string | null;
   /** 它独立复核了哪些必需检查项（同 check_id 时投影优先取这一条） */
-  checks?: { check_id: string; result?: "passed" | "failed"; evidence_sha256?: string | null; scope?: string[] }[];
+  checks?: { check_id: string; result?: "passed" | "failed" | "not_checked"; pending?: PendingHuman; evidence_sha256?: string | null; scope?: string[] }[];
   coverage: CoverageRow[];
   findings?: string[];
   conclusion: "pass" | "fail";

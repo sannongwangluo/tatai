@@ -52,6 +52,7 @@ import {
   type ProjectItem,
 } from "../api";
 import { matchedNote, unmatchedNote, type LocateRequest } from "./locate";
+import { isDrawableBox, isFiniteRect } from "./mindmapGeometry";
 import { ReconcileCats } from "./ReconcileCats";
 // V09-13：来源与证据标注（判据 `provenance.ts`；渲染件 `ProvenancePanel.tsx`）——技术详情三图共用一份
 import { evidenceShortOf, sourceKindLabelOf, type ProvenanceModel } from "./provenance";
@@ -178,6 +179,7 @@ const LEGEND = [
   { mark: "○/●", hint: "点带圆点的节点折叠/展开（折叠态落盘，刷新后保持）" },
   { mark: "▣ ⇄", hint: "节点右侧两个小图标：在方框图 / 数据流向图定位同一 module_id（N3）" },
   { mark: "`路径`", hint: "每行尾带 id/path/files/from 注释，可回查 A1 模块清单" },
+  { mark: "规划", hint: "规划层节点（审定图纸派生、尚无实测代码对应；§4.2 灰「已规划，未开始」）——与代码模块分层显示，无真实路径不可下钻" },
 ];
 
 // ── N3：定位浮层（方框图/流向图入口 + "定位到这里"的光环）──────────────────────────────
@@ -262,6 +264,33 @@ function locateEntry(
   return g;
 }
 
+/**
+ * 规划层节点的「规划」徽标（原生 SVG，挂在节点右侧的定位浮层 wrap 里）。**不带节点文字**——
+ * 不碰节点 `<g>` 的 textContent，N1/N2 按整行文字锚定的脚本不受影响（与定位入口同一护栏）。
+ */
+function planBadgeEl(id: string): SVGGElement {
+  const g = svgEl("g", { class: "mm-overlay mm-plan", "data-mm-plan": id });
+  const tip = svgEl("title");
+  tip.textContent = "规划层节点：来自审定图纸派生、尚无实测代码对应（§4.2 灰「已规划，未开始」；无真实路径不可下钻）";
+  g.append(
+    tip,
+    svgEl("rect", {
+      x: 44,
+      y: 0,
+      width: 26,
+      height: 14,
+      rx: 3,
+      fill: "var(--tt-surface)",
+      stroke: "var(--tt-border)",
+      "stroke-width": 1,
+    }),
+  );
+  const t = svgEl("text", { x: 47, y: 10, "font-size": 9, fill: "var(--tt-muted)" });
+  t.textContent = "规划";
+  g.append(t);
+  return g;
+}
+
 /** 可见节点遍历（与 markmap 自己的口径一致：`payload.fold` 的枝连同子树一起不画） */
 function walkVisibleMm(n: MmNode, cb: (node: MmNode) => void): void {
   cb(n);
@@ -308,6 +337,15 @@ export function MindMapView({
   onLocate: (id: string, label: string, to: LocateTo) => void;
 }) {
   const [graph, setGraph] = useState<SharedGraph | null>(null);
+  /** 2026-10-08 五图补齐：规划层节点 id 集合（`plan_origin:"plan"`，同一份共用数据层节点集）。
+   *  导图节点据此加「规划」徽标（与方框图 ArchCanvas 同口径；只加标记，不改节点文字与状态色）。 */
+  const planIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const n of graph?.nodes ?? []) if (n.plan_origin === "plan") s.add(n.id);
+    return s;
+  }, [graph]);
+  const planIdsRef = useRef<Set<string>>(planIds);
+  planIdsRef.current = planIds;
   /** V09-22「显示全部」：顶层模块按全量上限拉取（`getArchRender full:true`，同一 builder 换上限）；
    *  概览默认逐字不变。换模式 = 重取共用层 + 按落盘展开态补拉枝（逻辑复用现有）。 */
   const [showAll, setShowAll] = useState(false);
@@ -349,6 +387,9 @@ export function MindMapView({
   };
   /** 重画后补浮层（渲染串行链里调用；ref 是为了在 callback 里引用保持稳定） */
   const paintRef = useRef<() => void>(() => {});
+  /** 容器可画才 `fit()`（判据 `isDrawableBox` 见 `mindmapGeometry.ts` 的根因注释）：用 ref 形式
+   *  避免进 useCallback 依赖数组、保持既有渲染链的引用稳定。 */
+  const safeFitRef = useRef<(mm: Markmap) => Promise<void>>(async () => {});
 
   const svgRef = useRef<SVGSVGElement | null>(null);
   const mmRef = useRef<Markmap | null>(null);
@@ -421,6 +462,7 @@ export function MindMapView({
         locateEntry("MODULE_BOX", id, tree?.label ?? id, tree?.path ?? "", 0, pick),
         locateEntry("DATA_FLOW", id, tree?.label ?? id, tree?.path ?? "", 22, pick),
       );
+      if (planIdsRef.current.has(id)) wrap.append(planBadgeEl(id));
       root.appendChild(wrap);
     });
     const focusId = focusIdRef.current;
@@ -467,10 +509,22 @@ export function MindMapView({
     root.appendChild(ring);
   }, []);
   paintRef.current = paintOverlay;
+  safeFitRef.current = async (mm) => {
+    // 判据要用**这个实例自己的** SVG 节点（不是 svgRef.current）：换项目时旧实例可能还挂在
+    // 已脱附的旧节点上（0×0），而 svgRef 已指向新的、有尺寸的节点——用错的节点判就会让旧实例
+    // 在 0 尺寸上 fit（0/0 → NaN）。isConnected 再兜一道"已脱附"。
+    const el = mm.svg?.node?.() as SVGSVGElement | null | undefined;
+    if (!el || !el.isConnected || !isDrawableBox(el.getBoundingClientRect())) return;
+    if (!isFiniteRect(mm.state?.rect)) return;
+    await mm.fit().catch(() => {
+      // 拟合失败不打断交互：下一次重画/尺寸变化会再试
+    });
+  };
 
   /** 重画 + 补浮层 + 递增重画序号（`renderTick` 是"这一帧画完了"的信号，定位居中靠它等 rect 就位） */
   const renderAndPaint = useCallback(async (mm: Markmap) => {
     await mm.renderData();
+    await safeFitRef.current(mm);
     paintRef.current();
     setRenderTick((t) => t + 1);
   }, []);
@@ -553,13 +607,13 @@ export function MindMapView({
     return () => ro.disconnect();
   }, [exists]);
 
-  /** markmap 的 autoFit 跟着"能不能画"开关：隐藏/零尺寸时关掉，免得它自己的 ResizeObserver
-   *  （markmap 内部观察 SVG 尺寸，切走时尺寸变 0 会触发）在 0 尺寸上 fit → NaN 缩放 + 无效 transform；
-   *  重新有尺寸时打开并补一次重画（顺带 refit，切回来一定是有效视图）。 */
+  /** autoFit 恒 false（创建时即关，见 Markmap.create 与 mindmapGeometry.ts）：放掉 markmap 自带的拟合
+   *  路径——它的内部 ResizeObserver（观察节点内容 div）在隐藏/零尺寸时仍会重画，autoFit 开着就会在
+   *  0 尺寸容器上 fit（0/0 → NaN → translate(NaN,NaN)）；关掉后拟合只经 safeFitRef，受尺寸判据约束。 */
   useEffect(() => {
     const mm = mmRef.current;
     if (!mm) return;
-    mm.setOptions({ autoFit: sized });
+    // autoFit 恒 false：隐藏期间的任何重画都不会触发 fit（拟合只走 safeFitRef 的受控路径）
     if (sized) enqueueRender(() => renderAndPaint(mm));
   }, [sized, enqueueRender, renderAndPaint]);
 
@@ -649,7 +703,7 @@ export function MindMapView({
       Markmap.create(
         svgEl,
         {
-          autoFit: sized,
+          autoFit: false,
           duration: 200,
           // 折叠态**不由 markmap 的 level 口径决定**（N2 起由本组件的展开态算 payload.fold，见 foldOf）；
           // 这里保持 -1（不按层深自动折），否则它会在 _initializeData 里把我们的 fold 覆盖成 1。
@@ -672,6 +726,7 @@ export function MindMapView({
     const nextPathMap = new Map<string, MindTreeNode>();
     enqueueRender(async () => {
       await mm.setData(root);
+      await safeFitRef.current(mm); // 容器可画才 fit（同 safeFit 判据，避免 0 尺寸上的 NaN）
       // 渲染完成后再取 markmap 自己的 state.path（它是内容哈希拼出来的，只能读不能算）
       const walkMm = (n: unknown, mine: MindTreeNode): void => {
         const node = n as { state?: { path?: string }; children?: unknown[] };
@@ -864,7 +919,10 @@ export function MindMapView({
       const cur = mmRef.current;
       const curData = cur?.state.data as unknown as MmNode | undefined;
       const node = curData ? findMmNode(curData, focusedNodeId) : null;
-      if (!cur || !node) return;
+      const el = cur?.svg?.node?.() as SVGSVGElement | null | undefined;
+      // 容器不可画时不做居中：centerNode 会除以当前缩放，0 尺寸下会算出 translate(NaN,NaN)（同 fit 的根因）。
+      // 判据用**这个实例自己的** SVG 节点（理由同 safeFitRef）；已脱附的旧实例一律不居中。
+      if (!cur || !node || !el || !el.isConnected || !isDrawableBox(el.getBoundingClientRect())) return;
       void cur.centerNode(node as unknown as Parameters<Markmap["centerNode"]>[0]);
       paintRef.current();
     };
@@ -962,6 +1020,7 @@ export function MindMapView({
       // V09-22：概览/全量（显示全部）模式状态常驻可读
       data-mindmap-mode-state={showAll ? "full" : "overview"}
       data-mindmap-source="selectGraph:MIND_MAP"
+      data-mindmap-plan-nodes={planIds.size}
       data-mindmap-nodes={tree.nodeCount}
       data-mindmap-depth={tree.depth}
       data-mindmap-mm-nodes={mmNodes}

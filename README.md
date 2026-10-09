@@ -14,6 +14,19 @@
 
 **快速导航**：[能力总览](#能力总览) ｜ [一个贯穿例子](#一个贯穿例子) ｜ [六张图分别看什么](#六张图分别看什么) ｜ [当前能力与边界](#当前能力与边界) ｜ [深入文档](#文档)
 
+## 0.4.0 更新（2026-10-09）
+
+本轮把人的**默认入口**换成**交付总览**，并补齐接续取材与提交前预检。逐条能力与如实限制见 [CHANGELOG.md](CHANGELOG.md) 的「0.4.0」条目；发布说明见 [docs/releases/v0.4.0.md](docs/releases/v0.4.0.md)。
+
+- **交付总览（新默认入口）**：打开项目先看到的是**交付总览**——一页核对本期功能、需求依据、技术验证、非作者审查、未解决问题与运行版本；详细检查与证据按需展开。六图保留用于查结构与定位问题，**章节方块的颜色不再充当整项目交付结论**。只有完整功能范围核查、功能验证、独立审查与运行版本核对都具备当前有效证据，页面才显示「可以开始人工试用」；缺证据、范围未定、旧版本或读取失败会逐条点名。**技术就绪不等于你已经接受——塔台不代你签收验收。**
+- **接续更省、取材更准**：`task_brief` 紧凑简报（理由索引＋按版本补取细节，`detail=full` 保留完整）；阶段材料按任务**精确取材**（条目带 `purpose` 分类，设计引用带 `resolution`／`source_ref`，定位到**当前版本**的章节与行范围，认不出即 `unresolved`、不当已读）；同步有阻断时给**只读修复计划**。
+- **提交前只读预检**：新增 MCP `preflight_task_result`（与 `submit_task_result` 同形输入）——提交前一次列清可预判缺项与锁内未查项；**不写任何字节、不是门禁/通行票**，旧宿主明确 `unsupported`、**不回退**。
+- **功能清单（只读派生）**：设计书旁的人话功能清单与四维读数（设计覆盖／实现／验证／用户接受**分开显示**），绿只取验证读数；同一判据另有 HTTP／MCP 只读读口（`GET /api/projects/:id/feature-ledger`、MCP `feature_ledger`），**不另建第二张进度台账**。
+- **运行部件构建身份**：`GET /health`、`GET /api/work/health` 与 MCP `doctor` 读回 `build_identity`（`release_id`／`build_id`、输入指纹、偏斜对照）。**发布验收要求**：源码、随包后端、前端产物、桌面壳与安装器必须重建，并在受控安装后**实际读回**——安装运行实例报出的身份须与本次构建一致，**未安装不得写通过**。
+- **新增 3 个 MCP 工具（28 → 31）**：`task_brief`、`preflight_task_result`、`feature_ledger`。
+- **旧 MCP 连接需重连**：升级到 v0.4.0 后，要让**当前会话**用上新的接续逻辑与新增工具，需重连塔台 MCP；新启动的连接使用已更新的 `server/mcp.js`。
+- **如实限制**：本轮的**正式安装与人的可用性验收尚未进行**（token 对照未测）；下面 0.3.0 段的能力与实测限制仍然有效。
+
 ## 0.3.0 更新（2026-10-04）
 
 本轮统一了界面与品牌，把「接续」主链路提速，并补上按需取料。逐条问题、修复、实测限制与界面变化见 [CHANGELOG.md](CHANGELOG.md) 的「0.3.0」条目；发布说明见 [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md)。
@@ -116,9 +129,9 @@
 
 ## 让 Agent 接进来（MCP）
 
-以下 28 个工具对应当前 v0.3.0。
+以下 31 个工具对应当前 v0.4.0。
 
-- 28 个 stdio MCP 工具：项目接续（`list_projects`／`select_project`／`project_entry`／`doctor`）、任务与进度、认领与回执、设计书与图纸、施工图与结构（`read_plan`／`expand_module`／`project_index`）、需求／变更、同步证据对账（`register_sync_contract`／`scan_sync_evidence`／`read_sync_status`）等。计数以 `src/mcp/tools/index.ts` 的注册表为唯一来源（`pnpm verify:v09-05` 对账，文档计数与注册表恒等）；完整清单见 [docs/capabilities.md](docs/capabilities.md)。
+- 31 个 stdio MCP 工具：项目接续（`list_projects`／`select_project`／`project_entry`／`task_brief`／`doctor`）、任务与进度、认领与回执（含**只读预检** `preflight_task_result`）、设计书与图纸、施工图与结构（`read_plan`／`expand_module`／`project_index`）、需求／变更、同步证据对账（`register_sync_contract`／`scan_sync_evidence`／`read_sync_status`）、功能清单（`feature_ledger`）等。计数以 `src/mcp/tools/index.ts` 的注册表为唯一来源（`pnpm verify:v09-05` 对账，文档计数与注册表恒等）；完整清单见 [docs/capabilities.md](docs/capabilities.md)。
 - **已经运行中的 MCP 连接保留旧内存代码**：更新程序后，要让**当前会话**用上新的接续逻辑与新增工具，需重连塔台 MCP；新启动的连接使用配置路径下已更新的 `server/mcp.js`。
 - 桌面壳装好后，MCP 入口就是安装目录下的 `server/mcp.js`，例如 `C:/Users/<用户名>/AppData/Local/Tatai/server/mcp.js`。`%LOCALAPPDATA%` 这类变量不会被自动展开，配置里必须写实际绝对路径。
 - 从源码跑时先 `pnpm build:server`，再用产物的绝对路径；不要依赖 `node --import tsx …` 这种要客户端 cwd 才解析得开的写法。完整示例见 [docs/getting-started.md](docs/getting-started.md) 第 5 节与 [docs/agent-integration.md](docs/agent-integration.md)。
@@ -167,8 +180,8 @@
 | [docs/capabilities.md](docs/capabilities.md) | 当前能力、六图口径、AI 与隐私边界、远程访问、已知限制 |
 | [docs/agent-integration.md](docs/agent-integration.md) | 外部执行接入：谁启动/终止 Agent 进程、认领与回执协议、MCP 读口的同源边界 |
 | [docs/sync-evidence-contract.md](docs/sync-evidence-contract.md) | 同步证据对账契约：登记「应同步清单」、逐项实读核对、阻断与自动解阻 |
-| [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（当前 0.3.0，2026-10-04） |
-| [docs/releases/](docs/releases/) | 逐版本发布说明（当前 [v0.3.0](docs/releases/v0.3.0.md)） |
+| [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（当前 0.4.0，2026-10-09） |
+| [docs/releases/](docs/releases/) | 逐版本发布说明（当前 [v0.4.0](docs/releases/v0.4.0.md)） |
 | [GitHub Releases](https://github.com/sannongwangluo/tatai/releases) | 发布说明与安装包；产品版本口径以此为准 |
 | `DESIGN.md` / `PLAN.md` / `PROGRESS.md` | 设计依据 / 施工图与验收标准 DoD / 施工流水 |
 | [CONTRIBUTING.md](CONTRIBUTING.md)、[SECURITY.md](SECURITY.md) | 如何反馈问题与提交改动；安全漏洞的私密报告渠道 |

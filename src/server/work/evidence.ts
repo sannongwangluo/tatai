@@ -882,6 +882,19 @@ export interface FindingReportReceipt {
  * 已确认的判断也在这里落死：`repro` + `evidence_sha256` 齐 → `confirmed`，否则 `pending_repro` 且 `unverified`。
  */
 export function openFinding(submitter: WorkSubmitter, input: OpenFindingInput): FindingReportReceipt {
+  // 写入前校验（事故修复 2026-10-07：severity 枚举原先只在读侧 fold 时校验，非法值会先落账、
+  // 读回时才抛 EVENT_INVALID——账本被已持久化的非法事件毒化、全体事实派生 fail-closed。
+  // 与 audit.ts「写入被拒（EVENT_INVALID，零写入）」同口径：先校验，后提交）。
+  assertSeverity(input.severity, "(write:openFinding)");
+  if (typeof input.source !== "string" || input.source === "") {
+    findingBad("payload.source 必须是非空字符串（写入前校验）", { field: "source" });
+  }
+  if (typeof input.expected !== "string" || input.expected === "") {
+    findingBad("payload.expected 必须是非空字符串（写入前校验）", { field: "expected" });
+  }
+  if (typeof input.actual !== "string" || input.actual === "") {
+    findingBad("payload.actual 必须是非空字符串（写入前校验）", { field: "actual" });
+  }
   const current = currentFindings(submitter);
   const fingerprint = findingFingerprint({
     source: input.source,

@@ -27,12 +27,22 @@ import {
   isForgedRenewError,
   readProjectBudget,
 } from "./budget";
-import { loadDocuments, activeBaseline } from "./documents";
+import { activeBaseline } from "./documents";
 import { loadEvents } from "./eventStore";
-import { evidenceBlobPath, readEvidence } from "./evidence";
-import { importTaskDefinitions, taskDefinitionHash, type TaskDefinition } from "./plan";
-import { dependencyRelease, projectFromFacts } from "./statusProjection";
+import { evidenceBlobPath } from "./evidence";
+import { taskDefinitionHash, type TaskDefinition } from "./plan";
 import { computeSyncBlock } from "./sync";
+import {
+  evaluateSubmitResultChecks,
+  evaluateSubmitResultIdempotency,
+  leaseStateOf,
+  LEASE_NOTE,
+  planDefinitions,
+  dependencyRecheck,
+  checkEvidenceRefs,
+  type LeaseState,
+  type SubmitResultChecksInput,
+} from "./submitChecks";
 import {
   assertReopenPayload,
   foldTaskStates,
@@ -54,9 +64,10 @@ import {
 } from "./types";
 
 // ── 租约与工作目录口径 ──
-
-/** 租约语义的**唯一措辞**（§2.7 原文口径；回执与界面都用它，不许改写成"旧进程已停止"） */
-export const LEASE_NOTE = "租约到期只表示「当前所有权需核实」，不证明旧进程已停止（DESIGN.md §2.7）";
+//
+// P2/V09-47：租约判定（`leaseStateOf`/`LeaseState`）与租约措辞（`LEASE_NOTE`）已下移到
+// `submitChecks.ts`（预检与提交共用的唯一判据来源）；这里**再导出**，既有
+// `import { … } from "./claims"` 的调用方（entry.ts、verify 脚本）逐字不受影响。
 
 /** 缺省租约时长：15 分钟（长任务靠 `renew` 心跳续约，不靠长租约赌进程活着） */
 export const DEFAULT_LEASE_MS = 15 * 60 * 1000;
@@ -95,17 +106,9 @@ export interface TaskClaim {
   takeover_basis: string | null;
 }
 
-/** 租约状态：none = 没有认领记录；unknown = 时间戳解析不了（如实标未知，**不**当已过期） */
-export type LeaseState = "none" | "active" | "expired" | "unknown";
-
-/** 租约状态判定（纯函数；`now` 由调用方给，便于确定性验证） */
-export function leaseStateOf(leaseExpiresAt: string | null | undefined, now: string): LeaseState {
-  if (leaseExpiresAt === null || leaseExpiresAt === undefined || leaseExpiresAt === "") return "none";
-  const at = Date.parse(leaseExpiresAt);
-  const atNow = Date.parse(now);
-  if (Number.isNaN(at) || Number.isNaN(atNow)) return "unknown";
-  return at > atNow ? "active" : "expired";
-}
+/** 租约状态与判定的**再导出**（唯一实现在 `submitChecks.ts`，与预检/提交共用同一份） */
+export { leaseStateOf, LEASE_NOTE };
+export type { LeaseState };
 
 /** 新的认领令牌（不可猜测；不落仓库、不外发到项目正文） */
 export function newClaimToken(): string {
@@ -961,35 +964,13 @@ export interface SubmitResultSuccess {
   next_required_reads: unknown[];
 }
 
-/** 数组字段的宽容读取（幂等内容比对用；非数组按空处理） */
+/** 数组字段的宽容读取（幂等重试回执用；非数组按空处理） */
 function strListOf(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 }
 
-/**
- * 一次"结果提交"的调用方意图是否与已落盘的原提交一致（幂等重试专用）。
- * 只比**调用方能声明**的字段 + 派生但确定的 run/attempt：忽略服务端产出的 seq/时间戳与
- * `meaning` 之类常量文案。发布/交付内容任一不同即视为另一次意图（不冒充重放）。
- */
-function resultIntentMatches(existing: Record<string, unknown>, input: SubmitResultInput): boolean {
-  const normArr = (v: unknown): string[] => strListOf(v);
-  const normNull = (v: unknown): string | null => (typeof v === "string" && v !== "" ? v : null);
-  const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
-  return (
-    normNull(existing.claim_token) === normNull(input.claim_token) &&
-    normNull(existing.owner_id) === normNull(input.owner_id) &&
-    normNull(existing.owner_role) === input.role &&
-    JSON.stringify(normArr(existing.deliverables)) === JSON.stringify(normArr(input.deliverables)) &&
-    JSON.stringify(normArr(existing.evidence_refs)) === JSON.stringify(normArr(input.evidence_refs)) &&
-    sameJson(existing.verification ?? [], input.verification ?? []) &&
-    sameJson(existing.untested ?? [], input.untested ?? []) &&
-    sameJson(existing.known_issues ?? [], input.known_issues ?? []) &&
-    normNull(existing.diff_ref) === (input.diff_ref ?? null) &&
-    normNull(existing.result_revision) === (input.result_revision ?? null) &&
-    normNull(existing.ownership_basis) === (input.ownership_basis === undefined ? null : normNull(input.ownership_basis)) &&
-    sameJson(existing.runtime_entries ?? null, input.runtime_entries ?? null)
-  );
-}
+// 幂等键推导、意图比对（`resultIntentMatches`）与幂等前置判定已下移到 `submitChecks.ts`，
+// 由预检与真实提交共用同一份（见 `evaluateSubmitResultIdempotency`）。
 
 /**
  * 提交结果（重查五件事后再写）。任何一条查不过就**明确拒绝**并给重新读状态的入口；
@@ -1003,34 +984,56 @@ export async function submitTaskResult(
   const workDir = workDirOf(input.project_id, dataDir);
   const projectId = input.project_id;
   const taskId = input.task_id;
-  const dir = dataDirOr(dataDir);
-  const failures: string[] = [];
   const state = readTaskStates(workDir).states[taskId] ?? null;
   if (state === null) {
     return failure("INVALID_COMMAND", `任务 ${taskId} 没有运行状态`, projectId, taskId, workDir);
   }
 
+  // 提交判据的**单一输入对象**（与 `submit_task_result` 同形）：幂等前置与五查共用同一份。
+  // `now` 只作进程内测试注入（运行时调用方不传＝真实时刻；不允许回拨时钟延长租约，也不进公开预检输入）。
+  const intent: SubmitResultChecksInput = {
+    project_id: projectId,
+    task_id: taskId,
+    role: input.role,
+    owner_id: input.owner_id,
+    change_id: input.change_id,
+    claim_token: input.claim_token,
+    expected_revision: input.expected_revision,
+    evidence_refs: input.evidence_refs,
+    deliverables: input.deliverables,
+    verification: input.verification ?? [],
+    untested: input.untested ?? [],
+    known_issues: input.known_issues ?? [],
+    diff_ref: input.diff_ref ?? null,
+    result_revision: input.result_revision ?? null,
+    ...(input.runtime_entries === undefined ? {} : { runtime_entries: input.runtime_entries }),
+    ...(input.ownership_basis === undefined ? {} : { ownership_basis: input.ownership_basis }),
+    ...(input.now === undefined ? {} : { now: input.now }),
+  };
+
   // ①′ 幂等重试（V09-27／契约 F3）：响应丢失后**同一份结果请求**重发，必须拿回原提交的回执
   // （`duplicate: true`），不能因为任务已经提交（版本已推进/状态已变）就先给 VERSION_CONFLICT /
-  // INVALID_COMMAND 把原成功回执丢掉。幂等键与下面将要提交的键**完全同一推导**；命中同一键时：
+  // INVALID_COMMAND 把原成功回执丢掉。幂等键与五查共用**同一份**推导；命中同一键时：
   //   · 同内容 → 返回原事件回执（duplicate，无第二次效果）；
   //   · 异内容 → IDEMPOTENCY_CONFLICT 明确拒绝（不冒充重放）。
   // **新请求**（不同键）仍走下面的五查（版本/认领/租约/依赖/证据一条都不放宽）。
   {
-    const retryKey = `${taskId}:task.result_submitted:${input.expected_revision + 1}:${input.change_id}:${input.claim_token}`;
-    const existing = readClaimEvents(workDir).find((e) => e.idempotency_key === retryKey);
-    if (existing !== undefined) {
-      if (existing.type !== "task.result_submitted" || existing.entity_id !== taskEntityId(taskId) || !resultIntentMatches(existing.payload, input)) {
-        return failure(
-          "IDEMPOTENCY_CONFLICT",
-          `提交幂等键 ${retryKey} 已用于另一份内容不同的结果（原事件 ${existing.type} ${existing.event_id}，seq ${existing.seq}）：` +
-            "同键一旦用过就不能换内容重发——要改结果请走协调器 reopen 建新 attempt，或换一次新认领",
-          projectId,
-          taskId,
-          workDir,
-          { current_revision: state.revision },
-        );
-      }
+    const idem = evaluateSubmitResultIdempotency(readClaimEvents(workDir), intent);
+    if (idem.kind === "conflict") {
+      const existing = idem.event;
+      return failure(
+        "IDEMPOTENCY_CONFLICT",
+        // P2/V09-47 秘密安全纠正：幂等键内嵌认领 token，**不回显它**（错误码、判据与检查顺序不变）
+        `本次结果提交的幂等键（内嵌认领 token，不回显）已用于另一份内容不同的结果（原事件 ${existing.type} ${existing.event_id}，seq ${existing.seq}）：` +
+          "同键一旦用过就不能换内容重发——要改结果请走协调器 reopen 建新 attempt，或换一次新认领",
+        projectId,
+        taskId,
+        workDir,
+        { current_revision: state.revision },
+      );
+    }
+    if (idem.kind === "duplicate") {
+      const existing = idem.event;
       const next = deps.readNextAction === undefined ? null : deps.readNextAction(projectId, { role: input.role });
       return {
         ok: true,
@@ -1059,59 +1062,20 @@ export async function submitTaskResult(
     }
   }
 
-  // ① 任务版本
-  const versionOk = state.revision === input.expected_revision;
-  if (!versionOk) failures.push(`任务版本不符：调用方声明 ${input.expected_revision}，现场是 ${state.revision}`);
-  // ② 认领（所有交付检查当前认领 token）
-  const claimOk = state.claim_token !== null && state.claim_token === input.claim_token;
-  if (state.cancelled) failures.push(`任务已取消（${state.cancel_reason ?? "无理由"}）`);
-  if (state.status !== "claimed" && state.status !== "executing") {
-    failures.push(`当前状态是「${TASK_STATUS_LABELS[state.status]}」，不是认领/执行中`);
-  }
-  if (!claimOk) {
-    failures.push(
-      `认领 token 不是当前那个（现场 ${state.claim_token === null ? "没有有效认领" : `${state.claim_token.slice(0, 12)}…`}）：` +
-        "交付只检查当前认领 token（DESIGN.md §2.7）",
-    );
-  }
-  if (state.owner_id !== null && state.owner_id !== input.owner_id) {
-    failures.push(`持有者是 ${state.owner_id}，不是 ${input.owner_id}：不能替别人交付`);
-  }
-  // ③ 租约（到期只表示所有权需核实，不证明旧进程已停止）；毫秒精度比较，秒级以下租约才算得准
-  const now = input.now ?? new Date().toISOString();
-  const lease = leaseStateOf(state.lease_expires_at, now);
-  const ownership = (input.ownership_basis ?? "").trim();
-  if (lease === "expired" && ownership === "") {
-    failures.push(`租约已到期（${state.lease_expires_at}）：${LEASE_NOTE}；先续约，或给出 ownership_basis 说明怎么核实的所有权`);
-  }
-  if (lease === "unknown") failures.push(`租约时间戳解析不了（${state.lease_expires_at}）：按未知处理，先续约`);
-  // ④ 依赖释放（不看前置自报 done，按定义里的完成证据要求判）
-  const definitions = planDefinitions(projectId, dataDir);
-  const depCheck = dependencyRecheck(projectId, taskId, dataDir, definitions);
-  failures.push(...depCheck.failures);
-  // ⑤ 证据引用（无证据的完成不收）
-  const evCheck = checkEvidenceRefs(projectId, input.evidence_refs, dataDir);
-  failures.push(...evCheck.failures);
+  // ①–⑤ 五查：**预检与真实提交共用同一份只读判据**（`submitChecks.evaluateSubmitResultChecks`；只读、
+  //   无副作用，但会现读盘——不是数学意义的纯函数）——判据、错误码与检查顺序逐字不变（唯一例外是
+  //   认领 token 的**秘密安全纠正**，见该模块）。
+  //   同一份判据同时做「定义绑定漂移」「带 source_manifest 的证据源漂移」拒旧（P2 写边界进一步核实）。
+  const checks = evaluateSubmitResultChecks(intent, state, { ...(dataDir === undefined ? {} : { dataDir }) });
 
-  if (failures.length > 0) {
-    const code: ClaimFailureCode = !versionOk
-      ? "VERSION_CONFLICT"
-      : !claimOk
-        ? "CLAIM_NOT_YOURS"
-        : lease === "expired" && ownership === ""
-          ? "LEASE_NEEDS_VERIFICATION"
-          : depCheck.failures.length > 0
-            ? "DEPENDENCY_UNMET"
-            : evCheck.failures.length > 0
-              ? "EVIDENCE_MISSING"
-              : "INVALID_COMMAND";
-    return failure(code, `结果提交被拒（${failures.length} 项查不过）：${failures.join("；")}`, projectId, taskId, workDir, {
+  if (!checks.ok) {
+    return failure(checks.code ?? "INVALID_COMMAND", checks.message, projectId, taskId, workDir, {
       current_revision: state.revision,
-      failures,
+      failures: checks.failures,
     });
   }
 
-  const def = definitions.find((d) => d.task_id === taskId) ?? null;
+  const def = checks.definition;
   const receipt = await deps.submitter.submit(
     taskCommand({
       project_id: projectId,
@@ -1138,17 +1102,13 @@ export async function submitTaskResult(
         result_revision: input.result_revision ?? null,
         // 补修 F3：真的声明了运行入口才写这个键——旧调用（不声明）产出的结果回报事件**逐字节不变**
         ...(input.runtime_entries === undefined ? {} : { runtime_entries: input.runtime_entries }),
-        ownership_basis: ownership === "" ? null : ownership,
-        ...(def === null
+        ownership_basis: (input.ownership_basis ?? "").trim() === "" ? null : (input.ownership_basis ?? "").trim(),
+        ...(def === null || checks.definition_hash === null
           ? {}
           : {
-              // 结果回执绑"状态所绑的那份定义"：回放状态里的定义级批次绑定再算哈希
-              // （定义哈希含 change_id，现解析不带；不回放会与导入时哈希对不上——同 align 的回放口径）
-              definition_sha256: taskDefinitionHash({
-                ...def,
-                change_id: state.definition_change_id,
-                requirement_ids: def.requirement_ids ?? state.definition_requirement_ids ?? null,
-              }),
+              // 结果回执绑"状态所绑的那份定义"：哈希由共享判据按**同一回放口径**算出（definition_hash，
+              // 定义哈希含 change_id/requirement_ids，现解析不带，故按状态回放——与 align 同口径）
+              definition_sha256: checks.definition_hash,
               plan_revision: def.plan_revision ?? "",
             }),
         meaning: "执行者已提交结果；不表示审计通过或人工验收接受（DESIGN.md §5.4）",
@@ -1159,17 +1119,18 @@ export async function submitTaskResult(
   // 回报后读取下一动作（按新事实重新判，不重复开工）
   const next = deps.readNextAction === undefined ? null : deps.readNextAction(projectId, { role: input.role });
 
+  const ownership = (input.ownership_basis ?? "").trim();
   return {
     ok: true,
     receipt,
     claim_token: input.claim_token,
     rechecks: {
       revision: `任务版本 ${input.expected_revision} 与现场一致`,
-      dependencies: depCheck.checked,
+      dependencies: checks.dep_checked,
       claim: `认领 token 是当前那个（owner=${input.owner_id}）`,
-      lease: lease === "expired" ? `租约已到期，按 ownership_basis 核实后放行：${ownership}` : `租约 ${lease}`,
+      lease: checks.lease === "expired" ? `租约已到期，按 ownership_basis 核实后放行：${ownership}` : `租约 ${checks.lease}`,
       evidence: `${input.evidence_refs.length} 条证据引用都对得上`,
-      external_evidence_refs: evCheck.external,
+      external_evidence_refs: checks.external_evidence_refs,
     },
     next_action: next?.next_action ?? null,
     next_reasons: next?.reasons ?? [],
@@ -1177,99 +1138,11 @@ export async function submitTaskResult(
   };
 }
 
-/** 现场施工定义（不校验结构；读不出来就是空表，如实反映"没有定义"） */
-export function planDefinitions(projectId: string, dataDir?: string): TaskDefinition[] {
-  try {
-    const docs = loadDocuments(projectId, dataDir);
-    if (docs.plan === null) return [];
-    return importTaskDefinitions(docs.plan.text, { plan_revision: docs.plan.revision.content_sha256 }).definitions;
-  } catch {
-    return [];
-  }
-}
-
-/** 依赖重查：逐条前置给释放结论（用 V06-09 的 `dependencyRelease`，不看"前卡自报 done"） */
-export function dependencyRecheck(
-  projectId: string,
-  taskId: string,
-  dataDir?: string,
-  definitions?: TaskDefinition[],
-): { ok: boolean; checked: string[]; failures: string[] } {
-  const defs = definitions ?? planDefinitions(projectId, dataDir);
-  const def = defs.find((d) => d.task_id === taskId);
-  if (def === undefined) {
-    return { ok: false, checked: [], failures: [`施工定义里找不到任务 ${taskId}：无法核对依赖与交付要求`] };
-  }
-  if (def.dependency_ids.length === 0) return { ok: true, checked: ["本任务没有依赖"], failures: [] };
-  const { projection } = projectFromFacts(projectId, dataDirOr(dataDir));
-  const checked: string[] = [];
-  const failures: string[] = [];
-  for (const dep of def.dependency_ids) {
-    const prerequisite = projection.by_id[dep];
-    if (prerequisite === undefined) {
-      failures.push(`前置 ${dep} 还没有任何运行状态：依赖未释放（先让它开工并交出可核对的证据）`);
-      continue;
-    }
-    const release = dependencyRelease({
-      prerequisite_id: dep,
-      prerequisite,
-      evidence_requirement: def.dependency_evidence.find((d) => d.dependency_id === dep)?.evidence ?? null,
-    });
-    checked.push(`${dep} ${release.released ? "已释放" : "未释放"}：${release.reasons.join("；") || "无阻塞理由"}`);
-    if (!release.released) failures.push(`前置 ${dep} 未释放：${release.reasons.join("；")}`);
-  }
-  return { ok: failures.length === 0, checked, failures };
-}
-
 /**
- * 证据引用核对：内容寻址 sha256 → 必须在项目证据库里取得到；项目根内相对路径 → 必须真实存在；
- * 带 scheme/绝对路径 → 记进 `external`（如实标注"引用在项目之外，塔台没核"）。
+ * 施工定义 / 依赖重查 / 证据引用核对：唯一实现已下移到 `submitChecks.ts`（预检与真实提交共用同一份判据）；
+ * 这里**再导出**，保留既有 `import { … } from "./claims"` 面（`claimTask` 仍按同一份判据判依赖）。
  */
-export function checkEvidenceRefs(
-  projectId: string,
-  refs: readonly string[],
-  dataDir?: string,
-): { ok: boolean; failures: string[]; external: string[] } {
-  const failures: string[] = [];
-  const external: string[] = [];
-  if (refs.length === 0) {
-    failures.push("没有任何证据引用：交付检查要求结果带可追溯的证据（§5.5/§6.7）");
-    return { ok: false, failures, external };
-  }
-  const workDir = workDirOf(projectId, dataDir);
-  const project = getProject(projectId, dataDir);
-  const root = project === undefined ? null : path.resolve(project.path);
-  for (const ref of refs) {
-    const value = ref.trim();
-    if (value === "") {
-      failures.push("证据引用里有空串");
-      continue;
-    }
-    if (/^[0-9a-f]{64}$/.test(value)) {
-      try {
-        readEvidence(workDir, value);
-      } catch (e) {
-        failures.push(`证据 ${value.slice(0, 12)}… 对不上：${(e as Error).message}`);
-      }
-      continue;
-    }
-    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value) || path.isAbsolute(value) || /^[a-zA-Z]:[\\/]/.test(value)) {
-      external.push(value);
-      continue;
-    }
-    if (root === null) {
-      external.push(value);
-      continue;
-    }
-    const abs = path.resolve(root, value);
-    if (abs !== root && !abs.startsWith(root + path.sep)) {
-      failures.push(`证据引用 ${value} 越出项目根：路径穿越一律不收`);
-      continue;
-    }
-    if (!fs.existsSync(abs)) failures.push(`证据引用 ${value} 指向的文件不存在`);
-  }
-  return { ok: failures.length === 0, failures, external };
-}
+export { planDefinitions, dependencyRecheck, checkEvidenceRefs };
 
 // ── V09-10：协调器受控重开（附录 F；用户裁定原文 `.工作台/handoff/2026-09-24-返工流程裁定.md`）──
 //
@@ -1645,6 +1518,9 @@ function strOrNullOf(v: unknown): string | null {
  * `claims.releaseClaim` 的带 `claim_released` 释放、验证夹具的通用状态写）都不带这个键，
  * 因此逐字不受影响；而 Agent 上报链（`reportTaskPhase` → report_task_status/report_execution）
  * 一律带上它，所以**Agent 上报的那条路径**在服务边界被同一份判据核实，直连写口冒充"上报"也绕不过。
+ *
+ * 实现约束（2026-10-08）：这个"是否显式上报"的判定必须发生在 `state === null` 早退**之前**——
+ * 否则不带该键的既有写者（尤其 v1→v2 迁移回放）会在任务尚无运行状态时被误拒（产品回归）。
  */
 export function verifyTaskPhaseCommand(
   events: readonly WorkEvent[],
@@ -1653,7 +1529,17 @@ export function verifyTaskPhaseCommand(
 ): { ok: boolean; failures: string[]; state: TaskState | null } {
   const failures: string[] = [];
   const taskId = cmd.entity_id.startsWith("task:") ? cmd.entity_id.slice("task:".length) : cmd.entity_id;
+  const p = cmd.payload;
+  // 作用域判定**先于** state 存在性早退（2026-10-08 迁移回归修复）：只对"显式上报"发表意见。
+  // 没有 report_phase 的命令（迁移的历史状态回放、releaseClaim 的释放、夹具的通用状态写）在此返回
+  // 「不发表意见」——按顶部作用域注释，它们本就不受阶段门禁约束，不能因 taskId 尚无运行状态被
+  // state===null 早退误拒（v1→v2 迁移回放正是这种形态：migrate.ts 造的事件不带该键）。
+  const declared = typeof p.report_phase === "string" ? p.report_phase : "";
+  const phase: TaskPhaseReport | null =
+    declared === "doing" || declared === "blocked" || declared === "ready" ? declared : null;
   const state = foldTaskStates([...events]).states[taskId] ?? null;
+  if (phase === null) return { ok: true, failures: [], state };
+  // 显式上报（doing/blocked/ready）才核"已导入定义"：没有运行状态＝还没导定义，上报拒、零写入。
   if (state === null) {
     return {
       ok: false,
@@ -1661,12 +1547,6 @@ export function verifyTaskPhaseCommand(
       state: null,
     };
   }
-  const p = cmd.payload;
-  // 只核"显式上报"：没有 report_phase 的命令（迁移/释放/夹具的通用写）不发表意见，行为逐字不变
-  const declared = typeof p.report_phase === "string" ? p.report_phase : "";
-  const phase: TaskPhaseReport | null =
-    declared === "doing" || declared === "blocked" || declared === "ready" ? declared : null;
-  if (phase === null) return { ok: true, failures: [], state };
 
   if (state.cancelled) failures.push(`任务已取消（${state.cancel_reason ?? "无理由"}）：不能上报阶段`);
 
@@ -1701,8 +1581,9 @@ export function verifyTaskPhaseCommand(
   const ownerId = typeof p.owner_id === "string" && p.owner_id.trim() !== "" ? p.owner_id.trim() : cmd.actor_id;
   if (claimToken === "" || state.claim_token === null || state.claim_token !== claimToken) {
     failures.push(
+      // P2/V09-47 同类秘密安全纠正：现场 token **不回显**（含前缀）——只说"是不是现场那一个"
       `上报 doing/blocked 必须带**当前认领 token**（现场 ${
-        state.claim_token === null ? "没有有效认领" : `${String(state.claim_token).slice(0, 12)}…`
+        state.claim_token === null ? "没有有效认领" : "有另一份有效认领"
       }）：只有持有者能报自己那张卡的阶段（DESIGN.md §2.7/§6.5）`,
     );
   }

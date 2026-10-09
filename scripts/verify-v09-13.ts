@@ -30,7 +30,7 @@ import { getArchTool } from "../src/mcp/tools/getArch";
 import { addProject } from "../src/server/registry";
 import { WorkService } from "../src/server/work/service";
 import { readRequirements, registerRequirement } from "../src/server/work/requirements";
-import { submitTaskStatus } from "../src/server/work/tasks";
+import { submitTaskStatus, readTaskStates } from "../src/server/work/tasks";
 import { projectWorkDir } from "../src/server/workstation";
 import { buildViewModel, taskDerivedModuleStatus } from "../src/ui/arch/projectGraph";
 import {
@@ -198,6 +198,25 @@ async function main(): Promise<void> {
       Object.keys(fxReqs.requirements).length === 2 && fs.existsSync(path.join(FX_WORK, "events.jsonl")),
       "夹具：需求经唯一写入服务登记并落事件账本（读回 2 条，`events.jsonl` 真落盘）",
     );
+    // 夹具先导入正式定义，使用真实任务身份；这是夹具的防御性准备，不是非上报状态写的必要条件。
+    //   verifyTaskPhaseCommand 只核显式 report_phase；无该字段的迁移回放由 v06-03 单独验证。
+    //   T-1/T-2 是施工图里真实存在的卡，这里先经**唯一写口**把这两张卡的定义导入
+    //   （旧形态 `task.definition_imported`，与 verify-v06-09 夹具同形、不带 report_phase），
+    //   让 T-2 有合法的运行状态可上报——不硬写账本、不绕过唯一写口，也不放宽后续判据。
+    for (const [tid, seed] of [["T-1", "1"], ["T-2", "2"]] as const) {
+      service.submit({
+        schema_version: 2,
+        project_id: FX,
+        change_id: "change-none",
+        entity_id: `task:${tid}`,
+        expected_revision: null,
+        type: "task.definition_imported",
+        actor_id: "v0913-verify",
+        role: "executor",
+        idempotency_key: `v0913:def:${tid}:1`,
+        payload: { definition_sha256: seed.repeat(64), plan_revision: "a".repeat(64), definition_revision: 1 },
+      });
+    }
     // 真报一次任务状态（T-2 仍是"已规划未开始"的灰节点：来源可追、但没有任何证据）
     submitTaskStatus(submitter, {
       project_id: FX,
@@ -205,7 +224,7 @@ async function main(): Promise<void> {
       change_id: "change-none",
       actor_id: "v0913-verify",
       role: "executor",
-      expected_revision: null,
+      expected_revision: readTaskStates(projectWorkDir(FX, FX_HOME)).states["T-2"]?.revision ?? null,
       status: "preparing",
       reason: "夹具：让这张卡有状态投影对象（灰 planned），用来验证「来源可追但不算已交付」",
     });

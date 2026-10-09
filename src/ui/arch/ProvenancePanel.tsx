@@ -26,6 +26,12 @@ import {
   type ProvenanceModel,
   type IntraGroupRelation,
 } from "./provenance";
+import {
+  UNRESOLVED_REAL_GAP_REASONS,
+  UNRESOLVED_REASON_LABELS,
+  type UnresolvedEndpointReason,
+  type UnresolvedRelation,
+} from "./projectGraph";
 
 /** 待审线索的处置短标（§4.1／附录 E.17 裁定 1–2 的两种处置；**不留第三种口气**） */
 const MODEL_LEAD_DISPOSITION_LABEL: Record<ModelLeadInfo["disposition"], string> = {
@@ -77,13 +83,16 @@ export function ObjectProvenanceLines({ annotation }: { annotation: ProvenanceAn
 }
 
 /**
- * 六图信息栏的**判据**（只此一份）：由交付读数与待审线索算出「这条栏要不要出现、要列哪几类」。
+ * 六图信息栏的**判据**（只此一份）：由交付读数、待审线索与关系缺口算出「这条栏要不要出现、要列哪几类」。
  * 纯函数、零 React、零 IO——六张图共用，不各写一套。
  *
  * **可行动异常**（任一存在 ⇒ 出栏）：
  *   · 交付阻断：未映射／未验证／缺证／证据失效（按档计数，逐条原因在详情里）；
  *   · 能力分类未定（R-1：能力分类声明表损坏 ⇒ 该章不按功能能力计数，§3.2）；
- *   · 待审线索（`lead_pending_review`，关系侧＋节点侧，§4.1／附录 E.17／E.18）。
+ *   · 待审线索（`lead_pending_review`，关系侧＋节点侧，§4.1／附录 E.17／E.18）；
+ *   · 关系未画出（**真实缺口**）：本视图里端点解析不到可见分组、且成因为 `no_ownership`／`missing_node`
+ *     的关系条数（§3.3「隐藏≠没有」／§4.5「待归属」）。只按**已有的**分类常量计数——
+ *     **合理结果**（`folded_group` 折叠／`governance_excluded` 分类排除）**不计入异常**。
  * **不是异常**（不出栏、不占常驻行）：`可请求验收`／`尚未验收`／人工待验（`user_pending`）——
  * 人工验收待用户本人记录，读数里始终 `user_accepted=false`，不代签（§5.8）。
  */
@@ -94,6 +103,11 @@ export interface AttentionCounts {
   unclassified: number;
   /** 待审线索（关系侧＋节点侧；`total`＝两处之和） */
   pending_leads: { relations: number; nodes: number; total: number };
+  /**
+   * 关系未画出：本视图里端点解析不到可见分组的**真实缺口**条数（只数 `no_ownership`／`missing_node`）。
+   * **机械关系缺口，不是业务失败**——只给计数与逐条名单，不给完成色、不改交付判词（§3.3／§4.5）。
+   */
+  unresolved_gaps: { total: number; no_ownership: number; missing_node: number };
   /** 有可行动异常 ⇒ 信息栏出现（false = 健康态，整条不占任何常驻行） */
   any: boolean;
 }
@@ -102,16 +116,26 @@ export function attentionCountsOf(
   delivery: DeliveryReadout,
   leads: readonly ModelLeadInfo[] = [],
   nodeLeads: readonly ModelNodeLeadInfo[] = [],
+  unresolved: readonly UnresolvedRelation[] = [],
 ): AttentionCounts {
   const c = delivery.counts;
   const relations = leads.filter((l) => l.disposition === "lead_pending_review").length;
   const nodes = nodeLeads.filter((l) => l.disposition === "lead_pending_review").length;
   const total = c.unmapped + c.unverified + c.missing + c.invalidated;
+  // 关系未画出：只取**真实缺口**两类（机械关系缺口——待归属／缺节点），复用唯一分类常量；
+  // 合理结果（折叠／分类排除）**不计入**异常，也不进这条栏（§3.3／§3.2）。
+  const gaps = unresolved.filter((r) => UNRESOLVED_REAL_GAP_REASONS.includes(r.reason));
+  const unresolved_gaps = {
+    total: gaps.length,
+    no_ownership: gaps.filter((r) => r.reason === "no_ownership").length,
+    missing_node: gaps.filter((r) => r.reason === "missing_node").length,
+  };
   return {
     blocking: { unmapped: c.unmapped, unverified: c.unverified, missing: c.missing, invalidated: c.invalidated, total },
     unclassified: c.capability_unclassified,
     pending_leads: { relations, nodes, total: relations + nodes },
-    any: total > 0 || c.capability_unclassified > 0 || relations + nodes > 0,
+    unresolved_gaps,
+    any: total > 0 || c.capability_unclassified > 0 || relations + nodes > 0 || unresolved_gaps.total > 0,
   };
 }
 
@@ -137,6 +161,9 @@ export function GraphAttentionBar({
   delivery,
   leads = [],
   nodeLeads = [],
+  unresolvedRelations = [],
+  resolveUnresolvedTarget,
+  onOpenUnresolvedTarget,
   anchor,
   title = "交付结论",
 }: {
@@ -145,13 +172,24 @@ export function GraphAttentionBar({
   leads?: readonly ModelLeadInfo[];
   /** 节点侧待审线索（R-2／附录 E.18）；为空即视为没有 */
   nodeLeads?: readonly ModelNodeLeadInfo[];
+  /**
+   * 本视图里**端点解析不到可见分组**的关系（`ProjectViewModel.unresolved_relations`，**全量**：
+   * 含合理折叠/分类排除与真实缺口）。传入即把它们接进**这一条**信息栏的按需详情；
+   * 不传（技术三图 / 思维导图等没有这份账的调用点）行为一字不变。真实缺口（`no_ownership`／
+   * `missing_node`）会让这条栏出现并给计数；合理结果不触发（§3.3／§4.5）。
+   */
+  unresolvedRelations?: readonly UnresolvedRelation[];
+  /** 落空端点 → 当前画布上的可见对象显示名（null = 本视图画布上没有它，**如实给原因、不做假跳转**） */
+  resolveUnresolvedTarget?: (planId: string) => string | null;
+  /** 点开一个可见对象（跳转由调用方按本视图画布实现；没有可见对象时不调用） */
+  onOpenUnresolvedTarget?: (planId: string) => void;
   /** 数据锚点（六图各自的稳定标识；`data-delivery-readout` 沿用 V09-13 的读法） */
   anchor: string;
   title?: string;
 }) {
   const detailsRef = useRef<HTMLDetailsElement | null>(null);
   const c = delivery.counts;
-  const attn = attentionCountsOf(delivery, leads, nodeLeads);
+  const attn = attentionCountsOf(delivery, leads, nodeLeads, unresolvedRelations);
   const blocked = attn.blocking.total > 0 || delivery.verdict === "blocked";
   // 默认行上的「简短原因」：各档阻断的构成（条数按档，逐条原因在浮层里）
   const composition = (
@@ -239,6 +277,17 @@ export function GraphAttentionBar({
               title="待审线索（模型提案·未审定）：不进成员、绿态与交付读数（§4.1／附录 E.17／E.18；逐条见详情）"
             >
               待审线索 {attn.pending_leads.total} 条
+            </span>
+          )}
+          {/* 关系未画出：**真实缺口**（待归属／缺节点）在默认行给计数与入口——机械关系缺口，
+              不涂成业务失败、不改交付判词；合理结果（折叠／分类排除）不触发这枚标（§3.3／§4.5）。 */}
+          {attn.unresolved_gaps.total > 0 && (
+            <span
+              className="text-amber-300"
+              data-graph-info-unresolved-gaps-brief={attn.unresolved_gaps.total}
+              title="关系未画出：本视图里有关系的端点在蓝图里待归属/缺节点，画不出可见分组——机械关系缺口，不是业务失败（逐条见详情，§3.3／§4.5）"
+            >
+              关系未画出 {attn.unresolved_gaps.total} 条
             </span>
           )}
           <span className="text-neutral-400">{blocked ? "查看原因" : "查看详情"}</span>
@@ -348,6 +397,15 @@ export function GraphAttentionBar({
               不再另起一排常驻栏（§4.1／附录 E.17／E.18）。没有线索就不摆空壳。 */}
           {(leads.length > 0 || nodeLeads.length > 0) && (
             <ModelLeadsLines leads={leads} nodeLeads={nodeLeads} anchor={anchor} />
+          )}
+          {/* 关系未画出：**全量**逐条在场（合理折叠/分类排除 + 真实缺口）——收起≠删数据（§3.3）。 */}
+          {unresolvedRelations.length > 0 && (
+            <UnresolvedRelationsPanel
+              relations={unresolvedRelations}
+              anchor={anchor}
+              {...(resolveUnresolvedTarget !== undefined ? { resolveTarget: resolveUnresolvedTarget } : {})}
+              {...(onOpenUnresolvedTarget !== undefined ? { onOpenTarget: onOpenUnresolvedTarget } : {})}
+            />
           )}
         </div>
       </details>
@@ -587,5 +645,121 @@ export function IntraRelationChips({
         </button>
       ))}
     </span>
+  );
+}
+
+/**
+ * **关系未画出（本视图解析不到可见分组）的完整名单**——按唯一成因词表 `UNRESOLVED_REASON_LABELS`
+ * 逐条点名：稳定 ID、两端、落空端与成因、蓝图出处（`sources`）；真实缺口带【真实缺口】标记。
+ *
+ * 同一份数据／同一个组件挂在两处（不各写一套）：
+ *   · `GraphAttentionBar` 的按需详情里（真实缺口会让信息栏出现并给计数）；
+ *   · 主视图工具条上的「关系未画出」入口——只有合理折叠/分类排除时信息栏是健康态、不占行，
+ *     这条入口保证它们**照样逐条可达**，不被藏掉（§3.3「隐藏≠没有」）。
+ *
+ * 只读展示：不改状态、不给完成色、不把机械关系缺口涂成业务失败；可跳转到当前画布上的可见对象，
+ * 没有可见对象就**如实写原因**，不做假跳转。
+ */
+export function UnresolvedRelationsPanel({
+  relations,
+  anchor,
+  title = "关系未画出（本视图解析不到可见分组）",
+  resolveTarget,
+  onOpenTarget,
+}: {
+  relations: readonly UnresolvedRelation[];
+  anchor: string;
+  title?: string;
+  /** 端点 → 当前画布上的可见对象显示名（null = 本视图画布上没有这个对象） */
+  resolveTarget?: (planId: string) => string | null;
+  /** 点开一个可见对象（没有可见对象时调用方给 null，不会走到这里） */
+  onOpenTarget?: (planId: string) => void;
+}) {
+  // 展示顺序＝成因的稳定词表顺序（真实缺口在前）；计数与分类都取唯一常量，不另造状态。
+  const order: readonly UnresolvedEndpointReason[] = ["no_ownership", "missing_node", "folded_group", "governance_excluded"];
+  const gaps = relations.filter((r) => UNRESOLVED_REAL_GAP_REASONS.includes(r.reason));
+  return (
+    <section
+      className="border-t border-neutral-800 pt-1"
+      data-unresolved-relations={anchor}
+      data-unresolved-relations-count={relations.length}
+      data-unresolved-relations-gaps={gaps.length}
+    >
+      <p className="font-semibold text-neutral-300">
+        {title}：{relations.length} 条（其中真实缺口 {gaps.length} 条）
+      </p>
+      <p className="mt-0.5 text-neutral-500" data-unresolved-relations-note>
+        这些关系的端点解析不到本视图的可见分组——**一条都没被丢掉**，只是画不成连线（§3.3「隐藏≠没有」）。
+        「待归属（no_ownership）／缺节点（missing_node）」是**真实缺口**（须核对后补登）；
+        「折叠（folded_group）／分类排除（governance_excluded）」是视图口径本身的**合理结果**。
+        两类都**不表示业务失败**、不着完成色（§3.2／§4.5）。
+      </p>
+      <ul className="mt-0.5 max-h-40 space-y-0.5 overflow-y-auto" data-unresolved-relations-list>
+        {order
+          .flatMap((reason) => relations.filter((r) => r.reason === reason))
+          .map((r) => {
+            const realGap = UNRESOLVED_REAL_GAP_REASONS.includes(r.reason);
+            // 两端各自判定能否跳到**本视图画布上的可见对象**：能跳就给按钮，不能跳就如实写原因（不做假跳转）。
+            const ends: { id: string; end: "source" | "target" }[] = [
+              { id: r.source, end: "source" },
+              { id: r.target, end: "target" },
+            ];
+            return (
+              <li
+                key={r.id}
+                className="leading-relaxed text-neutral-300"
+                data-unresolved-relation={r.id}
+                data-unresolved-relation-kind={r.kind}
+                data-unresolved-relation-reason={r.reason}
+                data-unresolved-relation-end={r.unresolved_end}
+                data-unresolved-relation-missing={r.missing_id}
+                data-unresolved-relation-real-gap={realGap ? "1" : "0"}
+              >
+                <span
+                  className={realGap ? "font-semibold text-amber-300" : "text-neutral-400"}
+                  data-unresolved-relation-class={realGap ? "real_gap" : "reasonable"}
+                >
+                  {realGap ? "【真实缺口】" : "【合理结果】"}
+                </span>
+                {relationKindLabel(r.kind)}：{r.source} → {r.target}（落空端＝
+                {r.unresolved_end === "source" ? "起点" : "终点"} {r.missing_id}）
+                <span className="ml-1 text-neutral-500">{UNRESOLVED_REASON_LABELS[r.reason]}</span>
+                <span className="ml-1 text-neutral-500" data-unresolved-relation-sources={r.sources.length}>
+                  出处：
+                  {r.sources.length === 0
+                    ? "（这条关系没有可定位出处）"
+                    : r.sources.map((s) => `${s.path} · ${s.locator}`).join("；")}
+                </span>
+                {ends.map(({ id, end }) => {
+                  const label = resolveTarget?.(id) ?? null;
+                  const isMissing = end === r.unresolved_end;
+                  return label !== null && onOpenTarget !== undefined ? (
+                    <button
+                      key={end}
+                      type="button"
+                      data-unresolved-relation-open={id}
+                      data-unresolved-relation-open-end={end}
+                      onClick={() => onOpenTarget(id)}
+                      className="ml-1 rounded border border-neutral-700 px-1 text-[10px] text-neutral-300 hover:bg-neutral-800"
+                    >
+                      查看「{label}」↗
+                    </button>
+                  ) : (
+                    <span
+                      key={end}
+                      className="ml-1 text-neutral-500"
+                      data-unresolved-relation-no-target={id}
+                      data-unresolved-relation-no-target-end={end}
+                      data-unresolved-relation-no-target-missing={isMissing ? "1" : "0"}
+                    >
+                      （本视图画布上没有这个对象：{id}，不跳到别处）
+                    </span>
+                  );
+                })}
+              </li>
+            );
+          })}
+      </ul>
+    </section>
   );
 }

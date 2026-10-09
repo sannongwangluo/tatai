@@ -357,26 +357,30 @@ export function readLedger(workDir: string): LedgerRead {
   const prev = cache.get(key) ?? null;
   const checkpoint = prev !== null ? prev.content.verified_bytes : 0;
 
-  let attempt = 0;
-  let scan = scanAndParse(file, checkpoint);
-  while (scan.unstable && attempt < MAX_UNSTABLE_RETRIES) {
-    attempt += 1;
-    // 现场在变时 checkpoint 可能错位：重试一律从 0 全量，别拿不稳定现场的偏移续读
-    scan = scanAndParse(file, 0);
+  // 首次读取和前缀失配后的全量回退必须经过同一个稳定性门禁。
+  function stableScan(start: number) {
+    let attempt = 0;
+    let scan = scanAndParse(file, start);
+    while (scan.unstable && attempt < MAX_UNSTABLE_RETRIES) {
+      attempt += 1;
+      // 不稳定现场的偏移不可信：重试一律从 0 全量。
+      scan = scanAndParse(file, 0);
+    }
+    if (scan.unstable) {
+      stats.unstable_reads += 1;
+      cache.delete(key);
+      throw new WorkError(
+        "LEDGER_UNSTABLE",
+        `读取 ${LEDGER_FILE_NAME} 时文件持续在被改写（短读/并发追加/替换），已重试 ${MAX_UNSTABLE_RETRIES} 次仍未稳定；` +
+          "拒绝返回可能混合两个版本的读取结果，请稍后重试或停止写入后再读",
+        { file: LEDGER_FILE_NAME, work_dir: key, retries: MAX_UNSTABLE_RETRIES, file_bytes: scan.file_bytes },
+      );
+    }
+    return { scan, attempt };
   }
-  if (scan.unstable) {
-    // **已知变化必须明确拒绝**（V09-38 复审修正）：重试后仍不稳定，说明读到的字节可能横跨两个版本
-    // （短读/并发追加/替换），绝不能把"混合现场"当完整事实返回。清掉该 workDir 的缓存条目，避免
-    // 后续读继续命中被污染的旧前缀；由调用方在写入停止后重读。
-    stats.unstable_reads += 1;
-    cache.delete(key);
-    throw new WorkError(
-      "LEDGER_UNSTABLE",
-      `读取 ${LEDGER_FILE_NAME} 时文件持续在被改写（短读/并发追加/替换），已重试 ${MAX_UNSTABLE_RETRIES} 次仍未稳定；` +
-        "拒绝返回可能混合两个版本的读取结果，请稍后重试或停止写入后再读",
-      { file: LEDGER_FILE_NAME, work_dir: key, retries: MAX_UNSTABLE_RETRIES, file_bytes: scan.file_bytes },
-    );
-  }
+  const first = stableScan(checkpoint);
+  let scan = first.scan;
+  const attempt = first.attempt;
 
   // 只有"第一次尝试、整行收尾、且前缀摘要对上"才允许复用（现场在变已在上面直接拒绝，不会走到这里）
   const canReuse =
@@ -419,7 +423,7 @@ export function readLedger(workDir: string): LedgerRead {
           : !scan.ends_with_newline
             ? "missing_trailing_newline"
             : "prefix_mismatch";
-    if (attempt === 0) scan = scanAndParse(file, 0); // 丢掉"只校验了后缀"的那一份，重来全量
+    if (attempt === 0) scan = stableScan(0).scan; // 丢掉后缀扫描，重来全量并重新核验稳定性
     events = scan.events;
     reparsed = scan.events.length;
     stats.fell_back += 1;

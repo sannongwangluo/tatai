@@ -6,6 +6,7 @@
 ## 1. 现在可以使用什么
 
 - 项目登记、目录接入与跨项目概览；七步 Gate 由**用户确认**，任务由 **Agent 自报**。
+- **交付总览（人的默认入口，V09-62）**：打开项目先看到**交付总览**——一页核对本期功能、需求依据、技术验证、非作者审查、未解决问题与运行版本；详细检查与证据按需展开。六图保留用于查结构与定位问题，**章节方块的颜色不再充当整项目交付结论**。只有完整功能范围核查、功能验证、独立审查与运行版本核对都具备当前有效证据，页面才显示「可以开始人工试用」；缺证据、范围未定、旧版本或读取失败逐条点名。**技术就绪不等于用户已接受**，Agent 不代用户签收。`feature_ledger.delivery`（含集成组合流程验证）与逐项 `agent_review` 为同源只读扩展，不另建第二张完成台账。
 - **界面与品牌**：默认**浅色**、左下角可切**夜间**（选择本机记住，Windows 原生标题栏同步）；线条小塔台为唯一标志，界面标志、网页图标、EXE／安装包与桌面快捷方式同源生成；项目图**先讲用途、关联与当前情况**，缺少的用途或设计理由明确写「尚未记录」、不编造；选中方块可把对象与来源带入**可编辑聊天草稿**，由你确认后发送。保留**五主导航**与**六图**。
 - **六图**：功能全景／系统架构／施工依赖（三张主视图）＋模块方框图／数据流向图／思维导图（技术详情三张）。逐对象带来源与证据标注，可下钻追到出处。
   - 三张主视图从已审定图纸与代码派生，空仓也有灰色规划图；状态只来自事件与有效证据，界面**不提供人工涂色**。
@@ -26,13 +27,13 @@
 
 ### 1.1 MCP 工具面
 
-一个 MCP 接口接入所有 Agent，走 **stdio**（Agent 客户端主动拉起）。工具数以 `src/mcp/tools/index.ts` 的注册表为唯一来源（`pnpm verify:v09-05` 对账）。v0.3.0 共 28 个：
+一个 MCP 接口接入所有 Agent，走 **stdio**（Agent 客户端主动拉起）。工具数以 `src/mcp/tools/index.ts` 的注册表为唯一来源（`pnpm verify:v09-05` 对账）。v0.4.0 共 31 个：
 
 | 类别 | 工具 |
 | --- | --- |
-| 项目与接续 | `list_projects`、`select_project`、`project_entry`、`doctor` |
+| 项目与接续 | `list_projects`、`select_project`、`project_entry`、`task_brief`（project_entry 的紧凑只读简报：默认理由索引／短摘要，保留动作与当前任务约束/必读/图简状态，完整理由按版本补取；`detail=full` 兼容旧文）、`doctor` |
 | 任务与进度 | `list_tasks`、`report_task_status`、`update_progress`、`read_progress` |
-| 认领与回执 | `claim_task`、`submit_task_result`、`rebind_task` |
+| 认领与回执 | `claim_task`、`submit_task_result`、**只读预检** `preflight_task_result`（提交前一次列清可预判缺项与锁内未查项；**不写任何字节、不是门禁/通行票**，旧宿主 `unsupported` 不回退）、`rebind_task` |
 | 执行与证据上报 | `report_execution`、`record_work_evidence` |
 | 设计书与待议 | `read_design`、`append_discuss` |
 | 施工图与结构 | `read_plan`（按卡/章节/行范围原读取材，未入账卡仍可读）、`expand_module`（深层结构下钻，稳定分页＋来源版本）、`project_index`（持久项目说明索引：`read`/`impact`/`coverage` 只读，`upsert`/`remove` 经唯一宿主） |
@@ -40,6 +41,7 @@
 | 图纸基线 | `manage_baseline`（`read`/`preserve`/`activate`，经唯一宿主） |
 | 需求 / 变更 / 施工定义 | `manage_requirement`、`manage_change`、`import_plan_definitions` |
 | 同步证据对账 | `register_sync_contract`、`scan_sync_evidence`、`read_sync_status` |
+| 功能清单（只读派生，V09-52） | `feature_ledger`（同一 revision 事实快照 → 唯一义务派生 → `feature_item[]`；**只读**，四维读数分开，绿只取 `verification`；`paging.complete` 与 `coverage.source_complete` 分开。同一判据的 HTTP 读口：`GET /api/projects/:id/feature-ledger`） |
 | 模型相关 | `ask_flash`（**会调用模型**，内部可写概念补全层，不是保证无副作用的只读工具） |
 
 `claim_task` 的 op 面：claim/renew/release/**reopen**（reopen 是协调器专用的受控重开——已提交卡开新 attempt，旧 token 作废、旧结果永久保留，须带可取回的 `reopen_basis`；**不是新工具**，工具数不变）。
@@ -94,7 +96,7 @@ TATAI_REMOTE=1 TATAI_HOST="<局域网 IP>" TATAI_REMOTE_WRITE=1 TATAI_REMOTE_WRI
 - **远程只读、默认关闭**，不提供"允许公网"的开关（局域网通配绑定另有一个**默认拒绝**的显式环境变量逃生口，见上一节）。
 - **没有完整的自动接续与闭环**：当前不具备本链路的完整自动接续、图纸派生与审计证据闭环；中大型/超大型支持须经自举、故障与规模验证。本机单用户优先。
 - **性能只是有条件样本**：2026-10-03 统一优化的读数是**一份冻结的真实项目镜像**（约 2146 文件、约 53 MB 事件账本、9200 事件、44 批次）上每种链路 30 个暖样本的中位值——真实 MCP 完整接续 p50 约 4709 ms → 1333 ms（约 3.5×），直接接续入口 p50 约 2736 ms → 872 ms（约 3.1×），六图摘要 p50 约 417 ms → 263 ms（约 1.6×）。这是该镜像/该现场下的**有条件样本结论，不是普适倍数、也不是「全链路秒回」**：完整同步报告与新增证据写入仍有百毫秒级尖峰，拟议的暖界面 300 ms／轻接续 1 s／小证据 2 s 目标未全面达标；**另有一项如实列出变慢**——扫描幂等单次约 3159 ms → 3588 ms，新增证据场景约 5309 ms → 5009 ms（小幅改善）；换项目规模与负载读数会不同。
-- **已经运行中的 MCP 连接保留旧内存代码**：升级到 v0.3.0 后，要让**当前会话**用上新的接续逻辑与 `read_plan`／`expand_module`／`project_index` 三个新工具，需重连塔台 MCP；新启动的连接使用配置路径下已更新的 `server/mcp.js`。程序更新完成不等于旧客户端内存已更新。
+- **已经运行中的 MCP 连接保留旧内存代码**：升级到 v0.4.0 后，要让**当前会话**用上新的接续逻辑与新增工具（`task_brief`／`preflight_task_result`／`feature_ledger`），需重连塔台 MCP；新启动的连接使用配置路径下已更新的 `server/mcp.js`。程序更新完成不等于旧客户端内存已更新。
 - **不会替你执行或验收**：塔台管理协作事实与执行请求，**不启动/终止 Agent 进程**（外部协调器负责），**不代替用户点 Gate**。MCP 提供工具不等于客户端必然主动调用；只读客户端按能力如实声明。
 - **桌面壳退出的进程树收口**：壳正常关闭或强制结束时，由它启动/接管的后端子树会退出并释放端口（尤其 8787），且**只终止本壳的后端**、不误杀其他 Agent 客户端。**如实限制**：Job 建不出来时退回 `taskkill` 兜底（壳打告警，强杀仍可能留孤儿）；端口被**别的进程**占用时不自动杀占用者（弹窗说明＋给处置命令）。细口径见 [`../src-tauri/README.md`](../src-tauri/README.md)「进程树收口」。
 

@@ -45,14 +45,41 @@ const ok = (cond: boolean, label: string) => {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * 取回一个目录的**全部**直接子级（含被单枝上限聚合掉的那些）。
+ *
+ * 2026-10-06 定向更新（五要素留档）：
+ *   旧前提＝「一次 `expandDirectory` 就给出该目录的全部直接子级」｜依据＝A4 下钻层单枝硬上限
+ *   `ARCH_LIMITS.MAX_CHILDREN = 40`（src/arch/config.ts:20）——超限子级截断并合并为 `__more__`
+ *   聚合节点（§4.3 第 1 招）；`src/server/work` 本批增至 54 个直接子级 ⇒ 一次调用只给 39 个文件
+ *   ＋1 个聚合节点，余下 15 个文件永远进不了叶子集合（实测 74 ≠ 89）｜
+ *   新前提＝按 §3.3「被聚合的分组必须能从聚合入口展开并找到它的每个成员」用 `childrenOffset`
+ *   稳定分页逐页取回（offset 模式不返回聚合节点、全是真实子级），取到 `children_has_more` 为假为止｜
+ *   保留意图＝下面的等式断言仍是**逐路径相等**，一条都不放松｜
+ *   判据不放宽＝等式两侧口径未动，只是把取回手段从「一次调用」换成「同一契约的分页取全」。
+ */
+type ExpandChild = ReturnType<typeof expandDirectory>["children"][number];
+
+function childrenAll(root: string, rel: string): ExpandChild[] {
+  const first = expandDirectory(root, rel);
+  if (first.truncated.children === 0) return first.children;
+  const all: ExpandChild[] = [];
+  for (let offset = 0; ; ) {
+    const page = expandDirectory(root, rel, { childrenOffset: offset });
+    all.push(...page.children);
+    if (page.children.length === 0 || page.children_has_more !== true) break;
+    offset += page.children.length;
+  }
+  return all;
+}
+
+/**
  * 递归下钻收集"文件叶子"的相对路径集合（供下钻终点语义断言用）：
  * dir 子级继续钻、file 子级收进集合、aggregate（超上限聚合节点）不算文件叶子。
  * 用途：把"下钻到文件级的终点语义"表达成**与仓库布局无关**的判据——
  * 递归下钻得到的叶子集合，应当等于该目录（含子层）在磁盘上的真实文件集合。
  */
 function collectFileLeaves(root: string, rel: string, acc: string[] = [], depth = 0): string[] {
-  const r = expandDirectory(root, rel);
-  for (const c of r.children) {
+  for (const c of childrenAll(root, rel)) {
     if (c.kind === "dir") {
       if (depth < 12) collectFileLeaves(root, c.path, acc, depth + 1);
     } else if (c.kind === "file") {

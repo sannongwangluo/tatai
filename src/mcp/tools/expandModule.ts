@@ -19,7 +19,7 @@
 //     故不据此声称内容未变（内容证明见契约 U1：mtime/size/seq 都不算证据）。
 import { expandProject } from "../../arch/expand";
 import { IGNORED_SEGMENTS } from "../../arch/parse";
-import { RENDER_FULL_LIMITS } from "../../arch/config";
+import { JUNK_DIR_RANDOM_TEMP_RE, RENDER_FULL_LIMITS } from "../../arch/config";
 import { isWorkError } from "../../server/work/types";
 import { errorResult, textResult, type McpTool } from "./types";
 
@@ -147,6 +147,9 @@ export const expandModuleTool: McpTool = {
           ...(includeExternal ? { external } : {}),
           source_fingerprint: currentFingerprint,
           ignored_dir_segments: [...IGNORED_SEGMENTS].sort(),
+          // 2026-10-05：随机名临时目录按**形状规则**排除（Python tempfile 的 tmp+8 位随机串），
+          // 与段名清单并列如实带出——规则性排除不是采集残缺，回执写明规则本体。
+          ignored_dir_patterns: [`${JUNK_DIR_RANDOM_TEMP_RE}`],
           external_scope: includeExternal
             ? "external 是**子树级**读数（该子树内文件指向子树外的 import 聚合），不随 children_offset 的子级窗口变化"
             : null,

@@ -55,6 +55,7 @@ import type { ArchLayoutFile, NodePosition } from "../../arch/layoutStore";
 import { PROJECT_ARCH_LAYOUT_KEY } from "../../arch/graph-mode";
 import type { ReconcileResult } from "../../arch/reconcile";
 import {
+  canDrillSharedNode,
   selectDataFlowEdges,
   selectGraph,
   type GraphEdge,
@@ -163,6 +164,8 @@ export type ArchNodeData = {
   aggregateNote?: string;
   /** 聊天补全层节点（2026-09-19 试用增强三期）：chat 徽标 + 不可下钻（没有可解析子树） */
   origin?: "chat";
+  /** V06-05／2026-10-08 五图补齐：规划层节点标记（`plan_origin:"plan"`，审定图纸派生、尚无实测代码对应）；画布据此加「规划」徽标，与代码模块分层显示。规划节点 `path === ""`，无真实路径不可下钻。 */
+  planOrigin?: boolean;
   /** V09-13：**来源种类 + 证据状态**（来源与证据标注，判据在 `provenance.ts`）。
    *  给值时节点上多两个徽标（来源种类 / 证据状态）并挂 `data-arch-source-kind`、
    *  `data-arch-evidence-state`；不给值（旧口径）一个字段都不加。 */
@@ -398,6 +401,15 @@ function ArchNode({ id, data }: NodeProps<ArchFlowNode>) {
             data-arch-chat-node={id}
           >
             chat
+          </span>
+        )}
+        {data.planOrigin === true && (
+          <span
+            className="shrink-0 rounded border border-neutral-700 bg-neutral-800 px-1.5 py-0.5 text-[10px] text-neutral-300"
+            title="规划层节点：来自审定图纸派生、尚无实测代码对应（§4.2 灰「已规划，未开始」）——与代码模块分层显示；无真实路径不可下钻"
+            data-arch-plan-node={id}
+          >
+            规划
           </span>
         )}
         <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] ${badge.badge}`}>
@@ -1458,7 +1470,8 @@ export function ArchCanvas({
           kindBadge: KIND_STYLE[n.kind] ?? KIND_STYLE.mixed,
           aggregate: n.aggregate,
           origin: n.origin,
-          expandable: !n.aggregate && n.origin !== "chat",
+          ...(n.plan_origin === "plan" ? { planOrigin: true as const } : {}),
+          expandable: canDrillSharedNode(n),
           expanded: expanded[n.id] === true,
           busy: expandBusy === n.id,
           status: n.status,
@@ -1606,6 +1619,12 @@ export function ArchCanvas({
     focusedId,
     mode,
     renderEdgesOf,
+    // 2026-10-06 修复（首屏方框图徽标全不渲染的真缺陷）：本 memo 的节点数据读 `provenanceRef.current`（见上方
+    // 节点构造分支），而原依赖表**没有 `provenance`**——标注晚到时 memo 不重算，节点数据里的 provenance 一直
+    // 停在 undefined ⇒ 9 个非聚合节点一个徽标都不渲染（真 DOM 数得出 0/0）。补依赖即可：`provenanceRef.current`
+    // 在渲染期就被赋成本次 prop（635 行），重算时读到的必是新值；DATA_FLOW／思维导图因 deps 含 `mode`（切模式
+    // 即重建）此前未暴露，只有首屏方框图红。
+    provenance,
   ]);
   flowRef.current = flow;
 

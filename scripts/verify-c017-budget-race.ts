@@ -122,6 +122,8 @@ const planMdForged = [
 fs.mkdirSync(workOf(FORGED), { recursive: true });
 fs.writeFileSync(path.join(rootOf(FORGED), ".工作台", "plan.md"), planMdForged);
 fs.writeFileSync(path.join(rootOf(FORGED), ".工作台", "design.md"), "# C017 回炉验证设计书\n");
+// P2/V09-47 返工：结果提交的锁内交付校验**不**因夹具而放宽（空证据不再放行）——夹具按设计补真实证据引用。
+fs.writeFileSync(path.join(rootOf(FORGED), "c017-result-evidence.txt"), "C017 ⑤-6 结果交付证据（项目根内相对路径）\n");
 fs.writeFileSync(path.join(workOf(FORGED), "budget.json"), JSON.stringify({ max_task_claims: 2, near_threshold_ratio: 0.8 }));
 fs.writeFileSync(
   path.join(dataDir, "registry.json"),
@@ -597,7 +599,7 @@ async function main(): Promise<void> {
       run_id: "run-T-D-1",
       attempt_id: "att-T-D-1",
       deliverables: [],
-      evidence_refs: [],
+      evidence_refs: ["c017-result-evidence.txt"],
       verification: [],
       untested: [],
       known_issues: [],

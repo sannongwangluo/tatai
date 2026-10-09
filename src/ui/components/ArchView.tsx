@@ -34,6 +34,7 @@ import type { LocateRequest, ViewKey } from "../arch/locate";
 import { declaredLinksFromMatched } from "../../shared/reconcileLinks";
 import { getArchBlueprint, getArchReconcile, getStatusProjection } from "../api";
 import { moduleStatusKeysOf, taskDerivedModuleStatus } from "../arch/projectGraph";
+import { BusinessDataFlowView } from "../arch/BusinessDataFlowView";
 import type { ProvenanceModel } from "../arch/provenance";
 
 /** 思维导图（markmap）**按需加载**：markmap 系 + d3 只在这一个视图里用，
@@ -68,6 +69,7 @@ export function ArchView({ project }: { project: ProjectItem }) {
   const [projectView, setProjectView] = useState<ProjectViewKind>("functional");
   /** 技术详情内的子切换：默认方框图（A3 起的默认视图不变，回归口径不破） */
   const [mode, setMode] = useState<GraphMode>("MODULE_BOX");
+  const [flowLayer, setFlowLayer] = useState<'business' | 'code'>('business');
   // 思维导图首次进入才挂载（markmap 要真看时才初始化），之后隐藏但不卸载
   const [mindMounted, setMindMounted] = useState(false);
   useEffect(() => {
@@ -129,7 +131,10 @@ export function ArchView({ project }: { project: ProjectItem }) {
           for (const o of proj.objects) projection[o.object_id] = o;
           // V09-08 ①②：配对**只有材料点名了实现落点**的才继承状态色（落点未证实/名字信号一律不继承）
           const links = declaredLinksFromMatched(rec.exists ? (rec.result?.matched ?? []) : []);
-          const derived = taskDerivedModuleStatus({ blueprint, projection, declared_links: links });
+          // 2026-10-08 五图补齐：能力/功能范围节点（plan:cap:* / cap-loop-*）的状态只取 **canonical
+          // `scope_projection`**（与六图 `sixGraphs.ts`／`GET status-projection` 同一份），不由成员汇总
+          // 另算 cap 状态。这里传的就是上面从 `GET status-projection` 现读的同一份 canonical 投影。
+          const derived = taskDerivedModuleStatus({ blueprint, projection, declared_links: links, scope_projection: projection });
           setStatusMap(moduleStatusKeysOf(derived));
         }
         setStatusError(null);
@@ -158,6 +163,7 @@ export function ArchView({ project }: { project: ProjectItem }) {
   /** 发一次定位：切到目标视图 + 把请求交给它（同一模块连点两次也是两次请求，nonce 不同） */
   const requestLocate = useCallback((id: string, label: string, to: ViewKey, from: ViewKey, path?: string) => {
     setMode(to);
+    if (to === 'DATA_FLOW') setFlowLayer('code');
     setTab("tech");
     setLocate({ id, label, to, from, path, nonce: (locateNonceRef.current += 1) });
   }, []);
@@ -217,7 +223,7 @@ export function ArchView({ project }: { project: ProjectItem }) {
             <button
               key={m}
               data-graph-mode={m}
-              onClick={() => setMode(m)}
+              onClick={() => { setMode(m); if (m === 'DATA_FLOW') setFlowLayer('business'); }}
               className={`rounded px-2.5 py-1 text-xs ${
                 mode === m
                   ? "border border-neutral-700 bg-neutral-800 text-neutral-100"
@@ -235,7 +241,12 @@ export function ArchView({ project }: { project: ProjectItem }) {
           深入查看代码结构；项目能力、模块协作和工作安排在上方三个视图中。
         </span>
       </div>
-      <div className={mode === "MIND_MAP" ? "hidden" : "flex min-h-[120px] flex-1 flex-col"} data-arch-canvas-host>
+      {mode === 'DATA_FLOW' && <nav aria-label="数据流图层" className="flex gap-2 border-b border-neutral-700 px-3 py-1.5 text-xs">
+        <button aria-pressed={flowLayer === 'business'} onClick={() => setFlowLayer('business')}>业务数据路径</button>
+        <button aria-pressed={flowLayer === 'code'} onClick={() => setFlowLayer('code')}>代码引用线索</button>
+      </nav>}
+      {mode === 'DATA_FLOW' && flowLayer === 'business' && <BusinessDataFlowView key={project.id} projectId={project.id} />}
+      <div className={mode === "MIND_MAP" || (mode === 'DATA_FLOW' && flowLayer === 'business') ? "hidden" : "flex min-h-[120px] flex-1 flex-col"} data-arch-canvas-host>
         <ArchCanvas
           project={project}
           mode={canvasMode}

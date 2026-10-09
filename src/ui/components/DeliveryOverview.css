@@ -1,0 +1,99 @@
+/* V09-62「交付总览」功能方块网格 + 右侧详情（DESIGN §3.16／§3.17 的用户批准布局返工）。
+ *
+ * 只放这一页新增的类；`tt-dlv-*` 的基础样式仍在 `src/ui/index.css`（不改全局，避免扩大影响）。
+ * 颜色一律复用既有 `--tt-*` 主题变量，深浅主题自动跟随，不新增配色体系。
+ * 绿色（`tt-dlv-chip-ok`）只标**单项维度**的通过读数，且刷新失败（stale）时降为中性——
+ * 与「总览结论只在服务端明确可试用时转绿」的分寸保持一致。
+ *
+ * 2026-10-09 有界收敛（Codex 复审）：首屏只留一句结论 + 紧凑计数，卡片网格是主工作面；
+ * 关闭详情后网格占满可用宽度；窄屏详情叠到**网格上方**并由脚本滚进可视区。 */
+
+/* 页面阅读列（同 index.css 的 `.tt-dlv>*` 口径，略微放宽以便方块成列；双类提权重避免 HMR 顺序影响） */
+.tt-dlv.tt-dlv > * { max-width: 1240px; }
+
+/* 首屏要短：这一页的块间距比全局默认略紧（只作用于本页） */
+.tt-dlv.tt-dlv { gap: 8px; }
+
+/* 功能网格块放宽到整列（方块要成列，详情栏才有空间） */
+.tt-dlv.tt-dlv .tt-dlv-block-wide { max-width: none; }
+
+/* ── 首屏头部区：结论 + 紧凑计数 + 折叠行，尽量矮 ── */
+.tt-dlv-hero { display: flex; flex-direction: column; gap: 2px; }
+.tt-dlv-hero .tt-dlv-conclusion { margin: 0; }
+.tt-dlv-counts {
+  margin: 0; font-size: 12px; line-height: 1.7; color: var(--tt-text);
+  overflow-wrap: anywhere;
+}
+.tt-dlv-accept-line { color: var(--tt-muted); }
+/* 「还差什么」的一行人话分类计数（阻断提示色；不能用 .tt-dlv-warn——同权重下本文件先声明 .tt-dlv-counts） */
+.tt-dlv-blockers-line { color: var(--tt-warning); }
+.tt-dlv-blockhead-line { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 10px; }
+
+.tt-dlv-featurebar { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+
+.tt-dlv-grid-layout { display: grid; grid-template-columns: minmax(0, 1fr) 372px; gap: 16px; align-items: start; }
+/* 关掉详情后：网格占满可用宽度，不留空栏 */
+.tt-dlv-grid-layout[data-detail-open="0"] { grid-template-columns: minmax(0, 1fr); }
+
+.tt-dlv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(212px, 1fr)); gap: 12px; min-width: 0; }
+
+.tt-dlv-card {
+  display: flex; flex-direction: column; gap: 8px; align-items: stretch;
+  min-width: 0; padding: 14px;
+  border: 1px solid var(--tt-border); border-radius: 10px;
+  background: var(--tt-bg); box-shadow: 0 2px 8px var(--tt-shadow);
+  color: var(--tt-text); text-align: left; white-space: normal;
+}
+.tt-dlv-card:hover { border-color: var(--tt-accent); }
+.tt-dlv-card[aria-pressed="true"] { border-color: var(--tt-accent); box-shadow: 0 0 0 1px var(--tt-accent); background: var(--tt-surface); }
+.tt-dlv-card:focus-visible { outline: 2px solid var(--tt-focus); outline-offset: 3px; }
+.tt-dlv-card-index { font-size: 12px; color: var(--tt-subtle); font-variant-numeric: tabular-nums; }
+.tt-dlv-card-name { font-size: 15px; font-weight: 600; line-height: 1.45; overflow-wrap: anywhere; }
+.tt-dlv-card-scenario { font-size: 12px; color: var(--tt-muted); line-height: 1.65; overflow-wrap: anywhere; }
+.tt-dlv-card-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: auto; }
+.tt-dlv-card-chips .tt-dlv-chip { font-size: 11px; padding: 0 6px; }
+
+.tt-dlv-chip { font-size: 12px; line-height: 1.6; padding: 1px 7px; border-radius: 10px; background: var(--tt-surface-muted); color: var(--tt-muted); white-space: nowrap; }
+.tt-dlv-chip-ok { color: var(--tt-positive); background: var(--tt-positive-soft); }
+.tt-dlv-chip-warn { color: var(--tt-warning); background: var(--tt-warning-soft); }
+.tt-dlv-chip-info { color: var(--tt-accent); background: var(--tt-accent-soft); }
+.tt-dlv-chip-neutral { color: var(--tt-muted); background: var(--tt-surface-muted); }
+
+.tt-dlv-pane {
+  position: sticky; top: 0; align-self: start;
+  display: flex; flex-direction: column; gap: 10px; min-width: 0;
+  max-height: calc(100dvh - 150px); overflow: auto;
+  padding: 16px; border: 1px solid var(--tt-border); border-radius: 10px; background: var(--tt-surface);
+}
+.tt-dlv-pane:focus-visible { outline: 2px solid var(--tt-focus); outline-offset: 2px; }
+.tt-dlv-pane-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.tt-dlv-pane-eyebrow { font-size: 12px; color: var(--tt-muted); }
+.tt-dlv-pane-close { width: 28px; height: 28px; border-radius: 6px; font-size: 20px; line-height: 1; color: var(--tt-muted); }
+.tt-dlv-pane-close:hover { background: var(--tt-surface-muted); color: var(--tt-text); }
+.tt-dlv-pane-close:focus-visible { outline: 2px solid var(--tt-focus); outline-offset: 2px; }
+.tt-dlv-pane-name { font-size: 19px; font-weight: 650; line-height: 1.4; overflow-wrap: anywhere; }
+.tt-dlv-pane-purpose { font-size: 13px; line-height: 1.8; color: var(--tt-text); overflow-wrap: anywhere; }
+.tt-dlv-pane-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.tt-dlv-pane-sec { display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--tt-border); padding-top: 10px; }
+.tt-dlv-pane-sec-label { font-size: 12px; font-weight: 400; color: var(--tt-muted); }
+.tt-dlv-pane-sec p { font-size: 13px; line-height: 1.7; color: var(--tt-text); overflow-wrap: anywhere; }
+.tt-dlv-pane-sec p.tt-dlv-muted { font-size: 12px; color: var(--tt-muted); }
+.tt-dlv-pane-sec p.tt-dlv-warn { font-size: 12px; color: var(--tt-warning); }
+
+.tt-dlv-fold > summary { list-style: none; cursor: pointer; }
+.tt-dlv-fold > summary::-webkit-details-marker { display: none; }
+.tt-dlv-fold > summary:after { content: " ▸"; color: var(--tt-muted); }
+.tt-dlv-fold[open] > summary:after { content: " ▾"; }
+.tt-dlv-fold > summary.tt-dlv-block-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 0; }
+
+/* 交付核对折叠行的状态读数：与标题同行，省掉一整块首屏文字 */
+.tt-dlv-state-chip { display: inline-flex; align-items: baseline; gap: 4px; margin-left: 10px; font-size: 12px; font-weight: 400; color: var(--tt-muted); white-space: nowrap; }
+
+/* 窄屏：详情叠到网格**上方**（order 提权），选中后由脚本滚进可视区，不埋在十几张卡下面 */
+@media (max-width: 1120px) {
+  .tt-dlv-grid-layout { grid-template-columns: minmax(0, 1fr); }
+  .tt-dlv-pane { position: static; max-height: none; order: -1; }
+}
+@media (max-width: 560px) {
+  .tt-dlv-grid { grid-template-columns: minmax(0, 1fr); }
+}

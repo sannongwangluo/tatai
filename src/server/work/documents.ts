@@ -46,6 +46,7 @@ import { nowIso } from "../time";
 import { withFileLock } from "../fileLock";
 import { appendJsonlLine } from "../lineStream";
 import { WorkError } from "./types";
+import { memoizedForDerivation } from "./derivationScope";
 import { assertPlanTasksValid, definitionHashOf, parsePlanTable, validatePlanTasks, type PlanTask } from "./planValidate";
 
 /** `.工作台/` 目录名（`workstation.ts` 从这里取，保证全仓只此一处定义） */
@@ -460,12 +461,19 @@ export function revisionObjectRel(kind: DocumentKind, keyHash: string): string {
 }
 
 /**
- * 按**哈希**取不可变历史快照的原文（`*-revisions/<hash>.md`）；读不到/读不动一律返回 null。
+ * 按**哈希**取不可变历史快照的原文；读不到/读不动一律返回 null。
+ *
+ * 两个来源，按序取（**同一份判据**，不猜）：
+ *   ① 盘上不可变副本 `*-revisions/<hash>.md`（`immutable_copy`）；
+ *   ② 基线流水里该哈希对应的 `git:<oid>` 恢复位置（`git_blob`，DESIGN.md §2.6「已在 Git 里可长期
+ *      取回就直接引用」——`preserveRevision` 命中 Git 快速通道时**不落副本**，盘上因此没有文件。
+ *      只按文件名读就会漏：真机现场塔台本项目现行基线的两条 plan 修订即如此）。blob 取回字节的
+ *      sha256 必须等于该哈希，对不上/对象不在 = null（宁严不松）。
  *
  * 与 `textOfRevision` 的差别（2026-09-27，投影层分段失效复核要它）：`textOfRevision` 是
  * 差异对比路径的私有函数，找不到就抛（差异对比不拿近似比较）；本函数是**读侧复核**的
  * 最小读取——找不到快照不是错误，调用方据此**回退整份比对**（宁严不松），所以返回 null 不抛。
- * 只读不可变历史，不碰当前源、不写盘。
+ * **只读**：读不可变副本 / 直读 Git 对象（不经 shell、不写盘、**不扫描 Git 历史**），不碰当前源。
  */
 export function readRevisionSnapshotText(
   projectId: string,
@@ -474,18 +482,141 @@ export function readRevisionSnapshotText(
   dataDir?: string,
 ): string | null {
   const abs = revisionSnapshotAbs(projectId, kind, hash, dataDir);
-  if (abs === null) return null;
-  try {
-    if (!fs.existsSync(abs)) return null;
-    return fs.readFileSync(abs, "utf8");
-  } catch {
-    return null;
+  if (abs !== null) {
+    const text = readSnapshotTextCached(abs);
+    if (text !== null) return text;
   }
+  return readGitSnapshotText(projectId, kind, hash, dataDir);
 }
 
 /**
- * 该修订的不可变快照在盘上有没有（只读；**不读正文**——给带解析缓存的读侧复核做"还在不在"的
- * 廉价前置判断：缓存过的快照也要每次确认文件仍在，否则删掉快照不会回退整份比对）。
+ * 基线流水里按**内容哈希**记下的 `git:<oid>` 恢复位置（只查**本项目**自己的流水，有界）。
+ *
+ * 判据＝恢复记录写的 `sha256`（＝ 该字节流的逐字节 sha256）等于要取的哈希，且 `kind` 相符、
+ * `recovery.kind === "git_blob"`。只在**盘上副本读不到**时才被调用（绝大多数修订有副本），
+ * 所以这里的"扫一遍基线流水"是廉价路径；仍按 `projectId` 隔离——同哈希必同内容，但
+ * "哪条流水记了它、记在哪"是本项目的事实，绝不拿别的项目的恢复位置顶替。
+ */
+function gitRecoveryBySha256(
+  projectId: string,
+  kind: DocumentKind,
+  sha256: string,
+  dataDir?: string,
+): DocumentRecovery | null {
+  if (sha256 === "") return null;
+  return memoizedForDerivation(
+    "documents:git-recovery",
+    `${projectId}\u0000${dataDir ?? ""}\u0000${kind}\u0000${sha256}`,
+    () => {
+      let log: BaselineLog;
+      try {
+        log = readBaselineLog(projectId, dataDir);
+      } catch {
+        return null;
+      }
+      for (let i = log.baselines.length - 1; i >= 0; i--) {
+        const b = log.baselines[i];
+        for (const ref of [b.design_revision, b.plan_revision]) {
+          if (ref.kind !== kind) continue;
+          if (ref.recovery.kind !== "git_blob") continue;
+          if (ref.content_sha256 !== sha256 || ref.recovery.sha256 !== sha256) continue;
+          return ref.recovery;
+        }
+      }
+      return null;
+    },
+  );
+}
+
+/** `git:<oid>` 里的 oid；形状不对 = 不认（绝**不把哈希名直接当路径**用） */
+function gitOidOf(ref: DocumentRecovery): string | null {
+  const oid = ref.ref.startsWith("git:") ? ref.ref.slice("git:".length) : "";
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid) ? oid : null;
+}
+
+/**
+ * 按内容哈希从基线流水找回 `git:<oid>` 并直读原文（`git cat-file`，**不经 shell**）。
+ * 取回字节的 sha256 必须等于记录哈希，否则 = null；对象不在/读不动 = null（fail-closed，不猜）。
+ */
+function readGitSnapshotText(
+  projectId: string,
+  kind: DocumentKind,
+  sha256: string,
+  dataDir?: string,
+): string | null {
+  const rec = gitRecoveryBySha256(projectId, kind, sha256, dataDir);
+  if (rec === null) return null;
+  const oid = gitOidOf(rec);
+  if (oid === null) return null;
+  const root = resolveDocumentSource(projectId, kind, dataDir).project_root;
+  return memoizedForDerivation("documents:git-blob-text", `${root}\u0000${oid}\u0000${rec.sha256}`, () => {
+    let out: Buffer;
+    try {
+      out = Buffer.from(
+        execFileSync("git", ["-C", root, "cat-file", "blob", oid], {
+          maxBuffer: 64 * 1024 * 1024,
+          timeout: 5000,
+          stdio: ["ignore", "pipe", "ignore"],
+        }),
+      );
+    } catch {
+      return null;
+    }
+    return sha256Hex(out) === rec.sha256 ? out.toString("utf8") : null;
+  });
+}
+
+/** 快照对象正文的只读读法（**按绝对路径**在「一次派生」内复用；见 `derivationScope`）。 */
+function readSnapshotTextCached(abs: string): string | null {
+  return memoizedForDerivation("documents:snapshot-text", abs, () => {
+    try {
+      if (!fs.existsSync(abs)) return null;
+      return fs.readFileSync(abs, "utf8");
+    } catch {
+      return null;
+    }
+  });
+}
+
+/**
+ * 快照对象正文 + 其**解码后文本的内容哈希**（同一遍读算出，一起在「一次派生」内复用）。
+ *
+ * 供 `planContentSnapshotIndex` 这类"逐候选读原文并核内容哈希"的解析器用：候选名常常是同一批
+ * （同一定义哈希下的多份正文），此前每个候选、每次调用都要重读 466 KB 并重算 sha256——现场一次
+ * 派生里同一份对象被读+核哈希 944 次。这里把"读到的正文"和"它的哈希"绑定成一次计算，派生内复用。
+ *
+ * **哈希输入是 UTF-8 解码后的文本**（`sha256Hex(text)`）——这正是旧 `planContentSnapshotIndex.read`
+ * 的判据（它先 `readRevisionSnapshotText` 拿到文本、再 `sha256Hex(text)`），逐字保留。需要**原始字节**
+ * 摘要的调用方（不可变副本内容核对）用下面的 `readSnapshotRawShaCached`，不要用这个。
+ */
+function readSnapshotTextAndShaCached(abs: string): { text: string; sha256: string } | null {
+  return memoizedForDerivation("documents:snapshot-text-sha", abs, () => {
+    const text = readSnapshotTextCached(abs);
+    return text === null ? null : { text, sha256: sha256Hex(text) };
+  });
+}
+
+/**
+ * 快照对象**盘上原始字节**的 sha256（按绝对路径在「一次派生」内复用）。
+ *
+ * 与 `readSnapshotTextAndShaCached` 的唯一区别是**哈希的输入**：这里哈希未解码的 `Buffer`。旧
+ * `existingRecovery` 就是 `sha256Hex(fs.readFileSync(abs))`，判据必须逐字保留——先解成 UTF-8 再哈希，
+ * 会让"非法字节被替换字符吞掉"的篡改蒙混过关（真实反例见
+ * `E/runtime-final/ROOT-RAW-BYTE-ACTUAL.json`：同一段文本的合法字节与非法字节解码相同、文本哈希相同）。
+ * 因此不改 `readFileSync` 的 try 语义：读失败照旧抛出（判据与旧实现一致），缺文件由调用方先 `existsSync`。
+ */
+function readSnapshotRawShaCached(abs: string): string {
+  return memoizedForDerivation("documents:snapshot-raw-sha", abs, () =>
+    sha256Hex(fs.readFileSync(abs)),
+  );
+}
+
+/**
+ * 该修订的不可变快照**取不取得到**（只读；**不读正文**——给带解析缓存的读侧复核做"还在不在"的
+ * 廉价前置判断：缓存过的快照也要每次确认来源仍在，否则删掉快照不会回退整份比对）。
+ *
+ * 两个来源都要认：盘上副本存在，或基线流水的 Git 对象可读且内容哈希吻合。
+ * Git 原始对象文件仍可能损坏；读取与哈希核验在每次派生内复用，不仅检查对象路径是否存在。
  */
 export function revisionSnapshotExists(
   projectId: string,
@@ -494,12 +625,17 @@ export function revisionSnapshotExists(
   dataDir?: string,
 ): boolean {
   const abs = revisionSnapshotAbs(projectId, kind, hash, dataDir);
-  if (abs === null) return false;
-  try {
-    return fs.existsSync(abs);
-  } catch {
-    return false;
+  if (abs !== null) {
+    try {
+      if (fs.existsSync(abs)) return true;
+    } catch {
+      // 盘上路径不可判：落到 Git 来源继续判（不因此放行）
+    }
   }
+  const rec = gitRecoveryBySha256(projectId, kind, hash, dataDir);
+  if (rec === null) return false;
+  // 仅 cat-file -e 不能发现对象文件在原路径被篡改；暖缓存复用前也核实际内容哈希。
+  return readGitSnapshotText(projectId, kind, hash, dataDir) !== null;
 }
 
 /** 快照绝对路径（空哈希 → null）；只拼路径，不碰盘 */
@@ -542,6 +678,82 @@ function revisionObjectCandidates(
   return [primary, { rel: revisionObjectRel(kind, revision.content_sha256), key: revision.content_sha256 }];
 }
 
+/**
+ * 施工图「**内容哈希** → 不可变快照对象」的读侧解析器（有限集合、有据可核）。
+ *
+ * 为什么需要它（V09-45…V09-50 真机现场）：施工图不可变对象的**主名是定义哈希**（DESIGN.md §2.6），
+ * 同一定义哈希下的**另一份正文**才按内容哈希另存（§2.9；见 `revisionObjectCandidates`）。而一条
+ * 检查记录绑的是**内容哈希**——只有「这份正文恰好是该定义哈希下的首份」时，
+ * `readRevisionSnapshotText(plan, 内容哈希)` 才直读得到；旧修订（盘上只有定义名文件）直读得 null。
+ * 读侧若据此回退整份比对，本可用**分段复核**救回的「本卡没变」就被误判 stale（假 stale）。
+ *
+ * 本解析器只做一件有界的事：把内容哈希经**已核基线流水**映回该修订的对象候选名（定义哈希主名优先，
+ * 内容哈希兜底），**逐候选读原文并核内容哈希**——核不上不算命中（不拿主名顶替、不当篡改过的对象是它）。
+ * 候选只来自基线流水与内容哈希本身，**不扫描无限历史**；读不到/核不上就 `read()` 返回 null（不猜）。
+ *
+ * 盘上**一个候选文件都没有**时还有第三种落点（同一条根因，2026-10-08 补）：该修订可能经
+ * 「Git 里已能逐字节取回」直接引用为 `git:<oid>`（DESIGN.md §2.6），`preserveRevision` 那时**不落副本**，
+ * 于是只按对象文件读必得 null、回退整份比对，把本卡没变误判 stale。此时按**内容哈希**从本项目基线流水
+ * 找回该 blob 直读并核哈希（`readGitSnapshotText`）——仍是有界、只读、不扫描 Git 历史。
+ */
+export interface PlanContentSnapshotIndex {
+  /** 内容哈希 → 对象候选键（定义哈希主名优先，含内容哈希兜底；只拼名字、有界） */
+  object_keys(contentSha: string): string[];
+  /**
+   * 逐候选读并**核内容哈希**；命中的快照原文 + 实际对象名／Git 引用，读不到/核不上 = null。
+   * Git 来源命中时 `source_ref` 是 `git:<oid>`、`object_key` 是内容哈希（复核侧据此复查来源仍在）。
+   */
+  read(contentSha: string): { text: string; source_ref: string; object_key: string } | null;
+}
+
+export function planContentSnapshotIndex(projectId: string, dataDir?: string): PlanContentSnapshotIndex {
+  const byContent = new Map<string, ProjectBaseline>();
+  try {
+    for (const b of readBaselineLog(projectId, dataDir).baselines) {
+      byContent.set(b.plan_revision.content_sha256, b);
+    }
+  } catch {
+    // 基线流水读不了：退化为「按内容哈希直读」，读不到就是 null（不猜）
+  }
+  const object_keys = (contentSha: string): string[] => {
+    const out: string[] = [];
+    const b = byContent.get(contentSha);
+    if (b !== undefined) {
+      for (const h of [b.plan_revision.definition_sha256, b.plan_revision.content_sha256]) {
+        if (typeof h === "string" && h !== "" && !out.includes(h)) out.push(h);
+      }
+    }
+    if (contentSha !== "" && !out.includes(contentSha)) out.push(contentSha);
+    return out;
+  };
+  const read = (contentSha: string): { text: string; source_ref: string; object_key: string } | null => {
+    if (contentSha === "") return null;
+    for (const h of object_keys(contentSha)) {
+      // 逐候选读原文并核内容哈希：读+哈希在**一次派生**内按绝对路径复用（候选名在多个绑定间重复，
+      // 现场实测同一份 466 KB 对象被读+核哈希 944 次）。核不上不算命中——判据一分不改。
+      const abs = revisionSnapshotAbs(projectId, "plan", h, dataDir);
+      const got = abs === null ? null : readSnapshotTextAndShaCached(abs);
+      if (got !== null && got.sha256 === contentSha) {
+        return { text: got.text, source_ref: `${PLAN_REVISIONS_DIR}/${h}.md`, object_key: h };
+      }
+    }
+    // 盘上没有任何候选文件：这份内容可能是经「Git 里已能逐字节取回」直接引用的（`git:<oid>`，§2.6），
+    // 那时 `preserveRevision` **不落副本**——只按文件名读必得 null、回退整份比对，把本可分段救回的
+    // 「本卡没变」误判 stale。经**本项目已核基线流水**按内容哈希找回该 blob 直读并核哈希（有界、只读、
+    // 不扫描 Git 历史）；读不回/对不上 = null（不猜、不拿别的对象顶替）。
+    const rec = gitRecoveryBySha256(projectId, "plan", contentSha, dataDir);
+    if (rec !== null) {
+      const text = readGitSnapshotText(projectId, "plan", contentSha, dataDir);
+      if (text !== null) {
+        // object_key 给**内容哈希**：复核侧按它做"快照还在不在"的复查（`revisionSnapshotExists` 同样认 Git 来源）
+        return { text, source_ref: rec.ref, object_key: contentSha };
+      }
+    }
+    return null;
+  };
+  return { object_keys, read };
+}
+
 function gitAvailable(root: string): boolean {
   return fs.existsSync(path.join(root, ".git"));
 }
@@ -573,7 +785,7 @@ function gitBlobRef(root: string, bytes: Buffer): string | null {
     })
       .toString("utf8")
       .trim();
-    if (!/^[0-9a-f]{40,64}$/.test(oid)) return null;
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid)) return null;
     const back = execFileSync("git", ["-C", root, "cat-file", "blob", oid], {
       maxBuffer: 64 * 1024 * 1024,
       stdio: ["ignore", "pipe", "ignore"],
@@ -626,7 +838,9 @@ function existingRecovery(
   for (const candidate of revisionObjectCandidates(source.kind, revision)) {
     const abs = path.join(source.project_root, candidate.rel);
     if (!fs.existsSync(abs)) continue;
-    const sha = sha256Hex(fs.readFileSync(abs));
+    // 读+核内容哈希按绝对路径在「一次派生」内复用；**哈希的是盘上原始字节**（判据与旧实现
+    // `sha256Hex(fs.readFileSync(abs))` 逐字相同），对不上盘（含 UTF-8 非法字节的同形篡改）不算命中。
+    const sha = readSnapshotRawShaCached(abs);
     if (sha !== revision.content_sha256) continue;
     return { kind: "immutable_copy", ref: candidate.rel, key: candidate.key, sha256: sha };
   }
@@ -901,13 +1115,22 @@ export function loadDocument(
       reason: "not_a_file",
     });
   }
-  const text = fs.readFileSync(source.abs_path, "utf8");
-  const table = kind === "plan" ? parsePlanTable(text) : null;
+  // 一次派生里同一份图纸源只读+解析一次（现场实测 DESIGN/PLAN 在一次六图派生里被读+解析 18 次）：
+  // 文本、施工行解析、修订（定义哈希/章节索引/恢复位置核查）各按身份在 `derivationScope` 内复用。
+  // 作用域只在**一次同步派生**里有效，下一个请求照旧现读现算（源一变立刻可见）。
+  const abs = source.abs_path;
+  const text = memoizedForDerivation("documents:source-text", abs, () => fs.readFileSync(abs, "utf8"));
+  const table = kind === "plan" ? memoizedForDerivation("documents:plan-table", abs, () => parsePlanTable(text)) : null;
+  const revision = memoizedForDerivation("documents:revision", `${kind}\u0000${abs}`, () =>
+    revisionOf(source, text),
+  );
   return {
     source,
-    revision: revisionOf(source, text),
+    // 记忆化的是**只读计算**（读文本/解析/核恢复位置）；返回给调用方的 revision 与 tasks 一律给
+    // **深独立副本**——调用方改它们不会串到同派生的别处，也不会回写到记忆里（与不引入复用时的可见行为一致）。
+    revision: structuredClone(revision),
     text,
-    tasks: table?.rows ?? [],
+    tasks: table === null ? [] : structuredClone(table.rows),
     table_found: table !== null,
   };
 }

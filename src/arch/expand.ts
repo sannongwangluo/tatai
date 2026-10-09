@@ -3,7 +3,7 @@
 // **文件名即名字，LLM 零参与**（§4.1 红线：文件层纯静态，本文件不 import 任何 flash 模块）。
 // 懒加载硬约束（§4.3 第 2 招）：tree-sitter 只解析该子树范围内的源码文件；
 // 子树外只走文件名清单（判断 import 是否指向子树外），一个字节都不读、不解析。
-// 复用 A1 同一把解析器（parse.ts）与同一忽略口径（IGNORED_SEGMENTS），不自己发明轮子。
+// 复用 A1 同一把解析器（parse.ts）与同一忽略口径（isJunkDir＝具名段+*.egg-info+随机临时目录形状），不自己发明轮子。
 // N2 加两处降级（都只为巨枝，正常项目不触发）：
 //   ① 单枝子级硬上限（§4.3 第 1 招，数值与实现都在共用数据层，本文件只调用）：超上限的子级
 //      **在遍历之前**就被截掉 → 不遍历、不解析、不渲染，变成一个聚合节点；
@@ -17,16 +17,16 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { getProject } from "../server/registry";
 import { WsError } from "../server/workstation";
+import { isJunkDir } from "./config";
 import {
-  IGNORED_SEGMENTS,
   SOURCE_EXTS,
   WALK_LIMITS,
   boundedWalk,
   parseFileImports,
   slugify,
 } from "./parse";
-import { capChildren } from "./shared-graph";
-import { ARCH_LIMITS, CHANGE_DOT_WINDOW_HOURS } from "./config";
+import { capChildren, defaultChildLimit } from "./shared-graph";
+import { CHANGE_DOT_WINDOW_HOURS } from "./config";
 
 /** 子级节点（子模块=目录 / 文件节点 / 聚合节点） */
 export interface ExpandChild {
@@ -173,7 +173,8 @@ function recentChangedPaths(root: string): Set<string> {
  * @param root 项目根（绝对或相对）
  * @param modulePath 相对项目根的模块路径（posix；"." = 根散文件模块，只展开根直属文件）
  * @param opts.childrenLimit 本次生效的单枝子级硬上限（V09-22 全量模式传 RENDER_FULL_LIMITS.MAX_CHILDREN；
- *   缺省走 config.ts 的 ARCH_LIMITS.MAX_CHILDREN，行为与概览默认逐字节相同）。截断仍在遍历子树**之前**
+ *   缺省走共用数据层的单枝子级上限（`defaultChildLimit()`；数值口径仍在 config.ts，本文件不引它），
+ *   行为与概览默认逐字节相同）。截断仍在遍历子树**之前**
  *   落地；full 时 readdir 本来就全读了，直接子级全量列出，子树遍历仍走 WALK_LIMITS 预算、
  *   budget_exhausted 照实带出。
  * @param opts.childrenOffset V09-22 契约 2：传了它（含 0）即切到**稳定分页**模式——不再截断成「还有 N 个」
@@ -208,7 +209,7 @@ export function expandDirectory(
   ) {
     throw new WsError("INVALID_INPUT", `模块路径非法: ${modulePath}`);
   }
-  if (norm !== "." && norm.split("/").some((seg) => IGNORED_SEGMENTS.has(seg))) {
+  if (norm !== "." && norm.split("/").some((seg) => isJunkDir(seg))) {
     throw new WsError("INVALID_INPUT", `模块路径命中忽略段: ${modulePath}`);
   }
   const dirAbs = norm === "." ? abs : path.join(abs, ...norm.split("/"));
@@ -236,7 +237,7 @@ export function expandDirectory(
   // ── 直接子级扫描：子目录 → 子模块节点，直属文件 → 文件节点（忽略口径同 A1）──
   const entries = fs
     .readdirSync(dirAbs, { withFileTypes: true })
-    .filter((e) => !(e.isDirectory() && IGNORED_SEGMENTS.has(e.name)))
+    .filter((e) => !(e.isDirectory() && isJunkDir(e.name)))
     .sort((a, b) => a.name.localeCompare(b.name));
   // "." 根散文件模块的特殊口径：它的成员只有根直属文件（顶层目录是别的顶层模块，不算子级）
   const directDirs = norm === "." ? [] : entries.filter((e) => e.isDirectory() && !e.isSymbolicLink());
@@ -251,7 +252,7 @@ export function expandDirectory(
   // 而是把排序后全量直接子级按 [offset, offset+limit) 开窗（全是真实子级，逐页可取回上限外的对象）。
   const parentId = slugify(norm);
   const allChildren: fs.Dirent[] = [...directDirs, ...directFiles];
-  const childrenLimit = opts.childrenLimit ?? ARCH_LIMITS.MAX_CHILDREN;
+  const childrenLimit = opts.childrenLimit ?? defaultChildLimit();
   const offsetMode = opts.childrenOffset !== undefined;
   const pageOffset = offsetMode ? Math.max(0, Math.floor(opts.childrenOffset as number)) : 0;
   const capped = offsetMode ? null : capChildren<fs.Dirent>(allChildren, parentId, childrenLimit);

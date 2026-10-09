@@ -15,17 +15,24 @@
 // （首尾逐文件 sha256 对照，证明零改动）；收尾清理自建临时目录与起过的子进程（TATAI_KEEP_TMP=1 保留现场）。
 //
 // 检查项与场景对应：
-//   ① 真实入口登记（POST /documents/activate）→ 提交检查证据（POST /api/work/command，唯一写入服务面）
-//      → 读取父级状态（GET /status-projection）；绿灯依据可追溯到记录 / 定义版本 / 证据哈希。
+//   ① 真实入口登记（POST /documents/activate）→ 提交检查证据（正文 POST /api/work/reporting/evidence、
+//      记录 POST /api/work/command，都是唯一写入服务面）→ 读取父级状态（GET /status-projection）；
+//      绿灯依据可追溯到记录 / 定义版本 / 证据哈希（绑的是真实源清单指纹）。
 //   ② 服务重启后结果一致（真起后端、杀进程、再起、读同一状态）。
 //   ③ 缺自身集成证据不绿（声明了但没交检查记录 → 父级不绿，且缺口点名的正是那条检查）。
-//   ④ 证据过期撤销当前通过：④-a 被测版本前进（code 修订变化）→ 旧绿转待验证；
-//      ④-b 图纸改一行 → 当前声明不再被有效基线批准 + 旧证据随 plan 修订过期。
+//   ④ 证据过期撤销当前通过：④-a 改 fixture 覆盖的真实源 `src/data.ts` → 源清单失效、旧绿转待验证；
+//      ④-b 图纸改一行（改 C-3 卡定义）→ 当前声明不再被有效基线批准 + 旧证据随 plan 修订过期。
 //   ⑤ 两个端点绿不能代替集成线通过（集成线要自己的检查记录；补交后才绿）。
 //   反例：伪造 GET 参数 / 向前端声明式地"注入"集成检查要求 → 一个字节都改不动结果。
 //
-// 已知边界（如实登记，不冒充）：证据**正文**今天没有 HTTP 写口（V06-09 未提供），
-// 故正文走进程内 `putEvidence`（内容寻址 + 不可变），**检查记录事件**才走真实 HTTP 写入面。
+// 存证/记录口径（V09-27/V09-29 之后，本脚本 2026-10-08 起同步）：证据**正文**与**检查记录**都经真实
+// HTTP 唯一写宿主——正文 `POST /api/work/reporting/evidence`、记录 `POST /api/work/command`
+// （同一描述符令牌），不再走进程内 `putEvidence` 直写项目目录。
+//
+// 被测源码口径（契约 F4 / V09-29）：**当前代码版本不来自账本自报**（`revisions.code` 产品读口恒为 null，
+// 自报值只落 `code_declared` 展示）。本夹具用**真实源清单**（`source_manifest` 覆盖 `src/data.ts`）
+// 给 `module:data::integration` 背书，其 **binding.revision = 服务端算出的清单指纹**（不是自报 code 修订）；
+// 改掉覆盖的真实源文件即令旧绿转 `stale`（见 ④-a），不靠 `code_declared`、也不改期望为「不绿消红」。
 
 import crypto from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -34,13 +41,13 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import {
-  checksFromAudit,
+  checksFromFacts,
   collectProjectFacts,
   objectsFromFacts,
   projectStatuses,
   type StatusObjectInput,
 } from "../src/server/work/statusProjection";
-import { putEvidence, type RevisionKind } from "../src/server/work/evidence";
+import type { RevisionKind } from "../src/server/work/evidence";
 import { readServiceDescriptor } from "../src/server/work/service";
 import { projectWorkDir } from "../src/server/workstation";
 
@@ -108,6 +115,11 @@ const workbench = (root: string) => path.join(root, ".工作台");
 for (const d of [dataDir, mainRoot]) mkdirp(d);
 const MAIN_WORK = path.join(workbench(mainRoot), "work");
 
+/** 被 module:data::integration 的**真实源清单**覆盖的源码（项目根内相对路径 + 两版内容，供篡改/前进用） */
+const DATA_REL = "src/data.ts";
+const DATA_V1 = "export const DATA = 'data-v1';\n";
+const DATA_V2 = "export const DATA = 'data-v2-changed';\n";
+
 /**
  * 夹具施工图：施工卡表（V06-02 口径）+ 卡正文 + **集成检查要求表（补修 C 的版本化验收定义）**。
  * 集成检查要求小节标题含「集成检查要求」；表见 `parseIntegrationRequirements`。
@@ -165,7 +177,7 @@ let planText = PLAN_HEAD;
 const DESIGN_TEXT = "# 夹具设计书（补修包 C）\n\n## 1 概述\n本夹具用于验证父级集成检查的正式持久化链路。\n";
 write(path.join(workbench(mainRoot), "design.md"), DESIGN_TEXT);
 write(path.join(workbench(mainRoot), "plan.md"), planText);
-write(path.join(mainRoot, "src", "data.ts"), "export const DATA = 'data-v1';\n");
+write(path.join(mainRoot, DATA_REL), DATA_V1);
 write(path.join(mainRoot, "src", "ui.ts"), "export const UI = 'ui-v1';\n");
 // v1 台账：模块归属的唯一现实来源（父级 = module:<module_id>）
 write(
@@ -208,21 +220,8 @@ ok(projectWorkDir(MAIN, dataDir) === MAIN_WORK, `夹具注册表可解析项目 
 
 const planRev1 = sha256(planText);
 const designRev = sha256(DESIGN_TEXT);
-const codeRev1 = sha256("code-v1");
-const codeRev2 = sha256("code-v2");
-/** 集成检查结果的被测版本（code 维度）——④-a 用它证明"被测版本前进 → 旧绿转待验证" */
+/** 集成检查结果的被测版本维度（code）——④-a 证明"被覆盖的真实源前进 → 旧绿转待验证" */
 const CODE_KIND: RevisionKind = "code";
-
-const putEv = (kind: Parameters<typeof putEvidence>[1]["kind"], summary: string, content: string, revision: { kind: RevisionKind; value: string }) =>
-  putEvidence(MAIN_WORK, {
-    content,
-    kind,
-    summary,
-    created_by: "kimi-code",
-    role: "executor",
-    binding: { revision_kind: revision.kind, revision: revision.value },
-    source_ref: summary,
-  });
 
 const portListening = (port: number): Promise<boolean> =>
   new Promise((resolve) => {
@@ -325,6 +324,41 @@ const submitCommand = async (input: {
   return res;
 };
 
+// ── 唯一写入服务面（真实 HTTP 写口：POST /api/work/reporting/evidence + 描述符令牌）──
+// 证据正文（含源清单）也经唯一写宿主落盘：不再在脚本进程里 `putEvidence` 直写项目目录。
+const storeEvidence = async (input: {
+  kind: string;
+  summary: string;
+  content?: string;
+  binding: { revision_kind: RevisionKind; revision: string };
+  source_manifest?: unknown;
+}): Promise<{ sha256: string; fingerprint: string | null; raw: any }> => {
+  const res = await api("/api/work/reporting/evidence", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-tatai-work-token": workToken },
+    body: JSON.stringify({
+      project_id: MAIN,
+      kind: input.kind,
+      summary: input.summary,
+      created_by: "kimi-code",
+      role: "executor",
+      binding: input.binding,
+      source_ref: input.summary,
+      ...(input.content === undefined ? {} : { content: input.content }),
+      ...(input.source_manifest === undefined ? {} : { source_manifest: input.source_manifest }),
+    }),
+  });
+  if (res.status !== 200 || res.body?.ok !== true) {
+    throw new Error(`证据正文落盘失败（HTTP ${res.status}）：${res.text}`);
+  }
+  const ev = res.body.evidence ?? {};
+  return {
+    sha256: String(ev.sha256 ?? ""),
+    fingerprint: ev.source_manifest?.fingerprint ? String(ev.source_manifest.fingerprint) : null,
+    raw: ev,
+  };
+};
+
 const projectionOf = async (query = "") => (await api(`/api/projects/${MAIN}/status-projection${query}`)).body?.projection;
 const objectOf = (proj: any, objectId: string) => (proj?.objects ?? []).find((o: any) => o.object_id === objectId);
 const codesOf = (o: any): string[] => (o?.reasons ?? []).map((r: any) => r.code);
@@ -342,6 +376,10 @@ async function main(): Promise<void> {
   workToken = desc?.token ?? "";
 
   // 任务定义导入（模块归属要有任务状态才进对象表）——此时**还没有**有效基线
+  // P2/V09-47 最终纠正：这里是**夹具的历史状态**（造"这几张卡已交过结果"的现场，不是一次新交付）——
+  // 按**既有状态边界** `task.status_changed` + `payload.status` 写（与 `migrate.ts` 把 v1 `done` 折成
+  // `result_submitted` 同一形态）；`task.result_submitted` 是交付提交事件，只由带合法认领 + 证据的提交
+  // 写入（锁内共享判据），夹具不冒充交付提交、也不要求产品为夹具放宽校验。
   for (const id of ["C-1", "C-2", "C-3"]) {
     const r = await submitCommand({
       type: "task.definition_imported",
@@ -351,12 +389,12 @@ async function main(): Promise<void> {
     });
     if (r.status !== 200) throw new Error(`task.definition_imported ${id} 失败：${r.status} ${r.text}`);
     const r2 = await submitCommand({
-      type: "task.result_submitted",
+      type: "task.status_changed",
       entity_id: `task:${id}`,
       expected_revision: 1,
-      payload: {},
+      payload: { status: "result_submitted" },
     });
-    if (r2.status !== 200) throw new Error(`task.result_submitted ${id} 失败：${r2.status} ${r2.text}`);
+    if (r2.status !== 200) throw new Error(`task.status_changed(${id} → result_submitted) 失败：${r2.status} ${r2.text}`);
   }
 
   // 0 前置：声明读到了，但没有有效基线 → 不据此判绿
@@ -400,14 +438,24 @@ async function main(): Promise<void> {
     `1-3 生效后父级的必需项里就有那条集成检查（module:data required=${mDataRegistered?.required_count}，缺口原话「${whyReg}」）`,
   );
 
-  // ①-b 提交检查证据（先落证据正文：内容寻址 + 不可变；再交检查记录事件）
-  const evChild1 = putEv("self_check", "C-1 数据层验收记录", "$ pnpm test data\nOK 数据层\n", { kind: "plan", value: planRev1 });
-  const evChild2 = putEv("self_check", "C-2 接口层验收记录", "$ pnpm test api\nOK 接口层\n", { kind: "plan", value: planRev1 });
-  const evChild3 = putEv("self_check", "C-3 展示层验收记录", "$ pnpm test ui\nOK 展示层\n", { kind: "plan", value: planRev1 });
-  const evIntData = putEv("self_check", "module:data 集成检查输出", "$ pnpm test integ:data\nOK 数据层内部读写链路\n", { kind: CODE_KIND, value: codeRev1 });
-  const evIntUi = putEv("self_check", "module:ui 集成检查输出", "$ pnpm test integ:ui\nOK 展示层内部链路\n", { kind: "plan", value: planRev1 });
+  // ①-b 提交检查证据（先经唯一写宿主 HTTP 落证据正文：内容寻址 + 不可变；再交检查记录事件）
+  const evChild1 = await storeEvidence({ kind: "self_check", summary: "C-1 数据层验收记录", content: "$ pnpm test data\nOK 数据层\n", binding: { revision_kind: "plan", revision: planRev1 } });
+  const evChild2 = await storeEvidence({ kind: "self_check", summary: "C-2 接口层验收记录", content: "$ pnpm test api\nOK 接口层\n", binding: { revision_kind: "plan", revision: planRev1 } });
+  const evChild3 = await storeEvidence({ kind: "self_check", summary: "C-3 展示层验收记录", content: "$ pnpm test ui\nOK 展示层\n", binding: { revision_kind: "plan", revision: planRev1 } });
+  // module:data 的集成检查证据 = **真实源清单**（覆盖 DATA_REL）；清单指纹由服务端**现读**盘上内容算出。
+  const evIntData = await storeEvidence({
+    kind: "source_manifest",
+    summary: "module:data 集成检查源清单（覆盖 src/data.ts）",
+    content: "$ pnpm test integ:data\nOK 数据层内部读写链路\n",
+    binding: { revision_kind: CODE_KIND, revision: sha256(DATA_V1) },
+    source_manifest: [{ path: DATA_REL, sha256: sha256(DATA_V1) }],
+  });
+  const manifestFp1 = evIntData.fingerprint;
+  if (manifestFp1 === null) throw new Error("源清单未回执指纹：无法把检查绑到真实源清单");
+  const evIntUi = await storeEvidence({ kind: "self_check", summary: "module:ui 集成检查输出", content: "$ pnpm test integ:ui\nOK 展示层内部链路\n", binding: { revision_kind: "plan", revision: planRev1 } });
 
-  // 结果提交：把"当前被测代码版本"定到 codeRev1（集成检查绑的正是它）
+  // 结果提交（交付记录）：绑定 = 真实源清单指纹。**不**把它当"当前代码版本"用——
+  // 产品读口 `revisions.code` 恒为 null、自报值只落 `code_declared`；这里只是如实登记交付所覆盖的源。
   const sub1 = await submitCommand({
     type: "audit.submission_submitted",
     entity_id: "submission:c-round1",
@@ -416,9 +464,9 @@ async function main(): Promise<void> {
     payload: {
       goal: "补修 C 夹具：数据层/接口层/展示层交付",
       task_id: "C-1",
-      changed_files: ["src/data.ts", "src/api.ts", "src/ui.ts"],
+      changed_files: [DATA_REL, "src/api.ts", "src/ui.ts"],
       commands: [{ command: "pnpm test", exit_code: 0, output_ref: null }],
-      binding: { revision_kind: CODE_KIND, revision: codeRev1 },
+      binding: { revision_kind: CODE_KIND, revision: manifestFp1 },
       submitted_by: "kimi-code",
     },
   });
@@ -454,7 +502,7 @@ async function main(): Promise<void> {
     await selfCheck("c-c1", "C-1", "C-1::evidence", evChild1.sha256, { kind: "plan", value: planRev1 }, ["数据层读写"], "2026-09-20T01:10:00+08:00", "document"),
     await selfCheck("c-c2", "C-2", "C-2::evidence", evChild2.sha256, { kind: "plan", value: planRev1 }, ["接口层请求/响应"], "2026-09-20T01:11:00+08:00", "document"),
     await selfCheck("c-c3", "C-3", "C-3::evidence", evChild3.sha256, { kind: "plan", value: planRev1 }, ["展示层渲染"], "2026-09-20T01:12:00+08:00", "document"),
-    await selfCheck("c-int-data", "module:data", "module:data::integration", evIntData.sha256, { kind: CODE_KIND, value: codeRev1 }, ["数据层→存储 端到端", "边界：空输入"], "2026-09-20T01:20:00+08:00"),
+    await selfCheck("c-int-data", "module:data", "module:data::integration", evIntData.sha256, { kind: CODE_KIND, value: manifestFp1 }, ["数据层→存储 端到端", "边界：空输入"], "2026-09-20T01:20:00+08:00"),
     await selfCheck("c-int-ui", "module:ui", "module:ui::integration", evIntUi.sha256, { kind: "plan", value: planRev1 }, ["展示层→接口 端到端"], "2026-09-20T01:21:00+08:00", "document"),
   ];
   ok(
@@ -497,11 +545,12 @@ async function main(): Promise<void> {
   const basisData = (mData?.evidence_basis ?? []).find((b: any) => b.check_id === "module:data::integration");
   ok(
     basisData?.record_ref === "check:c-int-data" &&
-      basisData?.bound_revision?.revision === codeRev1 &&
+      basisData?.bound_revision?.revision === manifestFp1 &&
+      basisData?.bound_revision?.revision_kind === CODE_KIND &&
       basisData?.evidence_sha256 === evIntData.sha256 &&
       basisData?.effective === "passed" &&
       basisData?.scope?.includes("数据层→存储 端到端"),
-    `1-9 绿灯依据可追溯（记录=${basisData?.record_ref}、被测版本=${short(basisData?.bound_revision?.revision)}、证据=${short(basisData?.evidence_sha256)}、范围=${(basisData?.scope ?? []).length} 条）`,
+    `1-9 绿灯依据可追溯（记录=${basisData?.record_ref}、绑定源清单=${short(basisData?.bound_revision?.revision)}、证据=${short(basisData?.evidence_sha256)}、范围=${(basisData?.scope ?? []).length} 条）`,
   );
   ok(
     (mData?.reasons ?? []).some((r: any) => r.code === "integration_requirements_definition"),
@@ -549,7 +598,9 @@ async function main(): Promise<void> {
     return projectStatuses({
       objects: objectsFromFacts(MAIN, dataDir, facts, { extra_edges: [edge] }),
       findings: facts.findings,
-      checks: checksFromAudit(facts.audit),
+      // 与产品读口同一装配：`checksFromFacts` 带**源清单现读复核**（绑 code 的检查不再被当"没有可核对来源"
+      // 而无条件待复核——这正是本脚本此前 5-1/2-3 红的根因：这里曾用裸 `checksFromAudit` 漏掉清单复核）。
+      checks: checksFromFacts(facts),
       source_revision: facts.revisions,
     });
   };
@@ -565,7 +616,7 @@ async function main(): Promise<void> {
     setA.by_id[edgeId]?.missing.some((m) => m.check_id === edgeCheckId),
     `5-2 集成线缺口点名到它自己那条检查：${setA.by_id[edgeId]?.missing.map((m) => m.check_id).join("、")}`,
   );
-  const evEdge = putEv("self_check", "跨模块端到端链路检查输出", "$ pnpm test e2e:data-ui\nOK 数据层→展示层\n", { kind: "plan", value: planRev1 });
+  const evEdge = await storeEvidence({ kind: "self_check", summary: "跨模块端到端链路检查输出", content: "$ pnpm test e2e:data-ui\nOK 数据层→展示层\n", binding: { revision_kind: "plan", revision: planRev1 } });
   const edgeEvent = await selfCheck("c-int-edge", edgeId, edgeCheckId, evEdge.sha256, { kind: "plan", value: planRev1 }, ["数据层→展示层 端到端"], "2026-09-20T01:30:00+08:00", "document");
   const factsB = collectProjectFacts(MAIN, dataDir);
   const setB = withEdge(factsB);
@@ -604,26 +655,18 @@ async function main(): Promise<void> {
     "2-4 读入口跑完：事件文件与基线流水一个字节都没变（只读入口不写事实）",
   );
 
-  // ══════════════════════════ ④-a 证据过期：被测版本前进 ══════════════════════════
-  info("── ④-a 证据过期撤销当前通过（被测版本前进：code 修订变化）");
-  const sub2 = await submitCommand({
-    type: "audit.submission_submitted",
-    entity_id: "submission:c-round2",
-    expected_revision: null,
-    occurred_at: "2026-09-20T03:00:00+08:00",
-    payload: {
-      goal: "补修 C 夹具：第二轮交付（新代码版本）",
-      task_id: "C-1",
-      changed_files: ["src/data.ts"],
-      commands: [{ command: "pnpm test", exit_code: 0, output_ref: null }],
-      binding: { revision_kind: CODE_KIND, revision: codeRev2 },
-      submitted_by: "kimi-code",
-    },
-  });
+  // ══════════════════════════ ④-a 证据过期：被覆盖的真实源前进 ══════════════════════════
+  info("── ④-a 证据过期撤销当前通过（改 fixture 覆盖源 src/data.ts；不靠账本自报 code）");
+  // 契约 F4：module:data::integration 的采信来自**真实源清单现读**；改掉清单覆盖的真实源文件即令旧绿转 stale。
+  // 账本里**没有新事件**、`code_declared` 自报值也没变——下一条断言如实点名「采信不来自自报」。
+  write(path.join(mainRoot, DATA_REL), DATA_V2);
   const projStale = await projectionOf();
   const mDataStale = objectOf(projStale, "module:data");
   const mUiAfterCode = objectOf(projStale, "module:ui");
-  ok(sub2.status === 200, `4-a-0 第二轮结果提交成功（seq=${sub2.body?.seq}），当前被测代码版本推进到 ${short(codeRev2)}`);
+  ok(
+    projStale?.revisions?.code === null && projStale?.revisions?.code_declared === manifestFp1,
+    `4-a-0 改 fixture 覆盖源 ${DATA_REL}；账本 revisions.code=${JSON.stringify(projStale?.revisions?.code)}（产品读口恒 null），自报 code_declared=${short(projStale?.revisions?.code_declared)} 未变——采信不来自自报`,
+  );
   ok(
     mDataStale?.display_status !== "verified" &&
       mDataStale?.quality === "evidence_invalid" &&
@@ -634,19 +677,26 @@ async function main(): Promise<void> {
   const basisStale = (mDataStale?.evidence_basis ?? []).find((b: any) => b.check_id === "module:data::integration");
   ok(
     basisStale?.effective === "stale" &&
-      basisStale?.bound_revision?.revision === codeRev1 &&
-      basisStale?.current_revision === codeRev2 &&
-      (mDataStale?.history ?? []).some((h: any) => h.check_id === "module:data::integration" && h.bound_revision === codeRev1),
-    `4-a-2 旧结论保留在历史里（依据：绑 ${short(basisStale?.bound_revision?.revision)} → 当前 ${short(basisStale?.current_revision)}，history ${mDataStale?.history?.length} 条）`,
+      basisStale?.bound_revision?.revision === manifestFp1 &&
+      basisStale?.source_manifest?.status === "invalidated" &&
+      (basisStale?.source_manifest?.changed ?? []).includes(DATA_REL) &&
+      (mDataStale?.history ?? []).some(
+        (h: any) => h.check_id === "module:data::integration" && h.bound_revision === manifestFp1 && String(h.superseded_by ?? "").startsWith("source_manifest:"),
+      ),
+    `4-a-2 旧结论保留在历史里（依据：绑源清单 ${short(basisStale?.bound_revision?.revision)} → 覆盖源已变；source_manifest=${basisStale?.source_manifest?.status}、history ${mDataStale?.history?.length} 条）`,
   );
   ok(
     mUiAfterCode?.display_status === "verified",
-    `4-a-3 对照：绑 plan 修订的 module:ui 不受这次 code 版本变化影响（${mUiAfterCode?.display_status}）`,
+    `4-a-3 对照：绑 plan 修订的 module:ui 不受这次源变化影响（${mUiAfterCode?.display_status}）`,
   );
 
   // ══════════════════════════ ④-b 图纸改一行 → 声明不再被有效基线批准 + 旧证据过期 ══════════════════════════
   info("── ④-b 图纸改一行：当前声明不再被有效基线批准，旧证据随 plan 修订过期");
-  planText = `${planText}**施工备注**：补修 C 验证——图纸改一行即换一版，旧证据随之过期。\n`;
+  // 改 **C-3 卡定义的一行**（而非文末追加）：这样 C-3::evidence 会随 plan 修订真过期。
+  // 定向更新（2026-10-08）：旧夹具在文末追加备注，不落在任何卡分段内——分段口径下 C-3 的卡没变，
+  // C-3::evidence 本就不该转待验证，旧断言（要求它 stale 且 why 含「源变了」）与现产品行为不符；
+  // 现改为改 C-3 卡一行并断言「旧绿转待验证」（分段/整份两种口径下都成立），判据未放宽。
+  planText = planText.replace("**契约**：输入接口响应，输出页面。", "**契约**：输入接口响应，输出页面（改一行：补修 C 验证图纸改一行）。");
   write(path.join(workbench(mainRoot), "plan.md"), planText);
   const planRev2 = sha256(planText);
   const projReplan = await projectionOf();
@@ -665,7 +715,7 @@ async function main(): Promise<void> {
   ok(
     mUiReplan?.display_status !== "verified" &&
       mUiReplan?.missing.some((m: any) => m.check_id === "module:ui::integration") &&
-      mUiReplan?.missing.some((m: any) => m.check_id === "C-3::evidence" && String(m.why).includes("源变了")),
+      mUiReplan?.missing.some((m: any) => m.check_id === "C-3::evidence" && String(m.why).includes("旧绿转待验证") && String(m.why).includes("本对象涉及的卡变了")),
     `4-b-3 改图纸撤销了通过：module:ui=${mUiReplan?.display_status}，缺 ${mUiReplan?.missing.map((m: any) => m.check_id).join("、")}`,
   );
 }

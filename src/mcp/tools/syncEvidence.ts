@@ -74,7 +74,7 @@ function findRegisteredContract(projectId: string, dataDir: string, batchId: str
 export const readSyncStatusTool: McpTool = {
   name: "read_sync_status",
   description:
-    "只读：读项目当前的同步证据状态（配置/结论/逐项缺口/核对时间）。从唯一宿主只读读口取同一份判据（宿主不可达且已配置时 fail-closed）；不触发扫描、不写账、不拉起写者。",
+    "只读：读项目当前的同步证据状态（配置/结论/逐项缺口/核对时间），并附**只读修复计划**（现行批次逐项原因/来源漂移/可复用工件/契约代次/登记人/建议角色/下一读取入口；只列不自动补证、不改契约、不刷新漂移哈希、不改 blocks_entry）。从唯一宿主只读读口取同一份判据（宿主不可达且已配置时 fail-closed）；不触发扫描、不写账、不拉起写者。",
   inputSchema: { type: "object", properties: { project_id: { type: "string", description: "注册表里的项目 id" } }, required: ["project_id"], additionalProperties: false },
   handler: async (args, ctx) => {
     const projectId = projectIdOf(args);

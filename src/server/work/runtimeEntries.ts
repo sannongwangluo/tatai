@@ -86,6 +86,26 @@ export const RUNTIME_ENTRY_REVISION_LABELS: Readonly<Record<RuntimeEntryRevision
   unknown: "版本状态未知：缺少可比较的版本绑定（不猜）",
 };
 
+/**
+ * **逐来源**的版本轴解析结论（读侧的 IO 部分算出来，喂给纯函数 `runtimeEntryViews`）。
+ *
+ * 为什么不是一个全局的"当前版本"字符串：契约 F4 明确**不能拿账本里自报的 code revision 反推当前版本**；
+ * 能当"当前版本"的只有**这份成果自己正式引用、且版本绑定一致的合法源清单**现读复核的结论。
+ * 于是"当前版本"是**逐来源记录**的（每条登记引用的清单不同、现读结论也不同），不能项目级共用一串。
+ * 解析实现（唯一入口、含全部边界）见 `runtimeEntryRevision.ts`。
+ */
+export interface RuntimeEntryRevisionResolution {
+  state: RuntimeEntryRevisionState;
+  /** 可核对的当前版本：`valid` = 登记指纹；`invalidated` = 现读指纹；拿不到 = null */
+  current_revision: string | null;
+  /** 登记时指纹（有可用清单时）；没拿到可核对来源时为 null */
+  registered_fingerprint: string | null;
+  /** 生效的那份清单证据 id（唯一且可用时）；否则 null */
+  evidence_id: string | null;
+  /** 结论依据（人话；只用项目内相对路径，不含绝对私有路径/凭证） */
+  basis: string;
+}
+
 /** 装配后的入口（登记内容 + 来源成果与版本 + 当前状态）；界面/接口消费的是它 */
 export interface RuntimeEntryView extends RuntimeEntry {
   /** 来源成果：哪一条登记（`audit.submission_submitted` 的 record_id / `task.result_submitted` 的回报 id） */
@@ -106,6 +126,13 @@ export interface RuntimeEntryView extends RuntimeEntry {
   /** 版本轴：这条入口绑定的成果版本 vs 当前版本（与 `state` **相互独立**） */
   revision_state: RuntimeEntryRevisionState;
   revision_label: string;
+  /**
+   * 这条入口**逐来源**解析出的可核对当前版本（拿不到为 null）。只用于追溯/展示，不泄露私有路径。
+   * 逐来源解析生效时 = 解析结论；只有旧的两串比较路径下才回落到调用方给的全局当前版本。
+   */
+  revision_current: string | null;
+  /** 版本轴结论依据（人话；逐来源解析生效时给，旧比较路径下为 null） */
+  revision_basis: string | null;
 }
 
 /** 项目级入口概况（"尚不可体验"与"登记过但都不可用"必须分开说） */
@@ -291,6 +318,10 @@ export function resultSubmittedSources(
     if (entries.length === 0) continue;
     const rev = e.payload.result_revision;
     const revision = typeof rev === "string" && rev.trim() !== "" ? rev.trim() : null;
+    // 该回报**正式引用**的证据（与成果登记 `evidence_refs` 同口径）：逐来源解析"可核对当前版本"用。
+    // 只是把 payload 里已有的字段带出，不新增存储、不改判任何结论。
+    const refsRaw = e.payload.evidence_refs;
+    const evidence_refs = Array.isArray(refsRaw) ? refsRaw.filter((x): x is string => typeof x === "string") : [];
     out.push({
       kind: "result_submitted",
       record_id: recordId,
@@ -299,6 +330,7 @@ export function resultSubmittedSources(
       at: e.received_at,
       revision,
       revision_kind: revision === null ? null : "code",
+      evidence_refs,
       entries,
     });
   }
@@ -314,6 +346,17 @@ export interface RuntimeEntrySource {
   at: string;
   revision: string | null;
   revision_kind: string | null;
+  /**
+   * 该来源记录**正式引用**的证据 id（成果登记/结果回报的 `evidence_refs`）：逐来源解析"可核对当前版本"用。
+   * 缺省 = 没有可核对的引用（版本轴如实 unknown）。
+   */
+  evidence_refs?: readonly string[];
+  /**
+   * **逐来源**已解析出的版本轴结论（读侧现读该来源自己引用的源清单得出）。
+   * 给了就以它为准（含如实 `unknown`），**不回退**到调用方给的全局 `currentRevision`——
+   * 全局串只服务旧调用与函数层显式注入，产品读口一律逐来源解析。
+   */
+  revision_resolution?: RuntimeEntryRevisionResolution | null;
   entries: readonly RuntimeEntry[];
 }
 
@@ -321,7 +364,10 @@ export interface RuntimeEntrySource {
 export interface RuntimeEntryViewOptions {
   /** 可达性复核提醒阈值（默认 24h）：超阈值只标 `reverify_due`，**仍可打开** */
   reviewMs?: number;
-  /** 当前事实里的代码/内容版本（`facts.revisions.code`）；拿不到就按"版本状态未知" */
+  /**
+   * 旧口令的**全局**当前版本（`facts.revisions.code`）。只在来源**没有** `revision_resolution` 时生效
+   * （函数层显式注入 / 旧调用）；产品 HTTP 读口对每条来源都带逐来源解析，不再走这里。
+   */
   currentRevision?: string | null;
 }
 
@@ -339,9 +385,15 @@ export function runtimeEntryViews(
   const currentRevision = opts.currentRevision ?? null;
   const views: RuntimeEntryView[] = [];
   for (const src of sources) {
+    // 逐来源解析（读侧现读该来源自己引用的源清单）优先：给了就以它为准（含如实 unknown），
+    // 不回退到全局串；没给才走旧的两串比较（函数层显式注入 / 旧调用）。
+    const resolution = src.revision_resolution ?? null;
+    const revisionState =
+      resolution !== null ? resolution.state : runtimeEntryRevisionStateOf(src.revision, currentRevision);
+    const revisionCurrent = resolution !== null ? resolution.current_revision : currentRevision;
+    const revisionBasis = resolution !== null ? resolution.basis : null;
     for (const entry of src.entries) {
       const { state, openable } = runtimeEntryStateOf(entry, nowMs, reviewMs);
-      const revisionState = runtimeEntryRevisionStateOf(src.revision, currentRevision);
       views.push({
         ...entry,
         source_record_id: src.record_id,
@@ -356,6 +408,8 @@ export function runtimeEntryViews(
         openable,
         revision_state: revisionState,
         revision_label: RUNTIME_ENTRY_REVISION_LABELS[revisionState],
+        revision_current: revisionCurrent,
+        revision_basis: revisionBasis,
       });
     }
   }

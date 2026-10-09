@@ -251,18 +251,40 @@ async function main(): Promise<void> {
   );
 
   const revOf = (taskId: string): number | null => tasksMod.readTaskStates(workDir).states[taskId]?.revision ?? null;
+  // 夹具：`result_submitted` 是**历史/迁移状态**（造"已交付卡"的现场），不是一次新交付——走**既有状态边界**
+  // `task.status_changed` + `payload.status`（`migrate.ts` 把 v1 `done` 折成 `result_submitted` 的同一形态）；
+  // `task.result_submitted` 是交付提交事件，只由带合法认领 + 证据的提交写入（P2/V09-47 锁内共享判据），
+  // 夹具不冒充交付提交（本项不测试新交付）。
+  let fixtureStatusSeq = 0;
   const setStatus = (
     taskId: string,
     status: Parameters<typeof tasksMod.submitTaskStatus>[1]["status"],
     reason?: string,
   ): void => {
+    const expectedRevision = revOf(taskId);
+    if (status === "result_submitted") {
+      fixtureStatusSeq += 1;
+      submitter.submit({
+        schema_version: typesMod.SCHEMA_VERSION,
+        project_id: "entrypatch",
+        change_id: CHG,
+        entity_id: `task:${taskId}`,
+        expected_revision: expectedRevision,
+        type: "task.status_changed",
+        actor_id: "fixture",
+        role: "coordinator",
+        idempotency_key: `fixture-hist-status:${taskId}:result_submitted:${expectedRevision}:${fixtureStatusSeq}`,
+        payload: { status, ...(reason === undefined ? {} : { reason }) },
+      });
+      return;
+    }
     tasksMod.submitTaskStatus(submitter, {
       project_id: "entrypatch",
       task_id: taskId,
       change_id: CHG,
       actor_id: "fixture",
       role: "coordinator",
-      expected_revision: revOf(taskId),
+      expected_revision: expectedRevision,
       status,
       ...(reason === undefined ? {} : { reason }),
     });
@@ -458,12 +480,12 @@ async function main(): Promise<void> {
     { action: dupEscaped.next_action, text: dupEscaped.reasons[0]?.text?.slice(0, 240) },
   );
 
-  // A-16 schema_version 不匹配
+  // A-16 schema_version 不匹配（2 现已是合法 v2，未知版本用 99）
   const badSchema = validStageReads(null);
-  badSchema.schema_version = 2;
+  badSchema.schema_version = 99;
   writeStageReads(badSchema);
   okNew(entryOf("executor", { client_capabilities: "continuable" }).next_action === "blocked", true,
-    "A-16 schema_version=2（不认识的版本）→ blocked");
+    "A-16 schema_version=99（不认识的版本）→ blocked");
 
   // A-17 文件过大
   const big = validStageReads(null);

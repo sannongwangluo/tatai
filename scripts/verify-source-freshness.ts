@@ -38,7 +38,7 @@ import { fileURLToPath } from "node:url";
 import { addProject } from "../src/server/registry";
 import { WorkService, WorkServiceClient, handleWorkRequest, writeServiceDescriptor } from "../src/server/work/service";
 import { submitDefinitionImports } from "../src/server/work/tasks";
-import { readClaimEvents } from "../src/server/work/claims";
+import { claimTask, readClaimEvents } from "../src/server/work/claims";
 import { submitSubmission } from "../src/server/work/audit";
 import {
   checkEffectiveness,
@@ -425,12 +425,20 @@ async function main(): Promise<void> {
     evidence_refs: [deliveryEvSha], binding: { revision_kind: "code", revision: sha256(FOO_V1) },
   });
   ok(sub.seq >= 0, "10-1 成果登记（audit.submission）落账（用于对照结果回报映射）", { seq: sub.seq });
-  // 真实结果回报：落一条 task.result_submitted 事件（与 submitTaskResult 的 payload 同形）
+  // 真实结果回报：落一条 task.result_submitted 事件（与 submitTaskResult 的 payload 同形）。
+  // P2/V09-47 返工：结果提交现在必须在锁内按**合法认领 + 证据**核实——夹具先真认领 T-1，再带真 token 交付
+  // （不再用假的 "fx-token" 走通，也不能删 token 免检查）。
+  const claim29 = await claimTask(
+    { project_id: PID, task_id: "T-1", role: "executor", owner_id: "agent-1", change_id: CHG },
+    live.service,
+    dataDir,
+  );
+  if (!claim29.ok) throw new Error(`夹具缺陷：认领 T-1 失败：${claim29.message}`);
   const resultSubmit = await live.service.submit({
-    schema_version: 2, project_id: PID, change_id: CHG, entity_id: "task:T-1", expected_revision: entityRev("task:T-1"),
+    schema_version: 2, project_id: PID, change_id: CHG, entity_id: "task:T-1", expected_revision: claim29.claim.entity_revision,
     type: "task.result_submitted", actor_id: "agent-1", role: "executor",
     idempotency_key: `fx29-result-1`, payload: {
-      claim_token: "fx-token", owner_id: "agent-1", owner_role: "executor",
+      claim_token: claim29.claim.claim_token, owner_id: "agent-1", owner_role: "executor",
       deliverables: ["T-1 交付物"], evidence_refs: [deliveryEvSha],
       verification: [{ command: "node -e check", exit_code: 0, output_ref: `evidence:${deliveryEvSha}` }],
       untested: ["真实项目迁移（夹具不碰）"], known_issues: ["F8 已知限制（待用户接受）"],

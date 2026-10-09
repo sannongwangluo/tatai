@@ -188,7 +188,9 @@ const CURSOR_TOKEN_RE =
  *   ① `context_manifest.sources[kind=task_state]` 的 `content_sha256` / `note`——改前拿 `last_seq:<N>` 冒充内容哈希、
  *      note 只说重放到哪；改后给**账本真实完整 sha256**、note 带「已验证 <字节> 字节」；
  *   ② `context_manifest.omitted[…].detail` 的**续读游标**——改前旧短前缀 `tctx1:<16hex>:lines:<N>`，
- *      改后 `tcur1:design:<bind16>:<fullsha64>:lines:<N>`（同一 design 源、同一行范围）。
+ *      改后 `tcur1:design:<bind16>:<fullsha64>:lines:<N>`（同一 design 源、同一行范围）；
+ *   ③ V09-46 新增的可选字段 `purpose`/`resolution`/`resolution_detail`/`source_ref`——**只**允许「旧字段等价」：
+ *      条目数一致（范围变化须单独验证）、除新增键外逐字段一致、`purpose` 在闭集内，才删键归一（不忽略整条清单）。
  *
  * 这里**先逐条断言**差异正是这两种、且新值满足预期（旧 `last_seq:9200`；新 sha **独立复算**等于该账本文件的 sha256、
  * 字节数等于文件大小、且被 note 回指；新游标 fullsha ＝ 同一清单里 design 来源的实际 `content_sha256`、16 位前缀与原
@@ -201,12 +203,13 @@ function reconcileKnownEntryDiffs(
   redEntry: any,
   greenEntry: any,
   expectedLedger: { sha256: string; bytes: number } | null,
-): string[] {
+): { problems: string[]; normalized: string[] } {
   const problems: string[] = [];
+  const normalized: string[] = [];
   const rm = redEntry?.context_manifest;
   const gm = greenEntry?.context_manifest;
   if (rm?.sources === undefined || gm?.sources === undefined || !Array.isArray(rm.sources) || !Array.isArray(gm.sources)) {
-    return ["context_manifest.sources 缺失或非数组，无法按既定差异判据核实"];
+    return { problems: ["context_manifest.sources 缺失或非数组，无法按既定差异判据核实"], normalized };
   }
 
   // ① 事件账本（task_state）来源：旧 last_seq 占位 → 新真实完整 sha + 已验证字节
@@ -260,6 +263,7 @@ function reconcileKnownEntryDiffs(
     // 归一化该来源的内容身份两处（其余字段照旧比对）
     r.content_sha256 = g.content_sha256 = "<task_state-content-sha256>";
     r.note = g.note = "任务运行状态投影（重放到 seq 9200）";
+    normalized.push("①账本来源内容身份（旧 last_seq:9200 → 新真实 sha＋已验证字节）");
   }
 
   // ② 续读游标描述：旧短前缀 → 新完整版本（同一 design 源、同一行范围）
@@ -305,10 +309,110 @@ function reconcileKnownEntryDiffs(
         const start = rLegacy[3];
         r.detail = String(r.detail).replace(rTok, `<continuation-cursor:${unit}:${start}>`);
         g.detail = String(g.detail).replace(gTok, `<continuation-cursor:${unit}:${start}>`);
+        normalized.push(`②续读游标（旧 tctx1 → 新 tcur1，单位/起点 ${unit}:${start}）`);
       }
     }
   }
-  return problems;
+
+  // ③ V09-46 新增可选字段（`purpose`/`resolution`/`resolution_detail`/`source_ref`）：**仅允许旧字段等价**。
+  //    不忽略整条 `required_reads`、不放宽动作/理由/状态断言：
+  //      · 条目数必须一致——新增/删除条目属「范围扩大/收缩」，要**单独验证**，不在此归一；
+  //      · 除新增可选键外逐字段（含 why/revision/range/section）必须逐字一致；
+  //      · 每条 `purpose` 取值必须在闭集内（不是删掉一个任意键凑等价）。
+  //    核实到位后，才把新增可选键从两侧删掉，供其后 `firstDiff` 做「旧字段等价」对照。
+  const NEW_OPTIONAL_KEYS = ["purpose", "resolution", "resolution_detail", "source_ref"];
+  const ALLOWED_PURPOSES = new Set(["required_content", "trace_reference", "resume_context"]);
+  const stripNewOptional = (o: any): any => {
+    const c = { ...o };
+    for (const k of NEW_OPTIONAL_KEYS) delete c[k];
+    return c;
+  };
+  const rReads = redEntry?.required_reads;
+  const gReads = greenEntry?.required_reads;
+  if (!Array.isArray(rReads) || !Array.isArray(gReads)) {
+    problems.push("required_reads 缺失或非数组，无法核实 V09-46 新增可选字段的旧字段等价");
+  } else if (rReads.length !== gReads.length) {
+    problems.push(`required_reads 条数由 ${rReads.length} 变为 ${gReads.length}（新增/删除条目属范围变化，须单独验证，不在此归一）`);
+  } else {
+    for (let i = 0; i < gReads.length; i++) {
+      const g = gReads[i];
+      if (!(typeof g?.purpose === "string" && ALLOWED_PURPOSES.has(g.purpose))) {
+        problems.push(`required_reads[${i}].purpose 不在闭集内：${JSON.stringify(g?.purpose)}`);
+      }
+      const d = firstDiff(stripNewOptional(rReads[i]), stripNewOptional(gReads[i]), `required_reads[${i}]`);
+      if (d !== null) problems.push(`required_reads[${i}] 除新增可选字段外并不等价：${d}`);
+    }
+    for (let i = 0; i < gReads.length; i++) {
+      for (const k of NEW_OPTIONAL_KEYS) {
+        if (rReads[i] !== null && typeof rReads[i] === "object") delete rReads[i][k];
+        if (gReads[i] !== null && typeof gReads[i] === "object") delete gReads[i][k];
+      }
+    }
+    normalized.push(`③V09-46 每条的 purpose/resolution/resolution_detail/source_ref（${gReads.length} 条逐条核对后按旧字段等价归一）`);
+  }
+
+  // ③b P3/V09-48（**本卡写域外**）新增的可选字段 `sync_summary.repair_plan`：只读修复计划。
+  //    红侧没有该键、绿侧有；先核实其形态确是「只读修复计划」（generated_from=read_sync_status、
+  //    read_only=true、字符串 note、batches 数组、每批 verdict 在本域闭集内），再归一。
+  //    这里只核**身份与形态**（内容真实性/漂移候选由 P3 的 `verify-sync-repair.ts` 覆盖）；
+  //    `sync_summary` 的门禁/状态字段（configured/overall/blocked/blocking_batches）**照旧逐字段比对**。
+  const SYNC_VERDICTS = new Set(["not_configured", "missing", "passed", "failed", "stale", "needs_review", "invalid", "incomplete"]);
+  const rSync = redEntry?.sync_summary;
+  const gSync = greenEntry?.sync_summary;
+  if (rSync !== null && gSync !== null && typeof rSync === "object" && typeof gSync === "object") {
+    const rHasPlan = Object.prototype.hasOwnProperty.call(rSync, "repair_plan");
+    const gHasPlan = Object.prototype.hasOwnProperty.call(gSync, "repair_plan");
+    if (rHasPlan && !gHasPlan) {
+      problems.push("sync_summary.repair_plan 只在改前存在（改后反而没了，需核实）");
+    } else if (!rHasPlan && gHasPlan) {
+      const plan: any = (gSync as any).repair_plan;
+      const shapeOk =
+        plan !== null &&
+        typeof plan === "object" &&
+        plan.generated_from === "read_sync_status" &&
+        plan.read_only === true &&
+        typeof plan.note === "string" &&
+        Array.isArray(plan.batches) &&
+        plan.batches.every((b: any) => b !== null && typeof b === "object" && SYNC_VERDICTS.has(b.verdict));
+      if (!shapeOk) {
+        problems.push(`sync_summary.repair_plan 不是预期的只读修复计划形态：${JSON.stringify(plan).slice(0, 400)}`);
+      } else {
+        delete (gSync as any).repair_plan;
+        normalized.push("③b P3/V09-48 sync_summary.repair_plan（只读修复计划，写域外）");
+      }
+    }
+  }
+  // ④ 2026-10-07 批次唯一义务/状态派生层（obligations.ts，V09-52/53，本卡写域外）在 10-03 冻结镜像上的
+  //    语义升级：`reasons[50]`（no_ready_task）理由文本里的逐卡状态标注由旧派生口径变为新派生口径
+  //    （T02.2/T06.1 由「红：有已确认问题或明确阻塞」变「橙：结果待验证」，非作者复核声明清单随之变化）。
+  //    授权出处：现行基线 bl-48fcd680-38689c8a（2026-10-07 delegated_technical_review 激活，含 V09-52/53
+  //    卡定义）；独立归因：agent-closure-20261007/raw/audits/V09-30-audit.json findings 第 1 条
+  //    （非作者审查：改前树无 obligations.ts，逐卡差异恰为派生口径变化），差异两侧全文见
+  //    raw/h-section-reasons50-{red,green}.txt。判据**不放宽**：两侧文本逐字钉 sha256（不忽略字段、不泛化），
+  //    任一不符即 FAIL，其余字段照旧逐字段比对。
+  const REASONS50_RED_SHA256 = "26bfde8a10affe080e5e7f8c0dfa23a6c71b38c9e32d7ccd0f857461fa71c38a";
+  const REASONS50_GREEN_SHA256 = "0727bf57715459f5aace294640ac59d3c241e1eebf629c49c65c15cfbb877508";
+  const rReasons = redEntry?.reasons;
+  const gReasons = greenEntry?.reasons;
+  if (!Array.isArray(rReasons) || !Array.isArray(gReasons) || rReasons.length !== gReasons.length) {
+    problems.push(`reasons 数组缺失或长度不一致：${rReasons?.length} vs ${gReasons?.length}`);
+  } else {
+    const r50 = rReasons[50];
+    const g50 = gReasons[50];
+    const shaOf = (v: unknown): string =>
+      crypto.createHash("sha256").update(String((v as any)?.text ?? ""), "utf8").digest("hex");
+    if (r50?.code !== "no_ready_task" || g50?.code !== "no_ready_task") {
+      problems.push(`reasons[50].code 非预期 no_ready_task：${JSON.stringify(r50?.code)} vs ${JSON.stringify(g50?.code)}`);
+    } else if (shaOf(r50) !== REASONS50_RED_SHA256 || shaOf(g50) !== REASONS50_GREEN_SHA256) {
+      problems.push(
+        `reasons[50].text 与已审钉值不符（红 ${shaOf(r50).slice(0, 12)}…/绿 ${shaOf(g50).slice(0, 12)}…）——差异超出已审范围，拒绝归一`,
+      );
+    } else {
+      r50.text = g50.text = "<known-diff④:no_ready_task-obligations-derivation>";
+      normalized.push("④no_ready_task 理由文本（冻结镜像上唯一义务派生层语义升级，两侧文本 sha256 钉值核实后归一）");
+    }
+  }
+  return { problems, normalized };
 }
 
 const planText = (title: string): string =>
@@ -523,16 +627,21 @@ try {
               `H 运行现场（含 ${runsWithLease.length} 条 run 的 lease 状态）固定对照时钟 ${H_CLOCK} 后逐字段一致`,
             );
             // 本批另两卡改了「账本内容身份」与「续读游标」的既定表现：先逐条核实、再只归一这两处，其余照旧比对。
-            const knownDiffs = reconcileKnownEntryDiffs(red.value, green.value, expectedLedger);
+            const rec = reconcileKnownEntryDiffs(red.value, green.value, expectedLedger);
             ok(
-              knownDiffs.length === 0,
-              "H 既定表现差异逐条核实（旧 last_seq:9200 / 新真实账本 sha 独立复算一致＋已验证字节=文件大小 / 新游标完整 sha 与原范围一致）",
-              knownDiffs.length > 0 ? { problems: knownDiffs } : undefined,
+              rec.problems.length === 0,
+              "H 既定表现差异逐条核实（旧 last_seq:9200 / 新真实账本 sha 独立复算一致＋已验证字节=文件大小 / 新游标完整 sha 与原范围一致 / V09-46 新增可选字段仅按旧字段等价归一 / P3 只读 repair_plan 形态核实后归一）",
+              rec.problems.length > 0 ? { problems: rec.problems } : undefined,
+            );
+            ok(
+              rec.normalized.length > 0 && rec.normalized.some((n) => n.includes("V09-46")),
+              `H 归一的既定差异逐条登记、不静默（${rec.normalized.join("；")}）`,
+              rec.normalized,
             );
             const diff = firstDiff(red.value, green.value);
             ok(
               diff === null,
-              "H canonical 结果改前/改后等价（剔除本次时刻类字段；仅归一账本来源内容身份与续读游标两处既定差异）",
+              "H canonical 结果改前/改后等价（剔除本次时刻类字段；仅归一账本来源内容身份、续读游标两处既定差异、V09-46 新增可选字段的旧字段等价、③b 只读 repair_plan、④ obligations 派生语义升级的 no_ready_task 文本（钉值核实））",
               diff === null ? undefined : { firstDiff: diff },
             );
             // 改前 projectWithReleases 不识 projectFacts ⇒ 仍会重算 collectProjectFacts（读盘 1 次）

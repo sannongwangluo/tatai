@@ -371,13 +371,17 @@ const m2Src = read(path.join(REPO, "scripts", "verify-m2.ts"));
 // 各组非空 + 合计恰好 == 注册表 + 逐个成员在注册表内；不动态从注册表生成期望）。
 // 2026-10-03（统一优化 V09-32/33/35 与 V09-39）：`verify-m2.ts` 再增 `V0932_TOOLS`（read_plan/expand_module）
 // 与 `V0939_TOOLS`（project_index），注册表 25 → 28。同一口径补分组名，判据仍为"恰好"，不放宽。
-const m2Groups = ["EXPECTED", "M5_TOOLS", "V0610_TOOLS", "C015_TOOLS", "V0702_TOOLS", "V0704_TOOLS", "V0919_TOOLS", "V0923_TOOLS", "V0927_TOOLS", "V0932_TOOLS", "V0939_TOOLS"];
+// 2026-10-04（V09-41 紧凑简报 task_brief，独立集成复审 P1-1）：`verify-m2.ts` 再增 `V0941_TOOLS`
+// （task_brief），注册表 28 → 29。同一口径补分组名，判据仍为"恰好"，不放宽。
+// 2026-10-06（P2/V09-47 只读预检 preflight_task_result，最终集成）：`verify-m2.ts` 再增 `V0947_TOOLS`
+// （preflight_task_result），注册表 29 → 30。同一口径补分组名，判据仍为"恰好"，不放宽。
+const m2Groups = ["EXPECTED", "M5_TOOLS", "V0610_TOOLS", "C015_TOOLS", "V0702_TOOLS", "V0704_TOOLS", "V0919_TOOLS", "V0923_TOOLS", "V0927_TOOLS", "V0932_TOOLS", "V0939_TOOLS", "V0941_TOOLS", "V0947_TOOLS", "V0952_TOOLS"];
 const m2Names = m2Groups.flatMap((g) => extractArray(m2Src, g));
 ok(
   m2Groups.every((g) => extractArray(m2Src, g).length > 0) &&
     m2Names.length === toolNames.length &&
     m2Names.every((n) => toolSet.has(n)),
-  `③ verify:m2 的分组点名清单（${m2Names.length} 个：一期 8 + 扩充 2 + V06-10 三件套 + C-015 三件套 + rebind_task + doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口 + V09-32/33/35 两件 + V09-39 project_index）与注册表互等——多 ${m2Names
+  `③ verify:m2 的分组点名清单（${m2Names.length} 个：一期 8 + 扩充 2 + V06-10 三件套 + C-015 三件套 + rebind_task + doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口 + V09-32/33/35 两件 + V09-39 project_index + V09-41 task_brief + V09-47 preflight_task_result）与注册表互等——多 ${m2Names
     .filter((n) => !toolSet.has(n))
     .join("/") || "无"}／缺 ${toolNames.filter((n) => !m2Names.includes(n)).join("/") || "无"}`,
 );

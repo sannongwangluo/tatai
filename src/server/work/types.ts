@@ -116,6 +116,7 @@ export const REGISTERED_EVENT_TYPES: readonly EventTypeRegistration[] = [
   { type: "audit.self_check_recorded", owner: "V06-09", entity_prefix: "check:", payload: "checked_by/checks[]{check_id,method,command,exit_code,output_ref,evidence_sha256,scope,verifies}/coverage[]/method_limits/conclusion/binding（独立性固定 author_self；scope 为补修 C 可选字段；coverage/method_limits 为 V09-01 可选字段；**verifies 对新写入的通过检查必填**（写侧拒收缺失，历史不追溯），见附录 E.3.2／E.3.3）" },
   { type: "audit.independent_audit_recorded", owner: "V06-09", entity_prefix: "audit:", payload: "auditor/independence/checks[]{check_id,result,evidence_sha256,scope}/coverage[]/findings/not_reported_scope/binding（scope 为补修 C 可选字段）" },
   { type: "audit.fix_recorded", owner: "V06-09", entity_prefix: "fix:", payload: "finding_id/fix_revision/fixed_by/regression[]" },
+  { type: "audit.record_corrected", owner: "V06-09", entity_prefix: "audit-correction:", payload: "受控追加纠正：原事件/绑定hash、bind_finding_refs或reclassify_not_checked、独审证据、授权依据、supersedes/CAS；不产生passed" },
   { type: "audit.retest_recorded", owner: "V06-09", entity_prefix: "retest:", payload: "finding_id/retested_by/retest_evidence/result" },
   { type: "audit.human_acceptance_recorded", owner: "V06-09", entity_prefix: "acceptance:", payload: "decision/scenario_refs/baseline/evidence_refs/accepted_by（role 必须是 user）" },
   { type: "execution.start_requested", owner: "V06-11", entity_prefix: "execution:", payload: "goal/argv_digest/template_source/timeout_ms（现场=启动请求中）" },

@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import {
   blueprintNodeStatusOf,
-  capabilityStatusOf,
+  canonicalScopeStatusOf,
   moduleStatusKeysOf,
   planCodeNodeIdOf,
   taskDerivedModuleStatus,
@@ -91,14 +91,22 @@ ok(
   planCodeNodeIdOf("src") === "plan:code:src" && planCodeNodeIdOf("plan:code:src") === "plan:code:src",
   "技术模块 id ↔ 蓝图节点 id 的换算只此一处",
 );
-const cap1 = capabilityStatusOf([
-  { id: "plan:code:src", status: blueprintNodeStatusOf("plan:code:src", { blueprint: bp, projection, module_status: derived.status }) },
-]);
-ok(cap1.display === "verified", `能力节点按成员派生（cap:01 = ${cap1.display}）——画布不再直接落「无状态记录」`);
-const cap7 = capabilityStatusOf([]);
+// V09-55 返工：能力状态**只读 canonical 义务层投影**（不再本地按成员汇总）
+const cap1 = canonicalScopeStatusOf({
+  object_id: "plan:cap:01",
+  mapping: "mapped",
+  display_status: "verified",
+  display_status_label: "绿",
+  reasons: [],
+} as never);
 ok(
-  cap7.display === null && cap7.unmapped_reason === "no_members",
-  `没有成员的能力仍是灰（cap:07 → ${cap7.display}／${cap7.unmapped_reason}）`,
+  cap1.display === "verified",
+  `能力节点状态原样读 canonical 投影（cap:01 = ${cap1.display}）——判据在唯一义务层，画布只适配`,
+);
+const cap7 = canonicalScopeStatusOf(null);
+ok(
+  cap7.display === null && cap7.unmapped_reason === "no_status_source",
+  `读口没有该能力范围的 canonical 投影时仍是灰（cap:07 → ${cap7.display}／${cap7.unmapped_reason}；不本地造绿）`,
 );
 info(`  派生表里模块类键：${Object.keys(keys).filter((k) => !k.startsWith("module:")).join("、")}`);
 
@@ -125,15 +133,16 @@ console.log("[verify] ═══ ② 技术详情三视图与主视图同源（�
 console.log("[verify] ═══ ③ 红线：R3 灰块与「无合法声明位」的能力仍是灰 ═══");
 {
   const noMembers = ["plan:cap:01", "plan:cap:02", "plan:cap:03", "plan:cap:07", "plan:cap:10", "plan:cap:12"];
-  const greys = noMembers.map((id) => capabilityStatusOf([]).display === null);
-  ok(greys.every(Boolean), "无成员的能力一律不着完成色（不给 R3 文档章节编成员）");
-  const cap4 = capabilityStatusOf([]);
+  const greys = noMembers.map(() => canonicalScopeStatusOf(null).display === null);
+  ok(greys.every(Boolean), "读不到 canonical 范围投影的能力一律不着完成色（不给 R3 文档章节编成员）");
+  const cap4 = canonicalScopeStatusOf(null);
   ok(cap4.display === null, "cap:04 这类「无合法声明位」的能力同样留灰（§4.5 配不上就没有成员）");
-  // 反证：给它编一个成员（模型/人工塞的）才可能绿 —— 本卡不这么做，测试里断言代码里没有这条路径
-  const srcText = fs.readFileSync("D:/tatai/src/ui/arch/ProjectGraphView.tsx", "utf8");
+  // 反证：能力状态**不再**从成员数组本地汇总（旧 `capabilityStatusOf(capMembers...)` 旁路已撤）
+  // 读**被测工作树**的源码（不是本机 /D:/tatai 安装版），断言才是对本次改动的检查
+  const srcText = fs.readFileSync(new URL("../src/ui/arch/ProjectGraphView.tsx", import.meta.url), "utf8");
   ok(
-    srcText.includes("capabilityStatusOf(") && srcText.includes("capMembers.get(n.id)"),
-    "画布侧的能力状态只按**真实成员**算（成员从视图模型的分组里取，没有直接给能力涂色的旁路）",
+    srcText.includes("canonicalScopeStatusOf(") && !srcText.includes("capMembers.get(n.id)"),
+    "画布侧能力状态只读 canonical 投影（没有按成员本地汇总、直接给能力涂色的旁路）",
   );
 }
 
@@ -174,8 +183,8 @@ console.log("[verify] ═══ ④ 真实锚点抽检：塔台已发布蓝图�
     }
     const r3 = capIds.filter((id) => (capMembers.get(id) ?? []).length === 0);
     ok(
-      r3.length > 0 && r3.every((id) => capabilityStatusOf([]).display === null),
-      `真实蓝图里 ${r3.length} 个能力没有任何模块成员（含 R3 与 cap:04/05/06/09）→ 一律留灰（${r3.slice(0, 4).join("、")}…）`,
+      r3.length > 0 && r3.every(() => canonicalScopeStatusOf(null).display === null),
+      `真实蓝图里 ${r3.length} 个能力没有任何模块成员（含 R3 与 cap:04/05/06/09）→ 无 canonical 投影时一律留灰（${r3.slice(0, 4).join("、")}…）`,
     );
     info(`  真实蓝图：${real.nodes.length} 节点 / ${real.edges.length} 边；对账配对 ${Object.keys(links).length} 个声明模块`);
   }

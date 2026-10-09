@@ -1,8 +1,13 @@
 // backfill-tatai：V07-03 塔台自身历史状态回放。
 // 塔台不走通用迁移（events.jsonl 已在场，v2 是活账）——本脚本把 16 张已交付卡的历史事实
-// 按PLAN 完成证据列回放成 task.result_submitted（执行者已提交结果；人工验收以 2026-09-20
+// 按PLAN 完成证据列回放成"结果已提交"状态（执行者已提交结果；人工验收以 2026-09-20
 // Gate 记录为准，不在回放里代签），随后备份 v1 tasks.json 并重写为 v2 兼容投影（list_tasks 同源）。
 // 幂等：确定性幂等键，重跑返回原回执不重复生效。
+//
+// P2/V09-47 返工：只置状态改走**既有状态边界** `task.status_changed`（payload.status="result_submitted"，
+// 与 `migrate.ts` 把 v1 `done` 折成 result_submitted 同一份口径）——`task.result_submitted` 现在一律按
+// "一次结果交付提交"被锁内共享判据核实（缺认领 token/证据即拒），历史回放不该、也不能拿它当状态置位。
+// 交付包元数据（交付物/证据引用/验证命令）仍原样写进 payload 供事后审计追溯。
 import fs from "node:fs";
 import path from "node:path";
 import { getProject, resolveDataDir } from "../src/server/registry";
@@ -44,7 +49,7 @@ async function main(): Promise<void> {
     if (!fs.existsSync(path.join("D:/tatai", c.evidence))) throw new Error(`证据缺失：${c.id} → ${c.evidence}`);
   }
 
-  console.log("== ① 回放 16 张已交付卡 → task.result_submitted");
+  console.log("== ① 回放 16 张已交付卡 → status=result_submitted（经既有状态边界 task.status_changed）");
   for (const c of CARDS) {
     const states = readTaskStates(workDir).states;
     const state = states[c.id];
@@ -58,12 +63,13 @@ async function main(): Promise<void> {
       project_id: "tatai",
       change_id: "change-20260922-v07-round",
       entity_id: `task:${c.id}`,
-      type: "task.result_submitted",
+      type: "task.status_changed",
       expected_revision: state.revision,
       actor_id: "claude-code",
       role: "coordinator",
       idempotency_key: `v0703-backfill:${c.id}:result:1`,
       payload: {
+        status: "result_submitted",
         deliverables: [`${c.note}（历史交付回放，出处 PLAN 完成证据列）`],
         evidence_refs: [c.evidence],
         verification: [{ command: c.command, exit_code: 0, output_ref: c.evidence }],

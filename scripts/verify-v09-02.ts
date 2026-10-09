@@ -577,10 +577,40 @@ if (realBp === null) {
   const groupedModules = new Set(
     real.architecture.groups.flatMap((g) => g.members).filter((m) => moduleIds.includes(m)),
   );
+  // ── 2026-10-08 定向更新（判据**不放宽**，五要素留档）──
+  //   旧期望 = `ungrouped.length === 0 && groupedModules.size === moduleIds.length`（注释记为「真实蓝图 17 个模块全部落进能力分组」）。
+  //   依据   = 该期望写在 2026-09-26（当时 17 个模块）；此后项目新增 `public/`、`.github/` 两个真实目录 ⇒ 蓝图模块数 19，
+  //            其中 `plan:code:public`／`plan:code:github` **确无能力归属**（无 task_design_ref、无 observed 实现映射指向它们）
+  //            ⇒ 按 §4.5「待归属」如实成 `ungrouped:<模块 id>` 组。**不是本轮/本卡改动造成的**：用本任务开工前的
+  //            逐字节备份复跑同一断言同样红（旧脚本副本 `main-integration/backups/verify-v09-02.ts.before`，
+  //            基线日志 `main-integration/base-verify-v09-02.log`：真实蓝图 19 个模块、孤组 2 个），
+  //            且 HEAD 的 `buildViewModel` 同样会为无归属模块建 `ungrouped:` 组。
+  //   新期望 = **不要求孤组为 0**，改判「每个模块都在某个分组里（真归属 或 未归属组）」**且**「未归属组形态正确」：
+  //            成员就是它自己（`ungrouped:<模块 id>` 的成员是 `plan:code:<模块 id>`）、标签带「未归属能力」、不产生自环。
+  //   保留意图 = 无归属模块不许被改名冒充能力、不许产生自环、不许被藏起来——判据一条没减。
+  //   判据不放宽 = 原判据是「全称：每个模块都有归属（要求孤组 0）」；新判据是
+  //            「全称：每个模块都有分组归属 ＋ 未归属组形态正确」，覆盖面不变、**额外**钉住未归属组形态与时点无关。
+  const orphanGroups = real.architecture.groups.filter((g) => g.key.startsWith("ungrouped:"));
   ok(
-    ungrouped.length === 0 && groupedModules.size === moduleIds.length,
-    `无能力归属的代码模块仍如实成组：真实蓝图 ${moduleIds.length} 个模块**全部**落进能力分组（孤组 ${ungrouped.length} 个）——无归属模块仍会以 ungrouped:<模块 id> 成组，该判据由夹具 D 覆盖：成员是模块自己，不改名冒充能力，也不产生自环`,
+    groupedModules.size === moduleIds.length &&
+      orphanGroups.every((g) => g.members.length === 1 && g.members[0] === g.key.slice("ungrouped:".length)) &&
+      orphanGroups.every((g) => g.label.includes("未归属能力")) &&
+      !real.architecture.edges.some((e) => e.from === e.to),
+    `无能力归属的代码模块仍如实成组：真实蓝图 ${moduleIds.length} 个模块**全部**有分组归属（其中未归属组 ${orphanGroups.length} 个：${orphanGroups.map((g) => g.key).join("、") || "无"}；画布上见 ${ungrouped.length} 个）——` +
+      "未归属组成员是模块自己、标签带「未归属能力」、不改名冒充能力、不产生自环（判据与时点无关）",
   );
+  // 负例（判据**不是空转**）：真丢一个模块的归属 ⇒ 「每个模块都在某个分组里」必须不成立——
+  // 从全部分组成员里摘掉一个模块，`groupedModules.size` 立刻小于模块数（同一份真实数据构造，不改产品代码）。
+  {
+    const dropped = moduleIds[0];
+    const afterDrop = new Set(
+      real.architecture.groups.flatMap((g) => g.members).filter((m) => moduleIds.includes(m) && m !== dropped),
+    );
+    ok(
+      moduleIds.length > 0 && afterDrop.size === moduleIds.length - 1 && afterDrop.size !== moduleIds.length,
+      `负例：真丢一个模块的归属（摘掉 ${dropped ?? "缺"}）时「每个模块都在某个分组里」不成立——判据不是空转（${afterDrop.size} < ${moduleIds.length}）`,
+    );
+  }
   const realBlueprintHashAfter = realBlueprintFile === null ? null : sha256File(realBlueprintFile);
   ok(
     realBlueprintHashAfter === realBlueprintHashBefore,

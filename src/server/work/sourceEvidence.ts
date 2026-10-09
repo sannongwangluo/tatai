@@ -21,6 +21,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { WorkError } from "./types";
+import { memoizedForDerivation } from "./derivationScope";
 
 /** 清单口径标签：改这里就是改"什么算同一份源清单"，指纹随版本变化 */
 export const SOURCE_MANIFEST_VERSION = "source-manifest-v1";
@@ -167,6 +168,14 @@ export interface GitIgnoreProbe {
  *   · 探针成功 → `ignored` 给命中集合（exit 0 = 有命中；exit 1 = 一个都没命中）。
  */
 export function gitIgnoredPaths(projectRoot: string, rels: readonly string[]): GitIgnoreProbe {
+  // git check-ignore 是**同步子进程**（阻塞事件循环）：一次派生里同样的（根 + 路径集）只跑一次。
+  // 键按排序后的路径集算，与入参顺序无关（同一集合复用同一结论）。
+  const key = `${path.resolve(projectRoot)}\u0000${[...rels].sort().join("\u0000")}`;
+  const probe = memoizedForDerivation("source:git-ignored", key, () => computeGitIgnoredPaths(projectRoot, rels));
+  return { is_repo: probe.is_repo, ignored: new Set(probe.ignored), failure: probe.failure };
+}
+
+function computeGitIgnoredPaths(projectRoot: string, rels: readonly string[]): GitIgnoreProbe {
   const out = new Set<string>();
   const rootAbs = path.resolve(projectRoot);
   const isRepo = fs.existsSync(path.join(rootAbs, ".git"));
@@ -416,6 +425,24 @@ export interface SourceManifestVerdict {
  *   · 只比清单里声明的路径——**没被覆盖的无关文件变化不让它失效**（这是"有限范围"的本义）。
  */
 export function verifySourceManifest(projectRoot: string, manifest: SourceManifest): SourceManifestVerdict {
+  // 一次派生里同一份（项目根 + 清单指纹）只核一次：条目最多 512，逐条 lstat/realpath/读字节/算 sha256
+  // 在**一次派生**内被多个子派生重复调用（现场实测每个源文件被读+哈希约 30 次、并伴随多次 git 探针）。
+  // 键含清单指纹，清单不同即另算；作用域只在一次同步派生里有效（下一个请求照旧现核）。
+  const key = `${path.resolve(projectRoot)}\u0000${manifest.fingerprint}\u0000${manifestFingerprintOf(manifest.files)}`;
+  const verdict = memoizedForDerivation("source:verify-manifest", key, () =>
+    computeSourceManifestVerdict(projectRoot, manifest),
+  );
+  // 返回独立副本：登记结论里的三个数组（changed/missing/unreadable）在调用方之间不共享；数组元素是
+  // 路径字符串（原始值），浅拷贝即**完整**独立副本（本返回对象没有嵌套的结构化条目）。
+  return {
+    ...verdict,
+    changed: [...verdict.changed],
+    missing: [...verdict.missing],
+    unreadable: [...verdict.unreadable],
+  };
+}
+
+function computeSourceManifestVerdict(projectRoot: string, manifest: SourceManifest): SourceManifestVerdict {
   const declaredCount = manifest.files.length;
   const changed: string[] = [];
   const missing: string[] = [];
@@ -560,8 +587,40 @@ const sha256OfContent = (content: string): string =>
  * **完整性**：读时独立核「正文内容地址 == 文件名地址（只 hash `content`）、`bytes` 一致、`kind` 是
  * source_manifest」——正文被改过/截损但 `source_manifest`/`binding` 字段还完整时，载体判 `intact:false`
  * （不采信、按未知待复核），**不**去核整份 JSON 的哈希（现有 evidence 地址只 hash `content`）。
+ *
+ * 2026-10-07 运行时负载修复：一次派生里同一份载体只读一次（键=解析后的绝对路径）。证据正文不可变、
+ * 内容寻址，同一次派生内重读字节必同；作用域只在一次同步派生内有效，**跨请求不缓存**（下一个请求照旧现读）。
+ * 实测：一次只读入口 1440 次载体读（40.3 MB）里绝大多数是同一批载体的重复现读。
+ *
+ * 2026-10-07 回归修复：记忆**只**为省重复现读/解析，返回值一律是**深独立副本**——同一次派生里各检查
+ * 各拿一份，互不共享可变结构（此前直接返回记忆对象，一处就地深改会污染同次派生的其他检查）。
  */
 export function readManifestCarrier(filePath: string): SourceManifestCarrier | null {
+  const carrier = memoizedForDerivation("source:manifest-carrier", path.resolve(filePath), () =>
+    computeManifestCarrier(filePath),
+  );
+  // 返回**深独立副本**（null 保持 null）：记忆里存的是同一次派生内**共享**的解析结果；直接把它交出去，
+  // 调用方对返回对象就地深改（`binding.revision` / `manifest.files[*]` / `intact`）会**泄露给同次派生
+  // 里的其他检查**——同一份载体被多个检查各读一次（`checksWithSourceManifests` 装配检查输入、`submitChecks`
+  // 复核证据来源），前一处的就地改动污染后一处。这里逐字段重建（含嵌套对象/数组）：记忆只用来省重复
+  // 现读+解析，不共享任何可变结构。
+  if (carrier === null) return null;
+  return {
+    manifest: {
+      version: carrier.manifest.version,
+      fingerprint: carrier.manifest.fingerprint,
+      files: carrier.manifest.files.map((f) => ({ path: f.path, sha256: f.sha256, bytes: f.bytes })),
+    },
+    binding:
+      carrier.binding === null
+        ? null
+        : { revision_kind: carrier.binding.revision_kind, revision: carrier.binding.revision },
+    intact: carrier.intact,
+    defect: carrier.defect,
+  };
+}
+
+function computeManifestCarrier(filePath: string): SourceManifestCarrier | null {
   try {
     const expected = path.basename(filePath).replace(/\.json$/i, "").toLowerCase();
     const st = fs.statSync(filePath);

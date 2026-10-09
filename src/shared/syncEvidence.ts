@@ -32,6 +32,7 @@ export const SYNC_CHECK_TYPES = [
   "task_states",
   "graph_full",
   "required_reads",
+  "markdown_section",
 ] as const;
 export type SyncCheckType = (typeof SYNC_CHECK_TYPES)[number];
 
@@ -111,10 +112,28 @@ export interface SyncCheckGraphFull {
   type: "graph_full";
   expected_baseline_id: string;
 }
-/** 6. required_reads：期望项目内路径集合，核对 stage-reads.json 的 validated entries */
+/** 6. required_reads：期望项目内路径集合，核对 stage-reads.json 的 validated entries。
+ *  v2 允许同一 `path` 以不同 `section` 各列一条（去重键是 path+section），故每条期望可**显式点名** `section`
+ *  与 stage-reads 条目按 (path, section) 配对；不给 `section` 只匹配整文件条目，遇到"该 path 只有章节绑定条目"
+ *  会明确要求点名 section，**不按整文件哈希猜**。可选 `sha256` 核对条目 revision（条目是章节绑定则比章节子树哈希）。 */
 export interface SyncCheckRequiredReads {
   type: "required_reads";
-  expected: { path: string; sha256?: string }[];
+  expected: { path: string; section?: string; sha256?: string }[];
+}
+/**
+ * 7. markdown_section（V09-42）：按**完整标题路径**唯一定位 Markdown 章节，
+ * 核对「标题行 + 全部后代」子树的 sha256（口径见 src/shared/materialSection.ts）。
+ * 章节外改动不影响；章节缺失/同级同名重复/非文本 → 拒绝。
+ * **注意**：证据包里的 `artifact` 仍是**整文件** sha（现行契约，未因本 check 放宽）——
+ * 本 check 只锚定章节子树，不代表 artifact 整文件漂移被豁免。
+ */
+export interface SyncCheckMarkdownSection {
+  type: "markdown_section";
+  path: string;
+  /** 完整标题路径（各级标题以 `" / "` 连接；每级唯一） */
+  section: string;
+  /** 该章节子树（标题行 + 后代）的 sha256 */
+  sha256: string;
 }
 
 export type SyncCheck =
@@ -123,7 +142,8 @@ export type SyncCheck =
   | SyncCheckTaskDefinitions
   | SyncCheckTaskStates
   | SyncCheckGraphFull
-  | SyncCheckRequiredReads;
+  | SyncCheckRequiredReads
+  | SyncCheckMarkdownSection;
 
 export interface SyncContractItem {
   /** 稳定 item_id（同一契约内不重复） */
@@ -241,6 +261,177 @@ export interface SyncStatusReport {
   batches: SyncBatchReport[];
   unregistered_evidence: SyncUnregisteredEvidence[];
   collection: SyncCollection;
+  /**
+   * P3 / V09-48：**只读修复计划**（现行批次逐项原因／责任**建议**／代次／来源漂移／可复用工件／下一读取入口）。
+   * 只对现行（active）批次给；它是**只读附加**——不自动补证、不自动改契约、不自动刷新漂移哈希、不缩小必需项、
+   * **不改任何门禁**（`blocks_entry`/认领阻断一字不动）。未配置的项目可为空计划。
+   */
+  repair_plan?: SyncRepairPlan;
+}
+
+// ── P3（V09-48）：只读修复计划与候选证据边界（界面 / HTTP / MCP 共用同一份形状） ──
+//
+// 为什么放在 shared：`read_sync_status`、`GET /api/projects/:id/sync-status` 与界面必须读**同一份**形状，
+// 不许端上另造一套语义（与上面 report 同一口径）。判据（谁漂了、谁建议补、下一读哪个入口）只在
+// `src/server/work/sync.ts` / `syncRepair.ts` 算一次，这里只放类型。
+
+/** 契约来源漂移的一条：登记哈希 vs 当前实际哈希（缺失/不可读 → current_sha256=null，不冒充一致） */
+export interface SyncSourceDrift {
+  path: string;
+  registered_sha256: string;
+  current_sha256: string | null;
+}
+
+/** 可复用工件引用（哈希仍与当前目标一致） */
+export interface SyncRepairArtifact {
+  path: string;
+  sha256: string;
+}
+
+/** 已失效引用（与可复用**分开列**：不可读/哈希不符/自引用等） */
+export interface SyncExpiredArtifact {
+  path: string;
+  reason: string;
+}
+
+/** 按失败类型给出的**建议**承接角色（不替人授权、不构成指派、不改变任何角色的实际权限） */
+export type SyncRecommendedRole = "coordinator" | "executor" | "auditor";
+
+/**
+ * **结构化工具调用**（`tool` + `args`）——读取/补证入口一律用它，不再输出"不合法 JSON 式字符串"
+ * （如 `read_sync_status {project_id: X}` 这种既非合法 JSON、也无法被程序直接调用的写法）。
+ */
+export interface SyncToolCall {
+  tool: string;
+  args: Record<string, unknown>;
+}
+
+/**
+ * 缺证/不符项的**具体补证动作**（不是"再扫一遍"）：明确要交付什么、写到哪个证据包落点、
+ * 建议谁承接、要覆盖哪些目标与核对什么，最后再给**扫描入口**（结构化的 `then_scan`）。
+ * 补证动作只是指引，**不替人执行、不自动写盘、不构成指派**。
+ */
+export interface SyncEvidenceAction {
+  /** 补证动作（人话：要交付什么、不要拿什么冒充） */
+  action: string;
+  /** 建议承接角色（不替人授权、不构成指派） */
+  role: SyncRecommendedRole;
+  /** 证据包落点（项目根内相对路径，如 `.工作台/work/sync-inbox/<batch_id>.evidence.json`） */
+  evidence_path: string;
+  /** 本项要覆盖/核对的目标路径（项目根内相对路径；没有可机械指认的文件目标时为空数组） */
+  target_paths: string[];
+  /** 本项核对内容（人话，取自 check 类型与登记声明，供执行者知道要证明什么） */
+  verify: string;
+  /** 补证完成后的扫描入口（结构化；补证之后再扫，不是立刻重复扫同一缺项） */
+  then_scan: SyncToolCall;
+}
+
+/** 契约代次（来自 `FoldedBatch`：内容地址截断 + 登记事件真实序号 + 是否现行） */
+export interface SyncContractGeneration {
+  sha256_12: string;
+  registered_seq: number;
+  active: boolean;
+}
+
+/** 契约**登记事件**的角色/actor（登记人**不是**所有修复项的责任人） */
+export interface SyncRegisteredBy {
+  role: string;
+  actor_id: string;
+}
+
+/**
+ * 命中"图正在派生"导致的 `graph_full` 未通过时的**只读说明**（不是放行）：
+ * `state`／可选 `phase` 来自既有图更新状态；`eta` 只给**有依据**的实测量，依据不足写 `basis:"none"`
+ * 且 `total_ms=null`（**不编造** ETA）。v1 `required graph_full` 未满足时**仍阻断**。
+ */
+export interface SyncWaitingForDerivation {
+  state: "updating";
+  /** 图更新所处阶段（读口取不到时为 null，如实标未知，不猜） */
+  phase: string | null;
+  retryable: true;
+  /**
+   * updating 是不是本项未通过的**唯一**已知原因：有来源漂移或其它非更新类失败原因时为 `false`
+   * ——此时**不**把 updating 说成唯一"直接原因"（其余原因一并保留，不盖掉）。
+   */
+  sole_cause: boolean;
+  /** 除 updating 之外的已知失败原因（来源漂移路径等；`sole_cause=true` 时为空数组） */
+  other_failures: string[];
+  reason: string;
+  eta: { basis: string; total_ms: number | null; note: string };
+}
+
+/** 修复计划里的**一项**（完整项不可省略） */
+export interface SyncRepairItem {
+  item_id: string;
+  label: string;
+  required: boolean;
+  verdict: SyncItemVerdict;
+  reasons: string[];
+  expected: unknown;
+  actual: unknown;
+  /** 本批次契约来源的漂移（逐条给；无漂移为空数组） */
+  source_drift: SyncSourceDrift[];
+  reusable_artifacts: SyncRepairArtifact[];
+  expired_artifacts: SyncExpiredArtifact[];
+  registered_by: SyncRegisteredBy;
+  /** 按失败类型的建议；已通过项为 null */
+  recommended_role: SyncRecommendedRole | null;
+  /** 结构化下一读取入口（`{tool, args}`，可被程序直接调用；不是 JSON 式字符串） */
+  next_read_entry: SyncToolCall;
+  /** 需要补证/修正时的**具体补证动作**（含目标路径/角色/核对内容与扫描入口）；已通过项为 null */
+  next_evidence_action: SyncEvidenceAction | null;
+  waiting_for_derivation: SyncWaitingForDerivation | null;
+}
+
+/** 候选里单个 item 的工件**来源口径**（便于识别"保留的既有证据工件"与"按真实目标机械生成"） */
+export type SyncCandidateArtifactBasis = "reused_existing_evidence" | "mechanical_target";
+
+/** 候选证据的身份与输入版本（谁生成、依据哪一版契约与目标；`verified:false` = 明确未验证草稿） */
+export interface SyncCandidateMeta {
+  verified: false;
+  /** 草稿**默认不完整**（`package.completed=false`）：由协调者核实后显式改 `true` 才进原流程 */
+  completed_default: false;
+  generated_by: string;
+  based_on_contract_sha256: string;
+  based_on_registered_seq: number;
+  /** 逐项说明工件从哪来（**不是**所有项都拿契约来源冒充目标工件） */
+  item_basis: { item_id: string; basis: SyncCandidateArtifactBasis }[];
+  note: string;
+}
+
+/**
+ * 候选证据：**明确未验证的草稿**，不是证据、不是通过、不是独立审查结论。`package` 就是**原闭键解析**
+ * 能读的证据包（原样可进既有正式 scan 链路）；`meta` 是并列的身份/输入版本，**不塞进包内**（保持闭键兼容）。
+ * 本批只读返回，**零落盘、不新增保存入口**。
+ */
+export interface SyncCandidateEvidence {
+  package: SyncEvidencePackage;
+  meta: SyncCandidateMeta;
+}
+
+export interface SyncRepairBatch {
+  batch_id: string;
+  title: string;
+  active: boolean;
+  blocks_entry: boolean;
+  verdict: SyncVerdict;
+  contract_sha256: string;
+  contract_generation: SyncContractGeneration;
+  registered_by: SyncRegisteredBy;
+  source_drift: SyncSourceDrift[];
+  reusable_artifacts: SyncRepairArtifact[];
+  expired_artifacts: SyncExpiredArtifact[];
+  items: SyncRepairItem[];
+  candidate_evidence: SyncCandidateEvidence | null;
+  /** 无候选时的原因（如来源已漂移——候选不自动采纳漂移） */
+  candidate_unavailable_reason: string | null;
+}
+
+export interface SyncRepairPlan {
+  generated_from: "read_sync_status";
+  read_only: true;
+  note: string;
+  batches: SyncRepairBatch[];
 }
 
 /** 界面短标（§3.11 口径：人看的一句话；不默认展示实现 jargon） */

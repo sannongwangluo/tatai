@@ -11,6 +11,8 @@ import crypto from "node:crypto";
 import { WorkError } from "./types";
 import { resolveProjectRelative } from "./documents";
 import { findDuplicateKey } from "./stageReads";
+import { sectionSelectorProblem } from "../../shared/materialSection";
+import { stableStringify } from "../../shared/stableJson";
 import {
   SYNC_BATCH_ID_RE,
   SYNC_CHECK_TYPES,
@@ -36,6 +38,7 @@ const CHECK_KEYS: Readonly<Record<string, readonly string[]>> = {
   task_states: ["type", "scope_mode", "expected"],
   graph_full: ["type", "expected_baseline_id"],
   required_reads: ["type", "expected"],
+  markdown_section: ["type", "path", "section", "sha256"],
 };
 const COMPARE_KEYS = ["owner_role", "dependency_ids"];
 /** 标识/内容的界（防一条命令把事件文件或读口撑爆） */
@@ -66,15 +69,10 @@ function unknownKeys(obj: Record<string, unknown>, allowed: readonly string[]): 
   return Object.keys(obj).filter((k) => !allowed.includes(k));
 }
 
-/** 确定性 JSON：对象键递归排序；契约里 sources 按 path、items 按 id 排序（顺序无语义） */
-export function stableStringify(v: unknown): string {
-  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
-  if (isPlainObject(v)) {
-    const keys = Object.keys(v).sort();
-    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(v[k])}`).join(",")}}`;
-  }
-  return JSON.stringify(v ?? null);
-}
+/** 确定性 JSON 的**实现已统一**到 `src/shared/stableJson.ts`（单一来源）；此处只再导出同名函数，
+ *  旧的 `export function stableStringify` 调用点（`sync.ts`／`syncChecks.ts`）与输出逐字节不变。
+ *  （P0/V09-45 要求构建层复用同一原语而不引入 `server/work` 依赖环，故实现落在纯模块。） */
+export { stableStringify };
 
 /**
  * 该相对路径是否落在同步收件目录内（**自引用**判据：收件目录里的东西不能当独立目标）。
@@ -181,12 +179,18 @@ function validateCheck(raw: unknown, itemId: string): SyncCheck {
       if (!Array.isArray(raw.expected) || raw.expected.length === 0) bad(`item ${itemId} 的 required_reads.expected 必须是非空数组`, { item_id: itemId });
       const expected = raw.expected.map((e) => {
         if (!isPlainObject(e)) bad(`item ${itemId} 的 required_reads.expected 每项必须是对象`, { item_id: itemId });
-        const ee = unknownKeys(e, ["path", "sha256"]);
+        const ee = unknownKeys(e, ["path", "section", "sha256"]);
         if (ee.length > 0) bad(`item ${itemId} 的 required_reads.expected 条目有未知字段：${ee.join("、")}`, { item_id: itemId });
         const p = typeof e.path === "string" ? e.path.trim() : "";
         if (p === "" || path_isAbsoluteOrEscape(p)) bad(`item ${itemId} 的 required_reads.expected.path 不合法：${JSON.stringify(e.path)}`, { item_id: itemId });
         if (isSyncInboxRelativePath(p)) bad(`item ${itemId} 的 required_reads.expected.path 落在收件目录内——自引用不许当目标`, { item_id: itemId });
-        const out: { path: string; sha256?: string } = { path: p };
+        const out: { path: string; section?: string; sha256?: string } = { path: p };
+        if (e.section !== undefined) {
+          // 与 markdown_section 同一判据：完整标题路径，非空、无控制字符、有长度上限。
+          const sp = sectionSelectorProblem(e.section);
+          if (sp !== null) bad(`item ${itemId} 的 required_reads.expected.section 不合法：${sp}`, { item_id: itemId });
+          out.section = (e.section as string).trim();
+        }
         if (e.sha256 !== undefined) {
           if (typeof e.sha256 !== "string" || !SHA256_RE.test(e.sha256)) bad(`item ${itemId} 的 required_reads.expected.sha256 必须是 64 位小写十六进制`, { item_id: itemId });
           out.sha256 = e.sha256;
@@ -194,6 +198,13 @@ function validateCheck(raw: unknown, itemId: string): SyncCheck {
         return out;
       });
       return { type, expected };
+    }
+    case "markdown_section": {
+      const section = str("section", 2048);
+      const sp = sectionSelectorProblem(section);
+      if (sp !== null) bad(`item ${itemId} 的 markdown_section.section 不合法：${sp}`, { item_id: itemId });
+      // path 与其余 check 同款：项目根内相对路径、不许绝对路径/`..` 穿越/落同步收件目录（自引用）
+      return { type, path: rel("path"), section, sha256: sha("sha256") };
     }
     default:
       bad(`未支持的 check.type：${String(type)}`, { item_id: itemId });

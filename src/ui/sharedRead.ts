@@ -45,6 +45,9 @@ const inflight = new Map<string, Slot>();
 
 /** 只读且无体的语义安全方法（与 HTTP 幂等读语义一致）。 */
 const SHAREABLE_METHODS = new Set(["GET", "HEAD"]);
+const ARRAY_ITERATOR = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator)?.value;
+const HEADERS_ITERATOR = typeof Headers === "function"
+  ? Object.getOwnPropertyDescriptor(Headers.prototype, Symbol.iterator)?.value : undefined;
 
 /**
  * 读取代际。写请求（写开始 + 写完成）与明确的失效点（回前台/在线恢复）会 +1；
@@ -74,31 +77,46 @@ function abortError(): Error {
 }
 
 /**
- * 头规范化：大小写不敏感、顺序无关、同名多值稳定排序；返回二维数组（交给 JSON 序列化）。
+ * 头规范化：头名大小写及不同头的顺序无关；同名多值保留平台 Headers 的追加顺序。
+ * 返回二维数组（交给 JSON 序列化），不能按值排序而把 a,b 与 b,a 合并。
  * 认不出的形态（非 HeadersInit、值不是字符串）返回 `null` → 调用方**不共享**。
  */
 function normalizeHeaders(headers: HeadersInit | undefined | null): Array<[string, string]> | null {
-  if (headers === undefined || headers === null) return [];
-  const entries: Array<[string, string]> = [];
+  if (headers === undefined) return [];
+  if (headers === null) return null; // 平台拒绝 null，不能借空头的成功在途响应掩盖错误。
   if (typeof Headers === "function" && headers instanceof Headers) {
-    headers.forEach((value, name) => entries.push([name.toLowerCase(), value]));
+    // 可执行迭代器只能让真实 fetch 消费一次；预检不访问自定义 getter。
+    if (Object.getPrototypeOf(headers) !== Headers.prototype ||
+        Object.getOwnPropertyDescriptor(headers, Symbol.iterator) !== undefined ||
+        Object.getOwnPropertyDescriptor(Headers.prototype, Symbol.iterator)?.value !== HEADERS_ITERATOR) return null;
   } else if (Array.isArray(headers)) {
-    for (const pair of headers) {
-      if (!Array.isArray(pair) || pair.length !== 2) return null;
-      const [name, value] = pair as [unknown, unknown];
-      if (typeof name !== "string" || typeof value !== "string") return null;
-      entries.push([name.toLowerCase(), value]);
+    const ordinaryArray = (value: unknown): value is unknown[] => Array.isArray(value) &&
+      Object.getPrototypeOf(value) === Array.prototype &&
+      Object.getOwnPropertyDescriptor(value, Symbol.iterator) === undefined &&
+      Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator)?.value === ARRAY_ITERATOR;
+    if (!ordinaryArray(headers)) return null;
+    const descriptors = Object.getOwnPropertyDescriptors(headers);
+    for (let i = 0; i < headers.length; i++) {
+      const descriptor = descriptors[String(i)];
+      if (descriptor === undefined || !("value" in descriptor)) return null;
+      const pair = descriptor.value;
+      if (!ordinaryArray(pair) || pair.length !== 2) return null;
+      if (typeof Object.getOwnPropertyDescriptor(pair, "0")?.value !== "string" ||
+          typeof Object.getOwnPropertyDescriptor(pair, "1")?.value !== "string") return null;
     }
   } else if (typeof headers === "object") {
-    for (const [name, value] of Object.entries(headers as Record<string, unknown>)) {
-      if (typeof value !== "string") return null;
-      entries.push([String(name).toLowerCase(), value]);
+    const proto = Object.getPrototypeOf(headers);
+    if ((proto !== Object.prototype && proto !== null) || Symbol.iterator in headers) return null;
+    for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(headers))) {
+      if (!("value" in descriptor) || typeof descriptor.value !== "string") return null;
     }
   } else {
     return null;
   }
-  entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
-  return entries;
+  if (typeof Headers !== "function") return null;
+  const normalized: Array<[string, string]> = [];
+  new Headers(headers).forEach((value, name) => normalized.push([name, value]));
+  return normalized;
 }
 
 /** 计算共享 key；返回 null 表示「不共享」（非 GET/HEAD、带 body、或认不出的 init/headers）。 */

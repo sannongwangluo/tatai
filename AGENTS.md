@@ -10,6 +10,10 @@
 
 软件已施工，不是只有文档：v0.6 的 14 张施工卡、v0.7 与 v0.8 两轮都已交付代码与服务（逐卡状态与证据见 PLAN），**v0.9 健康修复批次的现行卡区是 V09-01…V09-14 与 V09-16**（V09-10 的执行结果已交付但**未经独立审计、未经用户验收**；V09-16 是施工前需求登记前置卡；其余卡以 PLAN 的卡行与其「账本投影对照表」为准——**曾提交执行结果不等于已验收**）。施工只做 PLAN 里**已定义**的卡，不得仅因某张卡出现在 PLAN 中就擅自扩大范围；"已施工"不等于"已验收"——模块/能力绿态按 v2 证据派生，用户 Gate 只由用户本人记录。后续在授权范围内持续推进，不每步重复要许可。**派生方向（2026-09-24 用户澄清）**：客户需求是最终交付目标；审定的 `DESIGN.md` 是施工依据，`PLAN.md` 由 `DESIGN.md` 派生——施工卡、依赖与验收都要能追到设计依据与需求。代码与 DESIGN 偏离时**标异常、给出处与影响、修正实现**；**不得依据代码自动修改 DESIGN.md 或 PLAN.md**，只有确认 DESIGN 漏写/误解用户需求、或用户明确授权变更时，才由设计角色修订 DESIGN 并同步 PLAN（DESIGN §1.5／§2.9／§4.5）。
 
+**2026-10-07 协作闭环批次（候选实现已具备，运行结论以账本为准）**：功能清单声明区、四维读数、唯一义务派生、逐项工作包及 HTTP/MCP 功能清单读口已实现。18 条 `req-loop-*` 已登记，V09-51…V09-58 已受检导入；逐卡执行、验证、安装与用户接受查当前账本，不从文档勾选位推断。接手先读 `project_entry`／`task_brief`，按 `work_package.checks[].next_operation` 取得动作、已知参数与缺参；`prerequisites`／`guidance` 是只读说明，不是工具参数。代码验证先实际执行，再按包中说明存覆盖源清单并回填证据哈希与源码指纹；非机械检查按方法/覆盖判据，不编造命令。仍须核实际工具面：旧客户端拿不到新能力时明确报 `unsupported`，不回退写路由。设计覆盖已核对不代表功能验证通过；无运行记录不等于无实现；用户 Gate 只由本人决定。人的体验与完整 token 对照未验收，不宣称整体目标完成。
+
+**2026-10-09 交付总览批次（V09-62）**：用户需要人能直接核对完整功能、验证、Agent 审查和运行版本后进入试用；现行设计为 DESIGN §3.16/3.17，新增人的默认交付总览，六图保留诊断用途。`feature_ledger.delivery`（含 `integration` 组合流程验证）与逐项 `agent_review` 为同源只读扩展；旧宿主缺字段应报未知，不拿其它绿状态代替。PLAN「交付核对声明」定义完整性、独审收口、运行核对的稳定检查，证据仍经既有唯一写口，不新增完成台账。当前施工/安装进展查实际账本；原 16 项技术通过不替代本轮新页面与完整性核查，Agent 不代用户 Gate。
+
 ## 1. 文档地图与事实源
 
 | 文件/记录 | 作用 | 写入规则 |
@@ -66,6 +70,8 @@ DESIGN §2.6 的事件源、自动投影和版本化写入**已上线并在运�
 
 - 同步证据对账（V09-23，2026-09-30）：执行前由**设计/协调角色**经 `register_sync_contract` 登记「应同步清单」契约（来源哈希实核、同批次改内容拒、`supersedes` 不得减少旧必需项或把 `blocks_entry` 改 false）；完成后把 `<batch_id>.evidence.json` 证据包写进项目 `.工作台/work/sync-inbox/`，由后台发现／`scan_sync_evidence`（唯一写服务宿主，与后台同一逻辑与写口）逐项读**当前实际目标**验收；`read_sync_status`／`GET /api/projects/:id/sync-status` 只读同判据。`blocks_entry` 批次未当前通过时 `project_entry` 给 `sync_summary` 且 `next_action=blocked`，`claim_task` 与直连写口同样拒绝——**补证后自动解阻，不需要人工逐项放行**。同步通过只表示所登记范围在该版本对账通过，**不等于业务实现、独立审计或用户 Gate**；契约细节见 `docs/sync-evidence-contract.md`。
 
+- 功能清单与会话事实（V09-51…V09-58，2026-10-07，**已实现，运行结论以账本为准**）：功能清单是**只读派生**（同一事实快照 → 唯一义务/状态层 → 设计页／六图／工作包共用一份结论），**不建第二张进度台账**、界面不提供涂色或改状态入口；用户补充走既有 `append_discuss`（只追加）→ 授权设计角色修订 DESIGN 正文 → 再同步 PLAN/基线。**读到清单不等于已通过**：引用存在 ≠ 已核对、模型提案 ≠ 已审定、设计被激活 ≠ 本需求已覆盖；缺口（未映射／未验证／证据失效／集成检查缺失）必须逐条点名并阻断相应用途，**子项都绿不冒充组合功能通过**。检查项文本若与 `**…状态…：` 一类加粗标签同段，会被现行 PLAN 解析判为派生状态段而整段退出定义区——新增检查项与键名要避开这一形态（DESIGN §2.5.1）。
+
 ## 7. 数据、目录与开源约束
 
 - 项目根以当前仓库为准。全局数据以运行服务 health 的 data_dir、TATAI_HOME 和实际配置核实，默认 ~/.tatai；不要沿用旧机器的硬编码目录。stdio MCP 与桌面服务必须同源。
@@ -77,21 +83,17 @@ DESIGN §2.6 的事件源、自动投影和版本化写入**已上线并在运�
 <!-- tatai-mcp:start -->
 > 本目录接了塔台（Tatai）工作台 MCP，干活时汇报状态。
 
-进项目先取接续入口（DESIGN.md §6.2 / §6.7）：
+接续规则（DESIGN §6.2 / §6.7；角色不绑定模型）：
 
-- 先 `select_project` 对准项目，再调 `project_entry`（入参 `project_id` / `role` / `client_capabilities` / `known_revision` / `resume_hint`）拿**只读交接**：有效基线、上下文清单、未结束 run、下一动作（`resume_task`/`claim_task`/`review_result`/`await_role`/`await_decision`/`blocked`/`complete`）、理由与必读原文。它只读，不会替你认领，也不会替你调模型。
-- **项目说明按需取材**（不要求先建齐全仓说明才接续）：取完 `select_project` / `project_entry` 后，用 `project_index` 的 `op=read` / `op=impact` 按**当前任务**的 `path`（或 `task_id`）取相关条目与来源状态，命中的条目**按需回读** `sources[].path` 原文。**空索引、查不到都不等于无影响**（缺少说明 ≠ 无耦合）；来源 `stale`/`missing`/`unreadable`/`unknown` 时**以实际源码为准**、不拿旧说明下结论。它是 Agent 后补的**待审说明层**，不是设计/事件/验收事实。
-- **改完代码要维护说明（闭环）**：完成代码变更后，按**改动路径**与实际**调用/约束**影响，经 `project_index` **唯一写入宿主** `upsert`/`remove` 增量更新**受影响**条目（**保持 `id` 不变**），不重写无关条目、也**不因缺索引被迫全仓预建**。写前用 `project_index` `op=read` 取 `notes_file.version_sha256` 作 `expected_file_sha256`；先**读过并核实来源语义**再重算 `sources[].sha256`——**不许只刷新哈希假装维护**；遇冲突**重读当前文件、合并本次增量再重试**；写后**读回核对**。**无写能力不得声称已写**：把本次说明更新/遗漏/未解决项交接给有权维护者。
-- **六图别靠读代码猜**（2026-09-26 V09-19）：接续入口 `project_entry` 的 `graph_summary` 给六图各一行的计数与状态、同一快照标识、基线/更新时间、更新中或过期状态与原因、异常与下一读取入口；完整状态用 `get_project_graphs` 一次取全（四档：全部六图／`graph=<六图之一>`／`node_id=…`／`relation_id=…`；逐对象带状态键、界面短标与颜色口径、来源、映射、证据状态、有效版本、阻断原因、用户待验；模型待审线索单列，不混进正式节点/关系）。没有图或图更新中/失败/过期时，它如实给状态与原因——**不许**把静态 import 依赖读成业务数据流，也不许把「可请求验收」读成「已交付」。**架构判断/影响分析前先 `get_project_graphs mode=full` 按同一快照游标逐图取齐**（`complete:true` 只表示图对象取完，不等于源码全覆盖；采集残缺／忽略目录／旧聚合桶看各图 `notes` 与顶层 `anomalies`）。技术图节点看 `origin_layer`／`counts.by_origin` 区分代码模块与规划层对象，**别把节点总数当代码模块数**（塔台实测 80 节点＝8 代码模块＋72 规划对象＋0 聊天补全）。
-- **阶段 / 提交 / 执行 / 证据是分开的四件事**（V09-27，契约 F3）：
-  - 阶段自报 `report_task_status`：v2 带 `expected_revision` + 当前 `claim_token` 报 `doing`（执行中）/ `blocked`（带 `reason`）；`ready` 解阻**协调器专用**且必须给可取回的 `readiness_basis`（项目内相对路径/`event:<id>`/64 位证据哈希）。**`done` 不在这里写**——完成走 `submit_task_result`（带证据/认领/版本五查），它只表示「执行者已交结果」，不等于审计通过或人工验收接受。
-  - 执行回执 `report_execution`：`op=start_requested/started/heartbeat/checkpoint/stop_requested/stopped/failed/delivered/effect_*`；每次带 `run_id`/`attempt_id`/`workspace`/`claim_token`。**心跳缺失不等于停机**，只有带确认依据（`confirmation`）的 `stopped` 才算已停。
-  - 证据与审计 `record_work_evidence`：`op=store/read/submission/self_check/independent_audit/fix/retest/finding`；证据正文经**唯一写服务宿主**落盘（不可变、内容寻址，stdio 进程不自己写项目目录）。作者自检 ≠ 独立审计（审计者须≠作者）；**不暴露人工验收/用户接受风险**，也不接受 `role=user` 代签用户 Gate。
-- **正向成套图纸入口**（V09-28）：`manage_baseline` `op=read`（只读两份源与生效基线，零副作用）→ `op=preserve`（存不可变历史）／`op=activate`（用**已有**图纸做技术审定激活：固定 `delegated_technical_review`，须带两份源当前 `expected` 内容哈希与 `approved_by`/`approval_basis`，零差异、不调模型、不写用户 Gate）。
-- 照 `next_action` 干活：`claim_task`（带 `expected_revision` 的原子领取，冲突会被拒）→ 按返回的允许范围执行 → 核实 → `submit_task_result`（重新校验任务版本/依赖/认领 token/证据）→ 再调 `project_entry` 取下一项。既有授权内不必等人逐卡说继续。
-- 能力如实声明：`client_capabilities` 不声明就按「仅可读取」处理——只读客户端只拿读取与明确的接续指令，不假装能自动执行。MCP 提供工具不等于客户端必然主动调用（§6.2）。
-- **任务状态的事实源是 v2 事件账本**：`read_progress` 里的模块四色是 v1 兼容读数，不得当现行状态；模块状态由 v2 证据派生，派生不到就如实「无状态记录」，不要自己给模块涂色。拿不准现状时回 `project_entry` 或 `list_tasks` 查，再报，不瞎报。
-- **来源可信度**（V09-29，契约 F4）：用于「已验证」的检查应绑定**有限、项目内、可取回**的源文件清单（`record_work_evidence` 的 `source_manifest`）：先 `op=store, kind=source_manifest`，取回 `evidence.source_manifest.fingerprint`；再用这个指纹作为自检/独审的 `binding.revision`（`revision_kind=code`），并在检查项引用该回执的 `evidence.sha256`。不要把旧自报修订或 Git HEAD 代替清单指纹。现读复核时覆盖的源码变了/删了 → 旧绿转**待验证**，取不到内容 → **未知待复核**，没被覆盖的无关文件变化不影响。可见工作面默认 **5 秒对账**，刷新失败显示陈旧横幅 + 原因 + 最近成功时间。
-- 旧版先重读有效基线：`known_revision` 落后于当前版本时，塔台不派新任务。租约到期只表示"当前所有权需核实"，不证明旧进程已停止。
-- 未迁移项目继续用现有接口与交接包（§6.6）：按项目实际格式与能力发现选择接口，不存在的工具不能用说明文本假装调用成功；`ask_flash` 会调用模型且可写图补全层，不是保证无副作用的只读工具。
+1. `select_project` 对准项目，优先 `task_brief`（旧连接未提供则 `project_entry`）。如实传 `role`、`client_capabilities`；未声明能力按只读处理。入口只读，不代认领、不启动 Agent；**不存在的工具不能用说明文本假装调用成功**（§6.6）。
+2. 按当前任务的 `required_reads` 读原文：阶段材料按 `path` 与 `range`（标题+子树的起止行，现读现算，插入章节外的行不影响）读原文；带 `section` 时它是**绑定定位**（§6.9），**不直接把它当 `read_design`/`read_plan` 的 `section` 参数转传**。条目带 `purpose` 分类（`required_content` 先读正文／`trace_reference` 按需回读／`resume_context` 续接现场）；设计引用派生条目另带 `resolution`／`source_ref`：`unresolved` 表示该条依据现在定位不到（**不是已读、不是已通过**），按 `source_ref` 用 `read_design(index=true)` 或按 `range` 补取核实，**不得用近似标题顶替**。`read_plan(task_id=…)` 取卡。简报默认摘要，不代表已读完整理由；必要时按返回索引/版本补取（detail=reason），detail=full 取完整简报。状态未变且无新动作不重复拉取；有 range 时不默认整篇读取。简报未返回的内容不算读过。账本和基线文件是追溯入口，不要求每轮全文读入；历史交接按需查，当前任务不默认重读全部历史。
+3. 按 `next_action`（resume_task / claim_task / review_result / await_role / await_decision / blocked / complete）执行。`claim_task` 带 `expected_revision` 原子领取；按允许范围开发、自检、独立复核，`submit_task_result` 带真实证据/版本/认领回报，然后再取下一步。提交前可用**只读预检** `preflight_task_result`（与 `submit_task_result` 同形输入）一次列清可预判缺项与锁内未查项；它**不写任何字节、不是门禁/通行票**，不替代提交时的锁内重核，宿主不支持时明确 `UNSUPPORTED_BY_HOST`、**绝不回退**成写入。已有授权内连续推进，不逐卡问续。
+4. 按完整可验收功能批次派工；共享文件由一个协调者集成，独立写域可并行。没有相关变化的有效证据复用；新增检查对应变化、失败或未证风险。辅助提交工具的自验不额外变成产品验收门；同因两次不收敛先查根因。
+5. 状态以 v2 事件账本为准。`report_task_status` 的 v2 状态上报须版本/认领/持有者；done 用 `submit_task_result`，blocked 须说明，ready 须协调者与可取回依据。旧 v1 `tasks.json`/模块四色只作 **v1 兼容读数**、不得当现行状态；模块状态由 v2 证据派生、派生不到就如实「**无状态记录**」，不要自己给模块涂色。结果提交、自检、独立审计、用户 Gate 分开，**不把「可请求验收」读成「已交付」**，Agent 不代用户验收。
+6. 执行现场用 `report_execution`；心跳缺失/租约过期不证明进程已停（**租约到期只表示「当前所有权需核实」，不证明旧进程已停止**），恢复前核实所有权和工作目录。`record_work_evidence` 存证/自检/独审/复测经唯一宿主（证据正文不可变、内容寻址，stdio 进程不自己写项目目录）；独审者≠作者，**不接受 `role=user` 代签用户 Gate**。实际未跑的验证不得写通过。
+7. 验证绑定有限、完整的 `source_manifest`（覆盖所验行为依赖的源码/配置/迁移）；用宿主返回的指纹作 `binding.revision` 并引用证据。覆盖源改变须重验，无关源变化不机械重验；Git HEAD 或自报哈希不能代替实际源清单。
+8. 同步契约由协调者先登记 `register_sync_contract`，执行者交 evidence 包，宿主 `scan_sync_evidence` 核验。阻断看当前入口/`read_sync_status`，不拿旧绿放行，不删必需项、自动刷新漂移哈希或伪造通过。阶段指针是派生导航，不是新授权；来源变化须核实后生成。
+9. 先用 `project_index` read/impact 按当前任务或路径查说明，按需回读来源；空索引≠无影响。改后用唯一宿主 CAS upsert/remove 更新受影响条目，不预建全仓说明；**不许只刷新哈希假装维护**，**无写能力不得声称已写**。说明为待审层，不替代设计与证据。
+10. 架构判断/影响分析前取 `get_project_graphs mode=full`，按同快照游标取齐；普通接续不重复取六图。完整分页不等于源码全覆盖，检查 collection/notes；静态 import 不是业务数据流，模型线索不是正式设计。用 `expand_module` 按需下钻。
+11. 有效设计/施工基线变更按授权由 `manage_baseline` read→preserve/activate，保留旧依据，不因实现偏离自动反改设计。`activate` 走固定 `delegated_technical_review`：须带两份源当前 `expected` 哈希与 `approved_by`/`approval_basis`、零差异、不调模型、不写用户 Gate。旧 `known_revision` 先重读；不把工具存在当成自动执行能力。`ask_flash` 会调模型且可能写补全线索，不视为纯只读。
 <!-- tatai-mcp:end -->

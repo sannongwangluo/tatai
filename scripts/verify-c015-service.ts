@@ -266,11 +266,47 @@ const CHG_OK = "change-合法";
 
 // ⑪ task: 实体提交不受影响（钩子只挂需求/变更实体域，不外溢到别的对象域）
 {
+  // 夹具先导入正式定义，使用真实任务身份；这是夹具的防御性准备，不是非上报状态写的必要条件。
+  //   verifyTaskPhaseCommand 只对带 doing/blocked/ready 的 report_phase 核定义与认领；迁移回放另由 v06-03 守护。
+  //   这里先经**唯一写口**导入一张最小定义（旧形态 `task.definition_imported`，与 verify-v06-09 夹具
+  //   同形、不带 report_phase）建立合法前置，再提交目标状态事件——不硬写账本、不绕过唯一写口，
+  //   也不放宽"钩子不外溢"这条判据（缺前置仍拒的负例由下面的服务边界核实守）。
+  const imp = trySubmit(
+    "task:T-1",
+    "task.definition_imported",
+    { definition_sha256: "0".repeat(64), plan_revision: "0".repeat(64), definition_revision: 1 },
+    null,
+    "k-⑪前置定义导入",
+  );
+  ok(
+    imp.accepted,
+    `⑪ 前置：正式导入 T-1 定义（task.definition_imported 经唯一写口；${imp.accepted ? "已接受" : `code=${imp.code}`}）`,
+  );
   const before = eventCount();
-  const r = trySubmit("task:T-1", "task.status_changed", { status: "ready" }, null, "k-⑪任务域");
+  const r = trySubmit("task:T-1", "task.status_changed", { status: "ready" }, 1, "k-⑪任务域");
   ok(
     r.accepted && eventCount() === before + 1,
     `⑪ task: 实体的事件提交行为不变（钩子不外溢；seq 前进到 ${eventCount()}）`,
+  );
+}
+
+// ⑪-负例（补实证，判据不放宽）：**真上报**（payload 带 `report_phase`）而缺前置（未导定义 / 无认领）
+//   ⇒ 写边界仍拒且零写入。这条对"当前实现"与"修掉 early-return 顺序后的实现"都成立
+//   （带 report_phase 就应当受阶段核实约束），所以它锁的是"非法上报仍被拒"，不是某个实现细节。
+{
+  const before = eventCount();
+  const r = trySubmit(
+    "task:T-never-imported",
+    "task.status_changed",
+    { status: "executing", report_phase: "doing", claim_token: "tok-x" },
+    null,
+    "k-⑪负例真上报缺前置",
+  );
+  ok(
+    !r.accepted && r.code === "INVALID_COMMAND" && eventCount() === before,
+    `⑪ 负例：带 report_phase 的真上报缺前置（未导定义/无认领）→ INVALID_COMMAND、零写入（实际 ${
+      r.accepted ? "被接受落盘" : `code=${r.code}`
+    }）`,
   );
 }
 

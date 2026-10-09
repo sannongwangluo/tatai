@@ -67,11 +67,22 @@ import {
   runtimeEntryStateOf,
   runtimeEntrySummaryOf,
   runtimeEntryViews,
+  type RuntimeEntrySource,
 } from "../src/server/work/runtimeEntries";
 import { putEvidence, type RevisionKind } from "../src/server/work/evidence";
 import { foldAuditRecords, AUDIT_EVENT_TYPES } from "../src/server/work/audit";
 import { loadEvents } from "../src/server/work/eventStore";
-import { readServiceDescriptor } from "../src/server/work/service";
+import {
+  readServiceDescriptor,
+  writeServiceDescriptor,
+  WORK_TOKEN_HEADER,
+  WorkServiceClient,
+  type WorkServiceDescriptor,
+} from "../src/server/work/service";
+import { collectProjectFacts } from "../src/server/work/statusProjection";
+import { buildSourceManifest } from "../src/server/work/sourceEvidence";
+import { recordWorkEvidenceTool } from "../src/mcp/tools/recordWorkEvidence";
+import { importTaskDefinitions, taskDefinitionHash } from "../src/server/work/plan";
 import { projectWorkDir } from "../src/server/workstation";
 import { REGISTERED_EVENT_TYPES, SCHEMA_VERSION, WORK_ERROR_CODES, isWorkError, type WorkEvent } from "../src/server/work/types";
 import { REMOTE_ROUTES, routeMentionTotal } from "../src/server/remote-routes";
@@ -166,12 +177,31 @@ const planA = planTextFor("补修 F 夹具 A", [
   ["T-3", "展示层"],
 ]);
 const planB = planTextFor("补修 F 夹具 B", [["X-1", "唯一的卡"]]);
-/** 夹具 C（F3 真链路）：三张卡分别用来验 版本过期 / 非法登记 / 旧调用兼容 */
+/** 夹具 C（F3 真链路）：四张卡分别用来验 版本过期 / 非法登记 / 旧调用兼容 / 版本轴真 HTTP（结果回报路径） */
 const planC = planTextFor("补修 F 夹具 C", [
   ["M-1", "可体验入口（结果回报）"],
   ["M-2", "非法入口登记（反例）"],
   ["M-3", "旧调用兼容"],
+  ["M-4", "版本轴真 HTTP（结果回报路径·清单绑定）"],
 ]);
+
+/** 夹具 A/B/C 的施工图文本 */
+const PLAN_OF: Record<string, string> = { [A]: planA, [B]: planB, [C]: planC };
+
+/**
+ * 真定义哈希（与写/读边界现读重算用的**同一份** `taskDefinitionHash`）。
+ *
+ * P2/V09-47 最终纠正：结果提交的锁内共享判据会按当前施工图**现读重算**定义绑定——夹具若继续拿
+ * `sha256("<taskId>-def")` 这种假哈希冒充"已绑定义"，提交会被如实拒（那不是产品缺陷，是夹具在撒
+ * 谎）。这里按真定义算：夹具不冒充定义绑定，也不要求产品放宽校验。
+ */
+function realDefinitionHash(project: string, taskId: string): string {
+  const text = PLAN_OF[project];
+  if (text === undefined) throw new Error(`夹具缺陷：没有 ${project} 的施工图文本`);
+  const def = importTaskDefinitions(text, { plan_revision: sha256(text) }).definitions.find((d) => d.task_id === taskId);
+  if (def === undefined) throw new Error(`夹具缺陷：${project} 的施工图里没有 ${taskId}`);
+  return taskDefinitionHash({ ...def, change_id: null, requirement_ids: def.requirement_ids ?? null });
+}
 
 for (const root of [rootA, rootB, rootC]) mkdirp(root);
 write(path.join(workbench(rootA), "plan.md"), planA);
@@ -215,6 +245,18 @@ const portListening = (port: number): Promise<boolean> =>
     sock.setTimeout(1000, () => done(false));
   });
 
+/** 向 OS 要一个空闲回环端口（就绪负例的真后端用；避免固定端口与并发跑冲突） */
+const freePort = (): Promise<number> =>
+  new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      const p = typeof addr === "object" && addr !== null ? addr.port : 0;
+      srv.close(() => resolve(p));
+    });
+  });
+
 function spawnServer(): ChildProcess {
   const proc = spawn(process.execPath, ["--import", "tsx", path.join("src", "server", "index.ts")], {
     cwd: REPO,
@@ -233,17 +275,59 @@ function spawnServer(): ChildProcess {
 /** 当前这一代后端进程（F3 的"重启后读回一致"要把它杀掉再起一个） */
 let serverProc: ChildProcess | null = null;
 
-async function waitUp(): Promise<void> {
-  for (let i = 0; i < 80; i++) {
-    try {
-      const r = await fetch(`http://127.0.0.1:${PORT}/health`);
-      if (r.ok) return;
-    } catch {
-      // 还没起来
-    }
-    await sleep(250);
+/**
+ * 就绪判据（**依产品真实就绪协议**，不是"/health 可达就算好"）：
+ *
+ * 2026-10-08 runtime 独审 REPORT-r3.md §6 确证：旧 `restartServer` 以 `/health` 可达当"重启完成"，
+ * 随即 `readServiceDescriptor(dataDir)?.token ?? workToken` 取 token——但产品在 `server.listen` 绑上后
+ * **立即应答 `/health`**，而"接管握手 ＋ 发布描述符"是 `listen` 回调里的**异步**流程
+ * （`src/server/index.ts:4200-4298`）⇒ 存在"/health 已 OK 但描述符尚未（重）发布"的窗口；此时读到的是
+ * **上一代宿主**的描述符（旧 pid ＋ 旧 token），缓存下来后写口 API 全 401/503（实测 11 次里 4 次 100/14）。
+ *
+ * 新的就绪条件（只等**本次**宿主真的成为唯一写宿主，两条同时满足）：
+ *   ① 数据目录里的服务描述符**属于本次进程**（`desc.pid === proc.pid`）——描述符由产品在
+ *      `publishUnderOwnershipLock` 里发布（`src/server/work/serviceOwnership.ts`）；
+ *   ② 凭该描述符的 token 真能过写口所有权探活（`GET /api/work/health` 200）——旧 token / 未就绪一律 401/不可达。
+ * `waitHostReady` 只在这个**具体条件**上有界轮询；超时**如实报错**（不固定 sleep、不用泛重试掩盖真实错误、
+ * 不拿旧 token 继续写）。四状态（`4-0b-*` 就绪负例）用独立 tempDataDir＋独立端口**真后端**确定性证明
+ * "旧条件过早、新条件不放行、旧 token 写被拒"。
+ */
+async function hostIsReady(dd: string, procPid: number): Promise<{ ready: boolean; why: string }> {
+  const desc = readServiceDescriptor(dd);
+  if (desc === null) return { ready: false, why: "数据目录里还没有服务描述符" };
+  if (desc.pid !== procPid) {
+    return { ready: false, why: `描述符仍指向**旧**宿主 pid=${desc.pid}（本次宿主 pid=${procPid}）——不拿它的 token` };
   }
-  throw new Error(`后端 ${PORT} 20 秒内未就绪`);
+  try {
+    const r = await fetch(`http://${desc.host}:${desc.port}/api/work/health`, {
+      headers: { [WORK_TOKEN_HEADER]: desc.token },
+      signal: AbortSignal.timeout(3000),
+    });
+    return r.ok
+      ? { ready: true, why: `描述符 pid=${desc.pid} ＋ token 写口探活 200` }
+      : { ready: false, why: `描述符 pid=${desc.pid} 但写口所有权探活 HTTP ${r.status}（旧 token / 尚未就绪）` };
+  } catch (e) {
+    return { ready: false, why: `描述符 pid=${desc.pid} 但写口不可达：${(e as Error).message}` };
+  }
+}
+
+async function waitHostReady(proc: ChildProcess, timeoutMs = 40_000): Promise<{ pid: number; token: string; port: number }> {
+  const deadline = Date.now() + timeoutMs;
+  let why = "尚未开始";
+  for (;;) {
+    const st = await hostIsReady(dataDir, proc.pid ?? -1);
+    if (st.ready) {
+      const desc = readServiceDescriptor(dataDir);
+      if (desc !== null) return { pid: desc.pid, token: desc.token, port: desc.port };
+      why = "探活通过但描述符读不到（竞态），继续等";
+    } else {
+      why = st.why;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`写入服务就绪超时（${timeoutMs}ms，判据＝本次宿主描述符 pid＋token＋写口所有权探活）：${why}`);
+    }
+    await sleep(100);
+  }
 }
 
 /** 杀净当前后端并重新起一个（同一数据目录、同一端口）：验"事实落盘了、不是只活在内存里" */
@@ -253,10 +337,99 @@ async function restartServer(): Promise<void> {
     if (!(await portListening(PORT))) break;
     await sleep(100);
   }
-  spawnServer();
-  await waitUp();
-  // 新一代后端有自己的服务描述符（token 变了）：写入面凭据要跟着刷新
-  workToken = readServiceDescriptor(dataDir)?.token ?? workToken;
+  const proc = spawnServer();
+  // 新一代后端有自己的服务描述符：等**本次**宿主（描述符 pid＋token＋写口所有权探活）就绪再刷新凭据，
+  // 不用"/health 可达"当就绪（旧写法会缓存上一代 token ⇒ 401/503，见上面 hostIsReady 说明）
+  const ready = await waitHostReady(proc);
+  workToken = ready.token;
+}
+
+/**
+ * 确定性就绪延迟负例（4-0b）：证明旧"/health 可达"条件**过早**、新条件在描述符陈旧/服务未就绪时**不放行**，
+ * 且此时凭**旧 token** 写会被拒（"不会用旧 token 写"）。
+ *
+ * 做法（不依赖时序碰运气、不用固定 sleep）：用**独立 tempDataDir ＋ 独立端口**起一个**真后端**；等它发布
+ * 自己的描述符（新宿主 pid/token）后，把描述符**替换成"陈旧宿主"**（另一个 pid ＋ 错误 token）——这正是
+ * "/health 已 OK、但描述符尚未（重）发布"这一窗口的精确复现。随后逐条核：旧条件仍成立、新条件不放行、
+ * 旧 token 写被拒；恢复本次描述符后新条件才为真。只动独立临时目录，判据用产品自己的描述符＋token 写口。
+ */
+async function readinessNegativeCase(): Promise<void> {
+  const negHome = path.join(tmpBase, "neg-home");
+  mkdirp(negHome);
+  const negPort = await freePort();
+  const proc = spawn(process.execPath, ["--import", "tsx", path.join("src", "server", "index.ts")], {
+    cwd: REPO,
+    env: { ...process.env, TATAI_HOME: negHome, TATAI_PORT: String(negPort), TATAI_SEMANTIC_AUTO: "0", TATAI_NO_AUTOSTART: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  spawned.push(proc);
+  proc.stdout?.on("data", () => {});
+  proc.stderr?.on("data", () => {});
+  const pid = proc.pid ?? -1;
+  try {
+    const deadline = Date.now() + 40_000;
+    let newDesc: WorkServiceDescriptor | null = null;
+    while (Date.now() < deadline) {
+      const d = readServiceDescriptor(negHome);
+      if (d !== null && d.pid === pid) {
+        newDesc = d;
+        break;
+      }
+      await sleep(100);
+    }
+    if (newDesc === null) {
+      ok(false, "4-0b 就绪负例：真后端 40s 内未发布自己的描述符（无法构造负例）");
+      return;
+    }
+    const goodDesc = newDesc;
+
+    // 把描述符替换成"陈旧宿主"（另一个 pid ＋ 错误 token）——复现"新宿主尚未发布描述符"的窗口
+    const staleDesc: WorkServiceDescriptor = { ...goodDesc, pid: pid + 100000, token: "0".repeat(64) };
+    writeServiceDescriptor(negHome, staleDesc);
+
+    // 旧条件：/health 可达（与描述符无关，此刻仍为真）——单看它无法区分新旧宿主 ⇒ 过早
+    const health = await fetch(`http://127.0.0.1:${negPort}/health`).catch(() => null);
+    // 新条件：描述符 pid ≠ 本次进程 ⇒ 不放行
+    const staleSt = await hostIsReady(negHome, pid);
+    // 凭**陈旧 token** 走真写口：必须被拒（非 200）
+    const staleWrite = await fetch(`http://127.0.0.1:${negPort}/api/work/command`, {
+      method: "POST",
+      headers: { "content-type": "application/json", [WORK_TOKEN_HEADER]: staleDesc.token },
+      body: JSON.stringify({
+        schema_version: 2,
+        project_id: A,
+        change_id: CHG,
+        entity_id: "neg:probe",
+        expected_revision: null,
+        type: "task.definition_imported",
+        actor_id: "neg",
+        role: "executor",
+        idempotency_key: `neg:probe:${Date.now()}`,
+        payload: {},
+      }),
+    }).catch(() => null);
+
+    // 恢复本次宿主描述符 ⇒ 新条件才为真
+    writeServiceDescriptor(negHome, goodDesc);
+    const restoredSt = await hostIsReady(negHome, pid);
+
+    ok(
+      health !== null && health.ok,
+      `4-0b-1 旧就绪条件（只看 /health 可达）在描述符仍是**陈旧宿主**时也成立 ⇒ **过早**（HTTP ${health?.status}）`,
+    );
+    ok(!staleSt.ready, `4-0b-2 新就绪条件在**陈旧描述符**下不放行：${staleSt.why}（旧写法会拿旧 token 继续写）`);
+    ok(
+      staleWrite !== null && staleWrite.status !== 200,
+      `4-0b-3 凭**陈旧 token** 走真写口被拒（HTTP ${staleWrite === null ? "不可达" : staleWrite.status}）——"不会用旧 token 写"`,
+    );
+    ok(restoredSt.ready, `4-0b-4 恢复**本次**宿主描述符后才就绪：${restoredSt.why}`);
+  } finally {
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      // 已退出
+    }
+  }
 }
 
 const api = async (p: string, init?: RequestInit): Promise<{ status: number; body: any; text: string }> => {
@@ -272,6 +445,19 @@ const api = async (p: string, init?: RequestInit): Promise<{ status: number; bod
 };
 const postJson = (p: string, body: unknown) =>
   api(p, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+/**
+ * 读口之外的**直接证据**：状态投影里的两个版本槽（契约 F4，`src/server/work/statusProjection.ts:2002–2007`）。
+ *   · `code` = **当前可核对**的代码版本：**不能来自账本里的自报**，只有调用方显式给 `code_revision` 才有值，
+ *     产品读口默认 `null`（= "当前源码未知，代码/版本一律待复核"）；
+ *   · `code_declared` = 账本里**自报**的最近一次声明版本（两源同权 `latestCodeBindingRevision`），
+ *     **只作展示**，绝不当"当前版本"。
+ * 所以"两源同权、实际发生时间优先"的可核证据是 `code_declared`；`code` 恒 null 才符合 F4（自报不自证）。
+ */
+const revisionsOf = async (project: string): Promise<{ code: string | null; code_declared: string | null }> => {
+  const r = (await api(`/api/projects/${project}/status-projection`)).body?.projection?.revisions ?? {};
+  return { code: r.code ?? null, code_declared: r.code_declared ?? null };
+};
 
 /**
  * 错误信封有两种形状（都得认，别把"读错字段"当成"没报错"）：
@@ -318,7 +504,7 @@ async function seedTask(project: string, taskId: string, planRev: string): Promi
     type: "task.definition_imported",
     entity_id: `task:${taskId}`,
     expected_revision: null,
-    payload: { definition_sha256: sha256(`${taskId}-def`), plan_revision: planRev, definition_revision: 1 },
+    payload: { definition_sha256: realDefinitionHash(project, taskId), plan_revision: planRev, definition_revision: 1 },
   });
   if (def.status !== 200) throw new Error(`task.definition_imported ${taskId} 失败：${def.status} ${def.text}`);
   const st = await submitCommand({
@@ -803,7 +989,7 @@ async function seedDefinitionOnly(project: string, taskId: string, planRev: stri
     type: "task.definition_imported",
     entity_id: `task:${taskId}`,
     expected_revision: null,
-    payload: { definition_sha256: sha256(`${taskId}-def`), plan_revision: planRev, definition_revision: 1 },
+    payload: { definition_sha256: realDefinitionHash(project, taskId), plan_revision: planRev, definition_revision: 1 },
   });
   if (def.status !== 200) throw new Error(`task.definition_imported ${taskId} 失败：${def.status} ${def.text}`);
   const rev = def.body?.entity_revision;
@@ -914,9 +1100,6 @@ async function mcpResultEntryChecks(opts: { freshIso: string; staleIso: string }
     source_ref: "F3 真链路证据",
   }).evidence_id;
   const eventsFileC = path.join(projectWorkDir(C, dataDir), "events.jsonl");
-  /** 读口之外的**直接证据**：状态投影里的"当前代码版本"（`revisions.code`）——它就是两源同权的取值点 */
-  const revisionCodeOf = async (): Promise<string | null> =>
-    (await api(`/api/projects/${C}/status-projection`)).body?.projection?.revisions?.code ?? null;
 
   // ── ① 两源同权（裁定 3）：先只给"成果登记（rev A）"，再给一条**更晚**的结果回报（rev B）──
   const subC = await submitCommand({
@@ -948,10 +1131,12 @@ async function mcpResultEntryChecks(opts: { freshIso: string; staleIso: string }
     },
   });
   ok(subC.status === 200, `⑥-2 夹具 C 先落一条成果登记（HTTP ${subC.status}，版本 A = ${CODE_REV_C}）：此刻"当前版本"只可能来自它`);
-  const codeRevSubmitOnly = await revisionCodeOf();
+  const revSubmitOnly = await revisionsOf(C);
   ok(
-    codeRevSubmitOnly === CODE_REV_C,
-    `⑥-2b 参照点：还没有任何结果回报时 revisions.code = ${codeRevSubmitOnly}（= 成果登记的版本 A）——下面那条更晚的结果回报才是分水岭`,
+    // F4：读口默认 `code=null`（自报不当当前版本）；自报值进 `code_declared`，此刻只可能来自这条成果登记（版本 A）。
+    revSubmitOnly.code === null && revSubmitOnly.code_declared === CODE_REV_C,
+    `⑥-2b 参照点（F4）：还没有任何结果回报时 revisions.code = ${revSubmitOnly.code}（**自报不当当前版本**，产品读口默认 null）；` +
+      `自报值 code_declared = ${revSubmitOnly.code_declared}（= 成果登记的版本 A）——下面那条更晚的结果回报才是分水岭`,
   );
 
   // ── ① 真认领 → MCP 提交（带 runtime_entries，声明**更晚**的版本 B）──
@@ -997,6 +1182,13 @@ async function mcpResultEntryChecks(opts: { freshIso: string; staleIso: string }
     ],
   });
   const subEvent1 = submitted1.json?.receipt?.event_id as string | undefined;
+  if (submitted1.isError || submitted1.json?.ok !== true) {
+    info(
+      `⑥-4 现场：isError=${submitted1.isError} code=${String(submitted1.json?.code ?? "")} message=${String(
+        submitted1.json?.message ?? "",
+      ).slice(0, 500)}`,
+    );
+  }
   ok(
     !submitted1.isError && submitted1.json?.ok === true && typeof subEvent1 === "string",
     `⑥-4 MCP 提交结果（带 runtime_entries）成功：事件 ${short(subEvent1)}（seq=${submitted1.json?.receipt?.seq}）`,
@@ -1015,24 +1207,27 @@ async function mcpResultEntryChecks(opts: { freshIso: string; staleIso: string }
     `⑥-5 MCP 提交的入口在验收读口出现（source_kind=${eM1?.source_kind}，来源 ${short(eM1?.source_record_id)}）：两条写入路径合并进同一份清单，不另造存储`,
   );
   // 裁定 3 的证据点：版本 B **只出现在 MCP 结果回报里**（没有任何成果登记声明过它），
-  // 而它比版本 A 更晚发生 ⇒ 绑 B 的那条入口必须是 current；旧口径（只认成果登记）下这两条正好相反。
-  const codeRevAfterResult = await revisionCodeOf();
+  // 而它比版本 A 更晚发生 ⇒ 按两源同权、实际发生时间优先，它就是**自报**的当前版本。
+  // 契约 F4：自报不当"当前可核对版本" ⇒ 这条可核证据落在 `code_declared`，`revisions.code` 保持 null；
+  // 读口没有可核对的当前版本 ⇒ 版本轴如实 unknown（不自证成 current，也不猜成 outdated）。
+  // "版本一致→current / 源变→outdated" 的真实验证在下面 ⑦（以**真实现读源清单**为当前版本）。
+  const revAfterResult = await revisionsOf(C);
   const eSubC = entryOf(accC, SUB_ENTRY_SCENARIO);
   ok(
-    codeRevAfterResult === CODE_REV_MCP_B &&
-      eM1?.revision_state === "current" &&
-      eSubC?.revision_state === "outdated" &&
-      eSubC?.openable === true &&
-      String(eSubC?.revision_label).includes("成果版本已过期"),
-    `⑥-6 两源同权（裁定 3）：revisions.code = ${codeRevAfterResult}，它**只来自更晚的结果回报**的 result_revision（无任何成果登记声明过它）` +
-      ` ⇒ 绑版本 B 的入口 revision_state=${eM1?.revision_state}（**纯走 MCP 结果回报的项目版本轴不再恒 unknown** 的证据），` +
-      `而更早的成果登记（版本 A）那条变成 ${eSubC?.revision_state} 且仍可打开（旧口径下这两条正好相反）`,
+    revAfterResult.code === null &&
+      revAfterResult.code_declared === CODE_REV_MCP_B &&
+      eM1?.revision_state === "unknown" &&
+      eSubC?.revision_state === "unknown" &&
+      eSubC?.openable === true,
+    `⑥-6 两源同权（裁定 3）的可核证据是 code_declared = ${revAfterResult.code_declared}：它**只来自更晚的结果回报**的 result_revision（无任何成果登记声明过它）` +
+      `，按实际发生时间优先成为**自报**的当前版本（旧口径只认成果登记，会取到版本 A）。` +
+      `F4：自报不当"当前可核对版本" ⇒ revisions.code=${revAfterResult.code}，两条入口版本轴都如实 ${eM1?.revision_state}（**未知不自证**），且仍可打开（${eSubC?.openable}）`,
   );
   ok(
     eM1?.state === "openable" &&
       eM1.openable === true &&
       eM1.source_revision === CODE_REV_MCP_B,
-    `⑥-6b 版本轴与"能不能打开"仍是两条轴：这条入口绑的就是当前版本（${eM1?.revision_state}），照样可打开（state=${eM1?.state}）`,
+    `⑥-6b 版本轴与"能不能打开"仍是两条轴：这条入口版本轴 ${eM1?.revision_state}（缺可核对当前版本）、照样可打开（state=${eM1?.state}）`,
   );
   const tM1 = taskOf(accC, "M-1");
   ok(
@@ -1071,27 +1266,29 @@ async function mcpResultEntryChecks(opts: { freshIso: string; staleIso: string }
     subCLater.status === 200,
     `⑥-8b 再追加一条更晚的成果登记（HTTP ${subCLater.status}，版本 C = ${CODE_REV_C_LATER}，**不声明入口**）`,
   );
-  const codeRevAfterLater = await revisionCodeOf();
+  const revAfterLater = await revisionsOf(C);
   const accC1 = await acceptanceOf(C);
   const eM1After = entryOf(accC1, M1_SCENARIO);
   const eSubAfter = entryOf(accC1, SUB_ENTRY_SCENARIO);
   ok(
-    codeRevAfterLater === CODE_REV_C_LATER,
-    `⑥-8c 当前版本跟着**最新一次声明了版本的提交**走：revisions.code = ${codeRevAfterLater}（版本 C 只来自这条成果登记）`,
+    revAfterLater.code === null && revAfterLater.code_declared === CODE_REV_C_LATER,
+    `⑥-8c 自报当前版本跟着**最新一次声明了版本的提交**走（两源同权、实际发生时间优先）：code_declared = ${revAfterLater.code_declared}` +
+      `（版本 C 只来自这条成果登记）；F4：可核对版本 code = ${revAfterLater.code}（不拿自报当当前版本）`,
   );
   ok(
-    eM1After?.revision_state === "outdated" &&
+    eM1After?.revision_state === "unknown" &&
       eM1After.state === "openable" &&
       eM1After.openable === true &&
-      eM1After.source_revision === CODE_REV_MCP_B &&
-      String(eM1After.revision_label).includes("成果版本已过期"),
-    `⑥-8d 版本过期仍被判得出来（两源同权没有把过期判定做废）：同一条入口从 ${eM1?.revision_state} 变 ${eM1After?.revision_state}，**仍然可打开**（state=${eM1After?.state}／openable=${eM1After?.openable}）`,
+      eM1After.source_revision === CODE_REV_MCP_B,
+    `⑥-8d 读口没有可核对的当前版本 ⇒ 版本轴如实 ${eM1After?.revision_state}（**不拿自报的版本 C 冒充当前版本**），**仍然可打开**（state=${eM1After?.state}／openable=${eM1After?.openable}）；` +
+      `"版本一致→current、相关源变化→outdated 且仍可打开"由 ⑦ 以**真实现读源清单**为当前版本独立验证`,
   );
   ok(
     (accC1?.runtime_entries ?? []).length === 2 &&
-      eSubAfter?.revision_state === "outdated" &&
-      String(taskOf(accC1, "M-1")?.result_entry?.note ?? "").includes("版本提示"),
-    `⑥-8e 版本 C 那条**不声明入口** ⇒ 入口总数不变（仍 ${accC1?.runtime_entries?.length} 条）；而过期提示已上屏（"版本提示"出现），两条入口都绑旧版本（${eM1After?.revision_state}／${eSubAfter?.revision_state}）`,
+      eSubAfter?.revision_state === "unknown" &&
+      !String(taskOf(accC1, "M-1")?.result_entry?.note ?? "").includes("版本提示"),
+    `⑥-8e 版本 C 那条**不声明入口** ⇒ 入口总数不变（仍 ${accC1?.runtime_entries?.length} 条）；` +
+      `F4 下没有可核对当前版本 ⇒ 不虚报"版本提示"（两条入口版本轴 ${eM1After?.revision_state}／${eSubAfter?.revision_state}）`,
   );
 
   // ── ④ 重启读回：事实落盘了，不是只活在内存里（字段里含 revision_state，版本轴结论也要经得起重启）──
@@ -1274,15 +1471,16 @@ async function mcpResultEntryChecks(opts: { freshIso: string; staleIso: string }
     `⑥-19 旧调用不在清单里多出入口（仍 ${accC4?.runtime_entries?.length} 条：成果登记 1 + 结果回报 1）：M-3 的入口只来自它那条成果登记，不来自旧调用`,
   );
   // 排序列的另一面（裁定 3 的排序口径）：这条旧调用的结果回报声明的是**版本 A**（与更早那条成果登记同一个串），
-  // 但它发生得更晚 ⇒ 按"实际发生时间优先"它就是当前版本，版本 A 那条入口又变回 current。这不是"粘性"，
-  // 而是"谁最后声明、谁就是当前版本"；下面 ⑥-24 的计数正是按这个末态算的。
-  const codeRevAfterLegacy = await revisionCodeOf();
+  // 但它发生得更晚 ⇒ 按"实际发生时间优先"它就是**自报**的当前版本。这不是"粘性"，而是"谁最后声明、谁就是自报当前版本"；
+  // 契约 F4：自报不当可核对当前版本 ⇒ 可核证据在 `code_declared`，`revisions.code` 恒 null，版本轴不自证。下面 ⑥-24 的计数按这个末态算。
+  const revAfterLegacy = await revisionsOf(C);
   ok(
-    codeRevAfterLegacy === CODE_REV_C &&
-      entryOf(accC4, SUB_ENTRY_SCENARIO)?.revision_state === "current" &&
-      entryOf(accC4, M1_SCENARIO)?.revision_state === "outdated",
-    `⑥-19b 版本轴跟着**最后一次声明了版本的提交**走（两源同权、实际发生时间优先）：这条旧调用声明的版本 A（${CODE_REV_C}）比版本 C 更晚 ⇒ revisions.code=${codeRevAfterLegacy}，` +
-      `绑 A 的入口回到 ${entryOf(accC4, SUB_ENTRY_SCENARIO)?.revision_state}、绑 B 的仍是 ${entryOf(accC4, M1_SCENARIO)?.revision_state}`,
+    revAfterLegacy.code === null &&
+      revAfterLegacy.code_declared === CODE_REV_C &&
+      entryOf(accC4, SUB_ENTRY_SCENARIO)?.revision_state === "unknown" &&
+      entryOf(accC4, M1_SCENARIO)?.revision_state === "unknown",
+    `⑥-19b 自报当前版本跟着**最后一次声明了版本的提交**走（两源同权、实际发生时间优先）：这条旧调用声明的版本 A（${CODE_REV_C}）比版本 C 更晚 ⇒ code_declared=${revAfterLegacy.code_declared}；` +
+      `F4 下可核对版本 code=${revAfterLegacy.code}，两条入口版本轴都 ${entryOf(accC4, SUB_ENTRY_SCENARIO)?.revision_state}（自报不自证）`,
   );
 
   // ── ⑦ 读侧闸门仍在（**历史**坏记录）：写侧已产不出坏记录，只能直接往 events.jsonl 末尾追加一条 ──
@@ -1364,12 +1562,524 @@ async function mcpResultEntryChecks(opts: { freshIso: string; staleIso: string }
       sumC.reverify_due_count === 1 &&
       sumC.failed_count === 0 &&
       sumC.unknown_count === 0 &&
-      sumC.outdated_count === 1 &&
+      // F4：读口不拿自报当"当前可核对版本" ⇒ 没有可核对当前版本时**无人**被判过期（outdated_count=0），
+      // 版本轴如实 unknown（那两条正常登记 + 两条历史记录都不是 current）。不粉饰成"过期 1 条"。
+      sumC.outdated_count === 0 &&
       String(sumC.note).includes("待重新验证"),
     `⑥-24 真链路末态的概况也不因超时降级：kind=${sumC?.kind}（不是 stale/unavailable）、共 ${sumC?.total} 条` +
       `（2 条正常登记 + 2 条历史追加）、可打开 ${sumC?.can_open_count} ／ 待重验 ${sumC?.reverify_due_count} ／ 版本过期 ${sumC?.outdated_count}` +
-      `（末态当前版本是版本 A——见 ⑥-19b：旧调用那条结果回报发生最晚；于是只有绑版本 B 的那条算过期，` +
-      `那两条历史记录没声明版本、版本轴是 unknown，不计入过期）`,
+      `（F4：读口无可核对当前版本 ⇒ 版本过期计数如实为 0，不拿自报的版本当当前版本；` +
+      `"相关源变化→过期"另由 ⑧ 以真实现读源清单为当前版本独立验证）`,
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ⑧ 版本轴以**真实现读源清单**为当前版本（契约 F4：自报不是当前版本，真 current 必须现读源清单）
+// ══════════════════════════════════════════════════════════════════════════════
+/** ⑧ 用的入口场景（读口/读函数按场景名找，改名要同步断言） */
+const V_AXIS_SCENARIO = "版本轴入口（真实现读源清单）";
+const V_NOVERSION_SCENARIO = "无版本声明入口（版本轴 unknown）";
+
+/**
+ * 为什么单独一段：契约 F4（`docs/forward-progress-contract.md`）明确「不能以账本里上次自报的 code revision
+ * 反过来当当前代码版本」，所以读口 `revisions.code` 默认 null，没有「可核对当前版本」时版本轴只能如实 unknown。
+ * 要真验证「版本一致→current、相关源变化→outdated 且仍可打开」，必须**造真实文件 + 经唯一宿主现读登记源清单**，
+ * 把清单指纹当**可核对当前版本**（`opts.code_revision`，产品的显式覆盖口），再走产品读口（`collectProjectFacts`
+ * + `runtimeEntryViews`，与验收读口同一份装配）。
+ * 不伪造顶层 revision、不改产品判据；这里只是以真实现读把版本轴跑满。
+ */
+async function versionAxisFromManifestChecks(): Promise<void> {
+  info("── ⑧ 版本轴以真实现读源清单为当前版本（F4：自报不是当前版本）");
+  const hostClient = new WorkServiceClient({ dataDir, autostart: false });
+  const rel = "src/version-axis.ts";
+  const now = Date.now();
+  const freshIso = new Date(now - 5 * 60 * 1000).toISOString();
+
+  /** 造真实文件 → 经**唯一宿主**现读登记源清单 → 取回执指纹（与产品 manifestFingerprint 逐字核） */
+  const storeManifest = async (content: string): Promise<{ fingerprint: string; sha: string }> => {
+    write(path.join(rootC, rel), content);
+    const local = buildSourceManifest(rootC, [rel]).fingerprint;
+    const r = await recordWorkEvidenceTool.handler(
+      {
+        op: "store",
+        project_id: C,
+        role: "executor",
+        kind: "source_manifest",
+        summary: "版本轴夹具源清单（宿主现读）",
+        binding: { revision_kind: "code", revision: "run:version-axis" },
+        source_manifest: [rel],
+      },
+      { work: hostClient, clientName: "kimi-code" } as never,
+    );
+    const text = (r.content ?? [])
+      .filter((c): c is { type: "text"; text: string } => (c as { type: string }).type === "text")
+      .map((c) => c.text)
+      .join("\n");
+    const j = JSON.parse(text);
+    const fp = j?.evidence?.source_manifest?.fingerprint as string | undefined;
+    ok(
+      j?.ok === true && typeof fp === "string" && /^[0-9a-f]{64}$/.test(fp) && fp === local,
+      `⑧-1 源清单经唯一宿主现读登记（/api/work/reporting/evidence）：宿主回执指纹 ${short(fp)} 与产品 manifestFingerprint（${short(local)}）逐字一致`,
+    );
+    return { fingerprint: fp as string, sha: j.evidence.sha256 as string };
+  };
+
+  const v1 = await storeManifest("export const VERSION_AXIS = 1;\n");
+
+  // 一条绑「真实现读清单指纹」的入口登记（版本＝盘上内容，不是自报串）+ 一条**无版本声明**的入口（另起一条登记）
+  const subAxis = await submitCommand({
+    project: C,
+    type: "audit.submission_submitted",
+    entity_id: "submission:sub-version-axis",
+    expected_revision: null,
+    payload: {
+      goal: "C 夹具：版本轴入口（绑定真实现读源清单指纹）",
+      task_id: "M-3",
+      submitted_by: "kimi-code",
+      changed_files: [rel],
+      commands: [{ command: "pnpm test version-axis", exit_code: 0, output_ref: null }],
+      untested: [],
+      known_issues: [],
+      binding: { revision_kind: "code", revision: v1.fingerprint },
+      runtime_entries: [
+        { scenario: V_AXIS_SCENARIO, url: `http://127.0.0.1:${PORT}/version-axis`, verified_at: freshIso, status: "reachable", reason: null },
+      ],
+    },
+  });
+  const subNoVer = await submitCommand({
+    project: C,
+    type: "audit.submission_submitted",
+    entity_id: "submission:sub-no-version",
+    expected_revision: null,
+    payload: {
+      goal: "C 夹具：无版本声明的入口（版本轴 unknown）",
+      task_id: "M-3",
+      submitted_by: "kimi-code",
+      changed_files: [],
+      commands: [{ command: "pnpm test no-version", exit_code: 0, output_ref: null }],
+      untested: [],
+      known_issues: [],
+      runtime_entries: [
+        { scenario: V_NOVERSION_SCENARIO, url: `http://127.0.0.1:${PORT}/no-version`, verified_at: freshIso, status: "reachable", reason: null },
+      ],
+    },
+  });
+  ok(
+    subAxis.status === 200 && subNoVer.status === 200,
+    `⑧-2 绑定「真实现读清单指纹」与「无版本声明」两条入口登记成功（HTTP ${subAxis.status}/${subNoVer.status}）`,
+  );
+
+  /** 以指定「可核对当前版本」读入口（与验收读口**同一份装配**：collectProjectFacts + runtimeEntryViews） */
+  const readAxis = (currentRev: string): any[] => {
+    const facts = collectProjectFacts(C, dataDir, { code_revision: currentRev });
+    const sources: RuntimeEntrySource[] = [
+      ...Object.values(facts.audit.submissions).map((s) => ({
+        kind: "submission" as const,
+        record_id: s.record_id,
+        task_id: s.task_id,
+        submitted_by: s.submitted_by,
+        at: s.at,
+        revision: s.binding?.revision ?? null,
+        revision_kind: s.binding?.revision_kind ?? null,
+        entries: s.runtime_entries,
+      })),
+      ...facts.result_runtime_sources,
+    ];
+    return runtimeEntryViews(sources, now, { reviewMs: RUNTIME_ENTRY_REVIEW_MS, currentRevision: currentRev });
+  };
+  const findE = (entries: any[], scenario: string): any => entries.find((e) => e.scenario === scenario) ?? null;
+
+  const read1 = readAxis(v1.fingerprint);
+  const eAxis1 = findE(read1, V_AXIS_SCENARIO);
+  const eM1Ax = findE(read1, M1_SCENARIO);
+  const eNoVer = findE(read1, V_NOVERSION_SCENARIO);
+  ok(
+    eAxis1?.revision_state === "current" && eAxis1.openable === true,
+    `⑧-3 版本一致 ⇒ current：入口绑的正是现读清单指纹（${short(v1.fingerprint)}）⇒ revision_state=${eAxis1?.revision_state}，仍可打开（${eAxis1?.openable}）`,
+  );
+  ok(
+    eM1Ax?.revision_state === "outdated" &&
+      eM1Ax.openable === true &&
+      String(eM1Ax.revision_label).includes("成果版本已过期"),
+    `⑧-4 版本不一致 ⇒ outdated 且**仍可打开**：绑旧版本的入口（结果是结果回报来源）revision_state=${eM1Ax?.revision_state}（openable=${eM1Ax?.openable}）`,
+  );
+  ok(
+    eNoVer?.revision_state === "unknown",
+    `⑧-5 未声明版本 ⇒ unknown（不猜成 current、也不猜成 outdated）：${eNoVer?.revision_state}`,
+  );
+
+  // 相关源变化：改被清单覆盖的那个文件 → 重新现读登记（新指纹）⇒ 原 current 入口变 outdated，仍可打开
+  const v2 = await storeManifest("export const VERSION_AXIS = 2;\n");
+  ok(
+    v2.fingerprint !== v1.fingerprint,
+    `⑧-6 相关源变化 ⇒ 现读清单指纹随之变化：${short(v1.fingerprint)} → ${short(v2.fingerprint)}`,
+  );
+  const eAxis2 = findE(readAxis(v2.fingerprint), V_AXIS_SCENARIO);
+  ok(
+    eAxis2?.revision_state === "outdated" && eAxis2.openable === true && eAxis2.source_revision === v1.fingerprint,
+    `⑧-7 相关源一变 ⇒ 原来 current 的入口变 outdated、**仍然可打开**（绑 ${short(eAxis2?.source_revision)}，当前 ${short(v2.fingerprint)}，openable=${eAxis2?.openable}）`,
+  );
+
+  // 自报不自证：显式可核对版本 = 现读清单指纹，而账本自报 code_declared 是另一串（≠ 指纹）
+  const factsV = collectProjectFacts(C, dataDir, { code_revision: v2.fingerprint });
+  ok(
+    factsV.revisions.code === v2.fingerprint && factsV.revisions.code_declared !== v2.fingerprint,
+    `⑧-8 可核对当前版本来自**现读源清单**（code=${short(factsV.revisions.code)}），不是账本自报（code_declared=${short(factsV.revisions.code_declared)} ≠ 指纹）：自报不自证`,
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ⑨ 版本轴经**真 HTTP 验收读口**（逐来源现读该来源自己引用的源清单；契约 F4「自报不自证」）
+//
+// 与 ⑧ 的分工：⑧ 用函数层的**显式注入口**（`opts.code_revision`）把版本轴跑满——它能证明"给定一个
+// 可核对当前版本，判定是对的"，但**证明不了产品读口自己能拿到那样的版本**。修复前的产品缺口正是：
+// `GET /api/projects/:id/acceptance` 从不给 `code_revision`，却把恒 null 的 `facts.revisions.code`
+// 灌进 `runtimeEntryViews`，于是**真实 HTTP 读口下每条入口 version 轴恒 `unknown`**——"还能开、
+// 但对应旧版成果"这条（DESIGN §3.7）在 HTTP 层永远判不出来。
+//
+// 修好之后：验收读口对**每条来源**逐来源现读它**明确引用**且**版本绑定一致**的合法源清单，
+// 覆盖源没变 ⇒ `current`；覆盖源变了/被删 ⇒ `outdated`（仍可打开）；没清单/错来源/错绑定/缺失/
+// 多份歧义 ⇒ `unknown`。本段全部走**真 HTTP 读写口 + 真宿主源清单**，不是函数探针。
+// ══════════════════════════════════════════════════════════════════════════════
+const HTTP_AXIS_SCENARIO = "⑨ 版本轴入口（成果登记·清单绑定）";
+const HTTP_NO_MANIFEST_SCENARIO = "⑨ 无清单入口（自报不自证）";
+const HTTP_WRONG_BIND_SCENARIO = "⑨ 错绑定入口（清单指纹≠声明版本）";
+const HTTP_MISSING_SCENARIO = "⑨ 缺失清单入口（引用的清单不在盘上）";
+const HTTP_NONMANIFEST_SCENARIO = "⑨ 错来源入口（引用非清单证据）";
+const HTTP_AMBIGUOUS_SCENARIO = "⑨ 多歧义入口（引用了两份不同清单）";
+const HTTP_RESULT_SCENARIO = "⑨ 结果回报入口（真 HTTP·两路同权）";
+
+async function httpVersionAxisChecks(): Promise<void> {
+  info("── ⑨ 版本轴经真 HTTP 验收读口：逐来源现读源清单（修复前 HTTP 下恒 unknown）");
+  const hostClient = new WorkServiceClient({ dataDir, autostart: false });
+  const workDirC = projectWorkDir(C, dataDir);
+  const rel = "src/axis-covered.ts";
+  const relOther = "src/axis-other.ts";
+  const relUnrelated = "src/axis-unrelated.ts";
+  const freshIso = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+  /** 造真文件 → 经**唯一宿主**现读登记源清单 → 取回执指纹（与产品实现逐字核）；返回 sha 供正式引用 */
+  const storeManifest = async (relPath: string, content: string): Promise<{ fingerprint: string; sha: string }> => {
+    write(path.join(rootC, relPath), content);
+    const local = buildSourceManifest(rootC, [relPath]).fingerprint;
+    const r = await recordWorkEvidenceTool.handler(
+      {
+        op: "store",
+        project_id: C,
+        role: "executor",
+        kind: "source_manifest",
+        summary: `⑨ 版本轴真 HTTP 夹具源清单（${relPath}）`,
+        binding: { revision_kind: "code", revision: "run:http-axis" },
+        source_manifest: [relPath],
+      },
+      { work: hostClient, clientName: "kimi-code" } as never,
+    );
+    const text = (r.content ?? [])
+      .filter((c): c is { type: "text"; text: string } => (c as { type: string }).type === "text")
+      .map((c) => c.text)
+      .join("\n");
+    const j = JSON.parse(text);
+    const fp = j?.evidence?.source_manifest?.fingerprint as string | undefined;
+    ok(
+      j?.ok === true && typeof fp === "string" && /^[0-9a-f]{64}$/.test(fp) && fp === local,
+      `⑨-1 源清单经唯一宿主现读登记（/api/work/reporting/evidence）：回执指纹 ${short(fp)} 与产品 manifestFingerprint 逐字一致`,
+    );
+    return { fingerprint: fp as string, sha: j.evidence.sha256 as string };
+  };
+
+  /**
+   * 造一份**同一覆盖集合但不同正文**的源清单载体（因而与别的载体同 `manifest.fingerprint`、不同内容地址），
+   * 经**同一唯一宿主写口**登记（与 ⑨-1 同一路径）。`binding` 可自选来源类/修订，用来构造"同指纹、冲突 binding"。
+   */
+  const storeCarrier = async (
+    relPath: string,
+    content: string,
+    binding: { revision_kind: string; revision: string },
+  ): Promise<{ fingerprint: string; sha: string }> => {
+    const r = await recordWorkEvidenceTool.handler(
+      {
+        op: "store",
+        project_id: C,
+        role: "executor",
+        kind: "source_manifest",
+        summary: `⑨b 冲突夹具源清单载体（${relPath} / ${binding.revision_kind}）`,
+        content,
+        binding,
+        source_manifest: [relPath],
+      },
+      { work: hostClient, clientName: "kimi-code" } as never,
+    );
+    const text = (r.content ?? [])
+      .filter((c): c is { type: "text"; text: string } => (c as { type: string }).type === "text")
+      .map((c) => c.text)
+      .join("\n");
+    const j = JSON.parse(text);
+    return {
+      fingerprint: j?.evidence?.source_manifest?.fingerprint as string,
+      sha: j?.evidence?.sha256 as string,
+    };
+  };
+
+  const v1 = await storeManifest(rel, "export const AXIS_COVERED = 1;\n");
+  const vOther = await storeManifest(relOther, "export const AXIS_OTHER = 1;\n");
+  // 一份**非** source_manifest 证据（"错来源"反例：普通证据不能给版本轴背书）
+  const nonManifest = putEvidence(workDirC, {
+    content: "$ pnpm test axis\npassed\n",
+    kind: "acceptance",
+    summary: "⑨ 非清单证据（错来源反例）",
+    created_by: "kimi-code",
+    role: "executor",
+    binding: { revision_kind: CODE_KIND, revision: v1.fingerprint },
+    source_ref: "⑨ 错来源",
+  }).evidence_id;
+  const missingSha = sha256("⑨ 这份证据故意不存在");
+
+  /** 一条成果登记（写侧真 HTTP）声明的入口；`bindingRevision` = 该登记声明的 code 版本，`refs` = 正式引用 */
+  const submitAxis = (slug: string, scenario: string, bindingRevision: string | null, refs: string[]) =>
+    submitCommand({
+      project: C,
+      type: "audit.submission_submitted",
+      entity_id: `submission:sub-http-${slug}`,
+      expected_revision: null,
+      payload: {
+        goal: `⑨ 版本轴真 HTTP（${slug}）`,
+        task_id: "M-3",
+        baseline: {},
+        changed_files: [],
+        commands: [{ command: "pnpm test axis", exit_code: 0, output_ref: null }],
+        untested: [],
+        known_issues: [],
+        evidence_refs: refs,
+        ...(bindingRevision === null ? {} : { binding: { revision_kind: "code", revision: bindingRevision } }),
+        submitted_by: "kimi-code",
+        runtime_entries: [
+          { scenario, url: `http://127.0.0.1:${PORT}/axis-${slug}`, verified_at: freshIso, status: "reachable", reason: null },
+        ],
+      },
+    });
+
+  const subAxis = await submitAxis("bound", HTTP_AXIS_SCENARIO, v1.fingerprint, [v1.sha]);
+  const subNoManifest = await submitAxis("nomanifest", HTTP_NO_MANIFEST_SCENARIO, "self-report-axis", []);
+  const subWrongBind = await submitAxis("wrongbind", HTTP_WRONG_BIND_SCENARIO, "self-report-wrong", [v1.sha]);
+  const subMissing = await submitAxis("missing", HTTP_MISSING_SCENARIO, v1.fingerprint, [missingSha]);
+  const subNonManifest = await submitAxis("nonmanifest", HTTP_NONMANIFEST_SCENARIO, v1.fingerprint, [nonManifest]);
+  const subAmbiguous = await submitAxis("ambiguous", HTTP_AMBIGUOUS_SCENARIO, v1.fingerprint, [v1.sha, vOther.sha]);
+  ok(
+    [subAxis, subNoManifest, subWrongBind, subMissing, subNonManifest, subAmbiguous].every((r) => r.status === 200),
+    `⑨-2 六条成果登记（合法/无清单/错绑定/缺失/错来源/多歧义）经真 HTTP 写口全部登记成功（HTTP ${[subAxis, subNoManifest, subWrongBind, subMissing, subNonManifest, subAmbiguous].map((r) => r.status).join("/")}）`,
+  );
+
+  // ── 真 HTTP 读口：修复前这里六条**全部** unknown ──
+  const acc1 = await acceptanceOf(C);
+  const eAxis1 = entryOf(acc1, HTTP_AXIS_SCENARIO);
+  const eNoManifest = entryOf(acc1, HTTP_NO_MANIFEST_SCENARIO);
+  const eWrongBind = entryOf(acc1, HTTP_WRONG_BIND_SCENARIO);
+  const eMissing = entryOf(acc1, HTTP_MISSING_SCENARIO);
+  const eNonManifest = entryOf(acc1, HTTP_NONMANIFEST_SCENARIO);
+  const eAmbiguous = entryOf(acc1, HTTP_AMBIGUOUS_SCENARIO);
+  ok(
+    eAxis1?.revision_state === "current" && eAxis1.openable === true && eAxis1.revision_current === v1.fingerprint,
+    `⑨-3 真 HTTP 读口：成果登记**正式引用**了版本绑定一致的合法源清单且现读一致 ⇒ revision_state=${eAxis1?.revision_state}（修复前恒 unknown）、仍可打开（${eAxis1?.openable}）`,
+  );
+  ok(
+    eNoManifest?.revision_state === "unknown" && eNoManifest.openable === true,
+    `⑨-4 自报不自证：没引用任何清单、只自报版本串 ⇒ 版本轴如实 ${eNoManifest?.revision_state}（**不拿自报当当前版本**），仍可打开（${eNoManifest?.openable}）`,
+  );
+  ok(
+    eWrongBind?.revision_state === "unknown",
+    `⑨-5 错绑定：引用了合法清单，但声明的 code 版本 ≠ 清单指纹 ⇒ ${eWrongBind?.revision_state}（**不借一份无关清单背书**）`,
+  );
+  ok(
+    eMissing?.revision_state === "unknown",
+    `⑨-6 缺失：正式引用的清单证据不在盘上 ⇒ ${eMissing?.revision_state}（不猜、不绿）`,
+  );
+  ok(
+    eNonManifest?.revision_state === "unknown",
+    `⑨-7 错来源：正式引用的证据不是 source_manifest（普通验收证据）⇒ ${eNonManifest?.revision_state}（不给版本轴背书）`,
+  );
+  ok(
+    eAmbiguous?.revision_state === "unknown",
+    `⑨-8 多歧义：正式引用了**两份不同**的源清单 ⇒ ${eAmbiguous?.revision_state}（不借其中任意一份背书）`,
+  );
+  ok(
+    acc1?.runtime_entry_summary?.outdated_count === 0,
+    `⑨-9 拿不到可核对当前版本的这些入口**没有一个**被误判过期（outdated_count=${acc1?.runtime_entry_summary?.outdated_count}）：unknown 不等于 outdated`,
+  );
+  ok(
+    !String(eAxis1?.revision_basis ?? "").includes(tmpBase) && !String(eAxis1?.revision_basis ?? "").includes(rootC),
+    `⑨-10 版本轴依据是人话且**不含绝对私有路径**：${String(eAxis1?.revision_basis ?? "").slice(0, 34)}…`,
+  );
+
+  // ── 无关源变化不连坐：改一个**没被清单覆盖**的文件 ⇒ 那条入口仍 current ──
+  write(path.join(rootC, relUnrelated), "export const AXIS_UNRELATED = 1;\n");
+  const accUnrelated = await acceptanceOf(C);
+  ok(
+    entryOf(accUnrelated, HTTP_AXIS_SCENARIO)?.revision_state === "current",
+    "⑨-11 无关文件变化**不连坐**：清单没覆盖它 ⇒ 该入口仍 current（有限范围的本义）",
+  );
+
+  // ── 结果回报路径（真 MCP 认领 + 真回报），正式引用**同一份**清单 ⇒ 两路同权 ──
+  const mcp = await startMcp("v0608f-http-axis");
+  const revM4 = await seedDefinitionOnly(C, "M-4", sha256(planC));
+  const claim4 = await mcp.call("claim_task", {
+    project_id: C,
+    task_id: "M-4",
+    role: "executor",
+    change_id: CHG,
+    expected_revision: revM4,
+  });
+  const submitted4 = await mcp.call("submit_task_result", {
+    project_id: C,
+    task_id: "M-4",
+    role: "executor",
+    change_id: CHG,
+    claim_token: claim4.json?.claim?.claim_token,
+    expected_revision: claim4.json?.claim?.entity_revision,
+    deliverables: ["⑨ 版本轴（结果回报路径）"],
+    evidence_refs: [v1.sha],
+    verification: [{ command: "node --import tsx scripts/verify-v06-08-f.ts", exit_code: 0 }],
+    untested: [],
+    known_issues: [],
+    result_revision: v1.fingerprint,
+    runtime_entries: [
+      { scenario: HTTP_RESULT_SCENARIO, url: `http://127.0.0.1:${PORT}/axis-result`, verified_at: freshIso, status: "reachable" },
+    ],
+  });
+  ok(
+    !submitted4.isError && submitted4.json?.ok === true,
+    `⑨-12 结果回报路径（MCP 真认领 + submit_task_result）正式引用同一清单、绑定版本一致：${String(submitted4.json?.receipt?.event_id ?? "").slice(0, 12)}…`,
+  );
+  const accResult = await acceptanceOf(C);
+  const eResult = entryOf(accResult, HTTP_RESULT_SCENARIO);
+  ok(
+    eResult?.revision_state === "current" &&
+      eResult.source_kind === "result_submitted" &&
+      eResult.source_revision === v1.fingerprint,
+    `⑨-13 两路同权：结果回报来源（source_kind=${eResult?.source_kind}）的版本轴与成果登记**同判** ${eResult?.revision_state}`,
+  );
+
+  // ── 相关源变化（**不重新登记**）：改被清单覆盖的文件 ⇒ 两条来源都 outdated、都仍可打开 ──
+  write(path.join(rootC, rel), "export const AXIS_COVERED = 2;\n");
+  const accChanged = await acceptanceOf(C);
+  const eAxis2 = entryOf(accChanged, HTTP_AXIS_SCENARIO);
+  const eResult2 = entryOf(accChanged, HTTP_RESULT_SCENARIO);
+  ok(
+    eAxis2?.revision_state === "outdated" && eAxis2.openable === true && eAxis2.source_revision === v1.fingerprint,
+    `⑨-14 相关源一变 ⇒ 真 HTTP 判 ${eAxis2?.revision_state}（绑 ${short(eAxis2?.source_revision)}）、**仍可打开**（openable=${eAxis2?.openable}）——"还能开但对应旧版成果"这条轴在 HTTP 层判得出来了`,
+  );
+  ok(
+    eResult2?.revision_state === "outdated" && eResult2.openable === true,
+    `⑨-15 结果回报那条**同判** ${eResult2?.revision_state}（两路同权、不偏袒任一来源）`,
+  );
+  ok(
+    entryOf(accChanged, HTTP_NO_MANIFEST_SCENARIO)?.revision_state === "unknown" &&
+      entryOf(accChanged, HTTP_AXIS_SCENARIO)?.openable === true,
+    "⑨-16 相关源变了也不连坐别的来源：无清单那条仍 unknown；版本轴与「能不能打开」始终两条轴",
+  );
+  ok(
+    (accChanged?.runtime_entry_summary?.outdated_count ?? 0) >= 2 &&
+      (accChanged?.runtime_entry_summary?.can_open_count ?? 0) >= 2,
+    `⑨-17 概况按版本轴单独计数：outdated_count=${accChanged?.runtime_entry_summary?.outdated_count}，can_open_count=${accChanged?.runtime_entry_summary?.can_open_count}（两个计数各说各的事、可重叠）`,
+  );
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // ⑨b 顺序无关 / 冲突不借绿（独立复审 D1）
+  //   旧解析**先按 `manifest.fingerprint` 去重、只核"保留的第一份"载体**，于是同一组引用换数组顺序
+  //   会给出 current ↔ unknown 两个结论，且同指纹、不同 binding 的冲突不被判为歧义（静默借第一份）。
+  //   修后：**每份候选先核到底，再按声明指纹归组**；组内结论必须全体一致，不一致 ⇒ 冲突 ⇒ unknown。
+  //   三条冲突构造（都经真 HTTP 写口 + 真宿主；`store` 产不出的坏清单另按"清单被动过"直接落盘）：
+  //     · 冲突 binding：同覆盖集合两份载体，`binding.revision_kind` 一份 code、一份 plan；
+  //     · 空 binding：同覆盖集合另一份载体，`binding.revision` 是空白串（来源类对不上）；
+  //     · 同指纹不同 files：声明同一 `fingerprint` 但 `files` 与指纹不自洽的载体（现读复核取不到结论）。
+  //   判据：**同一引用集合换顺序结论逐字一致**；冲突一律 `unknown`（不借第一份的绿，也不随机择优）。
+  // ══════════════════════════════════════════════════════════════════════════════
+  const relConflict = "src/axis-conflict.ts";
+  write(path.join(rootC, relConflict), "export const AXIS_CONFLICT = 1;\n");
+  const cGood = await storeCarrier(relConflict, "carrier:good", { revision_kind: "code", revision: "run:good" });
+  const cWrongKind = await storeCarrier(relConflict, "carrier:wrong-kind", { revision_kind: "plan", revision: "run:bad" });
+  const cEmpty = await storeCarrier(relConflict, "carrier:empty-binding", { revision_kind: "code", revision: "   " });
+  const cAgree = await storeCarrier(relConflict, "carrier:agree", { revision_kind: "code", revision: "run:agree" });
+  ok(
+    [cGood, cWrongKind, cEmpty, cAgree].every((c) => c.fingerprint === cGood.fingerprint) &&
+      new Set([cGood.sha, cWrongKind.sha, cEmpty.sha, cAgree.sha]).size === 4,
+    `⑨b-1 四份载体的覆盖集合相同（同清单指纹 ${short(cGood.fingerprint)}）、内容地址各不相同（构造前提成立）`,
+  );
+
+  // 同一指纹、但 `files` 与指纹不自洽的载体：store 产不出来（服务端现读算指纹），只能直接落盘当"清单被动过"
+  const fakeContent = "⑨b 声明同一指纹但 files 与指纹不自洽的清单载体";
+  const fakeSha = sha256(fakeContent);
+  write(
+    path.join(workDirC, "evidence", `${fakeSha}.json`),
+    JSON.stringify({
+      kind: "source_manifest",
+      content: fakeContent,
+      content_sha256: fakeSha,
+      bytes: Buffer.byteLength(fakeContent, "utf8"),
+      source_manifest: {
+        version: "source-manifest-v1",
+        files: [{ path: relConflict, sha256: "0".repeat(64), bytes: 1 }],
+        fingerprint: cGood.fingerprint,
+      },
+      binding: { revision_kind: "code", revision: "run:fake" },
+      summary: "⑨b 同指纹不同 files 的坏载体",
+      created_by: "kimi-code",
+      role: "executor",
+      source_ref: null,
+    }),
+  );
+
+  /** 同一引用集合、两种数组顺序各提交一条；返回两条读回的版本轴状态（用于断言顺序无关） */
+  const orderPair = async (slug: string, a: string, b: string): Promise<[string, string]> => {
+    const s1 = await submitAxis(`${slug}-ab`, `⑨b ${slug}（A 先）`, cGood.fingerprint, [a, b]);
+    const s2 = await submitAxis(`${slug}-ba`, `⑨b ${slug}（B 先）`, cGood.fingerprint, [b, a]);
+    if (s1.status !== 200 || s2.status !== 200) throw new Error(`⑨b ${slug} 登记失败 HTTP ${s1.status}/${s2.status}`);
+    const acc = await acceptanceOf(C);
+    return [
+      String(entryOf(acc, `⑨b ${slug}（A 先）`)?.revision_state),
+      String(entryOf(acc, `⑨b ${slug}（B 先）`)?.revision_state),
+    ];
+  };
+
+  // 对照：单一好载体是 current（下面"冲突 → unknown"不是因为好载体本身坏了）
+  await submitAxis("conflict-solo-good", "⑨b 单·好载体", cGood.fingerprint, [cGood.sha]);
+  const soloGood = entryOf(await acceptanceOf(C), "⑨b 单·好载体");
+  ok(
+    soloGood?.revision_state === "current",
+    `⑨b-2 对照：单引用这份好载体 ⇒ ${soloGood?.revision_state}（current；"冲突→unknown"不是因为它坏）`,
+  );
+
+  // 同指纹、结论**一致**的两份载体 ⇒ 仍 current（去重不误报冲突）
+  const dupPair = await orderPair("一致双载体", cGood.sha, cAgree.sha);
+  ok(
+    dupPair[0] === "current" && dupPair[1] === "current",
+    `⑨b-3 同指纹、结论一致的两份载体 ⇒ 两种顺序都 ${dupPair.join(" / ")}（去重不误报冲突）`,
+  );
+
+  const kindPair = await orderPair("冲突binding", cGood.sha, cWrongKind.sha);
+  ok(
+    kindPair[0] === "unknown" && kindPair[1] === "unknown",
+    `⑨b-4 同指纹、**冲突 binding**（code vs plan）：两种顺序都 ${kindPair.join(" / ")}，不借第一份的绿`,
+  );
+  const emptyPair = await orderPair("空binding", cGood.sha, cEmpty.sha);
+  ok(
+    emptyPair[0] === "unknown" && emptyPair[1] === "unknown",
+    `⑨b-5 同指纹、**空 binding**（binding.revision 空白）：两种顺序都 ${emptyPair.join(" / ")}，不借第一份的绿`,
+  );
+  const fakePair = await orderPair("同指纹异files", cGood.sha, fakeSha);
+  ok(
+    fakePair[0] === "unknown" && fakePair[1] === "unknown",
+    `⑨b-6 同指纹、**不同 files**（清单自身不自洽）：两种顺序都 ${fakePair.join(" / ")}，不借第一份的绿`,
+  );
+  ok(
+    kindPair[0] === kindPair[1] && emptyPair[0] === emptyPair[1] && fakePair[0] === fakePair[1],
+    "⑨b-7 三组「同一引用集合换数组顺序」的结论逐字一致（顺序无关 / 确定性；修复前会 current↔unknown 翻转）",
+  );
+  const conflictEntry = entryOf(await acceptanceOf(C), "⑨b 冲突binding（B 先）");
+  ok(
+    !String(conflictEntry?.revision_basis ?? "").includes(tmpBase) &&
+      !String(conflictEntry?.revision_basis ?? "").includes(rootC) &&
+      /冲突|不一致/.test(String(conflictEntry?.revision_basis ?? "")),
+    `⑨b-8 冲突依据是人话且不含绝对私有路径：${String(conflictEntry?.revision_basis ?? "").slice(0, 44)}…`,
   );
 }
 
@@ -1383,11 +2093,18 @@ async function main(): Promise<void> {
 
   info("── ④ 登记 → 读取（真起后端 + 真 HTTP 写口，隔离 TATAI_HOME）");
   if (await portListening(PORT)) throw new Error(`端口 ${PORT} 被占用，无法起隔离后端`);
-  spawnServer();
-  await waitUp();
-  const desc = readServiceDescriptor(dataDir);
-  ok(desc !== null && desc.port === PORT, `4-0 唯一写入服务描述符可发现（host=${desc?.host} port=${desc?.port}）`);
-  workToken = desc?.token ?? "";
+  const hostProc = spawnServer();
+  // 依产品就绪协议等**本次**宿主（描述符 pid＋token＋写口所有权探活），不用"/health 可达"当就绪
+  const hostReady = await waitHostReady(hostProc);
+  ok(
+    hostReady.port === PORT,
+    `4-0 唯一写入服务描述符可发现且属**本次**宿主（port=${hostReady.port}、pid=${hostReady.pid}；` +
+      `就绪判据＝描述符 pid ＋ token ＋ 写口所有权探活 200，非 /health 可达）`,
+  );
+  workToken = hostReady.token;
+
+  // 4-0b 就绪延迟负例（确定性）：证旧"/health 可达"过早、新条件不放行、旧 token 写被拒
+  await readinessNegativeCase();
 
   const planRevA = sha256(planA);
   const planRevB = sha256(planB);
@@ -1536,6 +2253,7 @@ async function main(): Promise<void> {
       eOpen.openable === true,
     `4-8 登记字段逐项对上：场景 / 实际入口 / 验证时间 / 结果（state=${eOpen?.state}）`,
   );
+  const revA = await revisionsOf(A);
   ok(
     eOpen?.source_kind === "submission" &&
       eOpen?.source_record_id === "sub-T-1" &&
@@ -1544,8 +2262,13 @@ async function main(): Promise<void> {
       eOpen?.source_submitted_by === "kimi-code" &&
       eOpen?.source_task_id === "T-1" &&
       typeof eOpen?.registered_at === "string" &&
-      eOpen?.revision_state === "current",
-    `4-9 来源成果与版本可追溯：${eOpen?.source_record_id} @ ${eOpen?.source_revision_kind} ${short(eOpen?.source_revision)}（登记人 ${eOpen?.source_submitted_by}，版本轴 ${eOpen?.revision_state}）`,
+      // 契约 F4：可核对当前版本不能来自账本自报 ⇒ 读口默认 code=null；自报值进 code_declared。
+      // 读口没有可核对的当前版本 ⇒ 版本轴如实 unknown（自报不自证；"版本一致→current / 相关源变化→outdated"由 ⑧ 真实验证）。
+      revA.code === null &&
+      revA.code_declared === "code-rev-A" &&
+      eOpen?.revision_state === "unknown",
+    `4-9 来源成果与版本可追溯：${eOpen?.source_record_id} @ ${eOpen?.source_revision_kind} ${short(eOpen?.source_revision)}（登记人 ${eOpen?.source_submitted_by}）；` +
+      `F4：可核对当前版本 code=${revA.code}（不拿自报当当前版本），自报 code_declared=${short(revA.code_declared)} ⇒ 版本轴如实 ${eOpen?.revision_state}`,
   );
 
   // ── ⑤ 失效 / 待重验入口说明状态（不静默消失，也不把"该复核了"说成"失效"）──
@@ -1707,6 +2430,12 @@ async function main(): Promise<void> {
   // ── ⑥ 裁定 F3 真链路：MCP 提交 → 持久化 → 验收页面显示 → 打开入口（夹具 C）──
   // 放在 4-x 之后：夹具 C 完全独立，但"重启后端"这一步只在这里做，避免影响上面各段的时间基准。
   await mcpResultEntryChecks({ freshIso, staleIso });
+
+  // ── ⑧ 版本轴以真实现读源清单为当前版本：真造文件 + 经唯一宿主现读登记 + 产品读口（夹具 C）──
+  await versionAxisFromManifestChecks();
+
+  // ── ⑨ 版本轴经**真 HTTP 验收读口**：逐来源现读源清单（修复前 HTTP 下恒 unknown，是产品缺口）──
+  await httpVersionAxisChecks();
 
   info(`── 小结：PASS ${passCount} / FAIL ${failCount}`);
 }

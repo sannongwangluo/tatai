@@ -20,6 +20,7 @@ import {
 } from "../../arch/blueprint";
 import { semanticStateOf } from "../../arch/blueprintAuto";
 import { renderGraph } from "../../arch/render";
+import { readModules } from "../../arch/parse";
 import { RENDER_FULL_LIMITS } from "../../arch/config";
 import { graphUpdateOf } from "./graphRefresh";
 
@@ -71,7 +72,28 @@ export function computeArchBlueprintRead(projectId: string): Record<string, unkn
   };
 }
 
-/** GET /api/projects/:id/arch/render 的只读图合成（`full` 用同一 builder 的另一组参数）。 */
-export function computeArchRenderRead(projectId: string, full: boolean): Record<string, unknown> {
+/**
+ * GET /api/projects/:id/arch/render 的只读图合成（`full` 用同一 builder 的另一组参数）。
+ *
+ * `planning=true`（UI 技术详情两图自 2026-10-08 五图补齐起的默认口径）：与 MCP 同名图
+ * （`module_map`／`mind_map`）读**同一份**静态＋已发布规划层——同一个 builder `viewGraphWithPlan`
+ * （旧静态口 `renderGraph` 不含规划层；不带 `planning` 的旧调用逐字不变）。
+ *   · `full` 保留 UI 的 `RENDER_FULL_LIMITS` 安全上限；MCP 以分页取齐同源未聚合集，UI 超额内容仍走隐藏对象入口；
+ *   · 规划层节点由 `mergePlanningLayer` **追加**在静态层之后，不受 15 个代码节点的概览上限约束；
+ *   · 既没有已发布规划图、也没有解析产物时返回 `{exists:false}` 真实空态（不拿顶住的空图冒充有图）。
+ * 纯只读、零写盘、零模型；不产生「静态 → 蓝图 → 渲染」递归（本函数只读两份、合并一份）。
+ */
+export function computeArchRenderRead(
+  projectId: string,
+  full: boolean,
+  planning = false,
+): Record<string, unknown> {
+  if (planning) {
+    const view = viewGraphWithPlan(projectId, full ? { limits: RENDER_FULL_LIMITS } : {});
+    // 静态侧是否存在：与 `viewGraphWithPlan` 内部 `buildSharedGraph` 同一判据（`readModules` 的 exists）。
+    const { exists: staticExists } = readModules(projectId);
+    const exists = staticExists || view.blueprint !== null;
+    return { ok: true, render: exists ? { exists: true, graph: view.graph } : { exists: false } };
+  }
   return { ok: true, render: renderGraph(projectId, full ? { limits: RENDER_FULL_LIMITS } : undefined) };
 }

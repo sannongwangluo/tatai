@@ -29,8 +29,9 @@ check 为闭合的 discriminated union，每类型只接受明确字段。保持
 3. `task_definitions`：来自当前审定 plan 的实际解析定义，与账本导入定义按稳定 task_id/definition_sha256、依赖、角色等 canonical 定义完整逐项比；缺项、多项、字段不同都列出。实际分母由指定 source_plan 原文及其登记哈希给出，不仅比数量。
 4. `task_states`：登记 task_id → execution_status 的准确期望集合，使用真实 v2 事件折叠，不能读 v1 compat 当实时；明确这证明执行登记而非独立验收。task_id 在定义中不存在亦失败。必须给 scope_mode=current|at_registration：current核对本次当前状态、改变即失败；at_registration以该契约登记事件前一个seq为固定截点（截点由服务确定，不能调用方任填），核对登记时已经存在的历史状态。证据在截点前未登记的成果不能拿截点后的状态补成通过。本次示例项目阶段历史回填采用at_registration，后续合法认领/reopen不会让旧同步批次永久阻塞；读口清楚给at_seq，不把此项说成实时进度。其他来源/文件/图基线等仍按实时规则，业务基线变化要求显式supersede，不静默解除约束。
 5. `graph_full`：六图的只读 canonical builder，全量同快照取齐，collection complete、无 anomalies、期望有效 baseline_id（登记值）；不把静态关系说成业务验证，不把 614 等对象数写死成通用规则。未发布、旧基线、失败/陈旧/更新中、超限未取齐不能通过。
-6. `required_reads`：期望项目内路径集合，核对 stage-reads.json 的 actual validated entries（不调用 project_entry 造成扫描循环）；各条目及来源哈希有效，缺条目点名。表示接续必读已配置，不意味着 Agent 已经阅读。
-7. `audit_check`（如需要独立审核）：引用已有任务/检查 ID 与版本，通过现有有效证据判据；缺失/旧版/未通过记 needs_review。不能由扫描器代写作者自检、独立审计或人工验收。本轮若没有真实用例可不开放该类型，但不得把技术对账说成语义审核。
+6. `required_reads`：期望项目内路径集合，核对 stage-reads.json 的 actual validated entries（不调用 project_entry 造成扫描循环）；各条目及来源哈希有效，缺条目点名。**v2 章节绑定兼容（V09-42）**：stage-reads 条目的去重键是 `path+section`，同一 `path` 可以有多个章节条目，所以每条期望可带可选 `section`，按 **(path, section)** 配对（只用 `path` 会让同 path 的多章节互相覆盖，出现假通过/假缺项，**不许**）；未点名 `section` 只匹配整文件条目，遇到"该 `path` 只有章节绑定条目"明确要求显式点名、**不按整文件哈希猜**；可选 `sha256` 核对条目 revision（条目是章节绑定则比章节子树哈希，拿整文件哈希核章节条目明确不符、不静默当匹配）。表示接续必读已配置，不意味着 Agent 已经阅读。
+7. `markdown_section`（V09-42）：`path` + `section`（完整标题路径）+ `sha256`。按完整标题路径**唯一定位** Markdown 章节，核对「标题行 + 全部后代」子树的 sha256（口径唯一实现在 `src/shared/materialSection.ts`）。章节外改动不影响、章节内改动即 failed；章节缺失、同级同名重复、**每级路径不唯一**（重复父标题下子标题只出现一次也拒）→ failed，非文本/非法选择器 → invalid。**不放松 artifact 整文件契约**：证据包里的 `artifact` 仍是整文件 sha，本 check 只锚定章节子树，不代表 artifact 漂移被豁免。
+8. `audit_check`（如需要独立审核）：引用已有任务/检查 ID 与版本，通过现有有效证据判据；缺失/旧版/未通过记 needs_review。不能由扫描器代写作者自检、独立审计或人工验收。本轮若没有真实用例可不开放该类型，但不得把技术对账说成语义审核。
 
 输出统一逐项 verdict：passed/failed/missing/needs_review/stale/invalid，带期望、实际、来源、证据引用、原因；必需项全部 passed 且完整读取才 overall=passed。无登记契约显示 not_configured，不说 synced；契约存在但证据缺失显示 missing，不默认为通过。额外 evidence 文件也显式报告未登记批次，不私自采纳。
 
@@ -162,3 +163,21 @@ active blocks_entry 契约未当前通过时：project_entry 添加 sync_summary
   L（构建期间真外部输入改变 → 明确过期）、M（停机等在途+排队、返回后不重启）三段；同文件 G 段改为完成代际有界断言；
   `scripts/verify-sync-request-reuse.ts` 增 C-3/E-5（真文件/真事件在 build 期间改变 → 明确过期）；`verify-sync-discovery` S3
   改为「等价规范 dataDir 共用同一单飞队列」。
+
+### 修复计划与候选证据边界（2026-10-06，P3／V09-48；契约细则见 docs/agent-optimization-20261006.md §7）
+
+- **只读修复计划**：现行（active）批次的 `read_sync_status`／`project_entry`／`task_brief` 在原有逐项之外给一份**修复计划**——
+  逐项 `item_id`、原因、责任角色（`registered_by` 来自登记事件；`recommended_role` 按失败类型建议，**不替人授权、不构成指派**）、
+  当前代次、来源漂移（**只列漂移，不自动重算哈希/补证/改契约/缩小必需项**）、可复用工件与**下一读取入口**；一次列全，
+  共因可分组显示但**不省略完整项**。
+- **候选证据边界**：由纯派生件（如需重算的图/清单）得出的候选**只在响应里返回 JSON**——**零落盘**、不落收件目录、
+  不被自动发现、**不自动采纳**；候选是**明确未验证的草稿**（不是证据、不是通过、不是独立审查），**不得**修改
+  `required`／`blocks_entry`。本批**不新增保存入口**；若将来实现保存，须满足唯一宿主、既有判据、非自动发现位置＋断言，
+  且候选进入正式链路时**实际读取并核对**其依据的契约哈希与目标当前字节，源再变 ⇒ 候选被拒。
+- **不放松 v1 门禁**：未知/损坏/失联/收件目录未取齐仍阻断；`graph_full` 等必需项未满足仍阻断（`waiting_for_derivation`
+  **只是说明**，不放行、**不编造 ETA**；重试有界且同代请求合并）。`at_registration` 截点与整文件绑定不为省事改档。
+- **简报的紧凑形态**（集成修正，契约 §7.1.1）：`task_brief` 默认 `detail=summary` 把 `repair_plan` 转**紧凑导航**
+  （`nav:true`；现行批次数／逐 `verdict` 项数／阻断批次数／等待派生计数／`read_only`／有界每批摘要／明确 `omitted.fields`／
+  结构化 `refetch`）；`read_sync_status` 与 `project_entry`／`task_brief detail=full` **完整保留**逐项（一字不删）；
+  summary **不重算**同步，只压缩同一次评估已有的投影。
+- **验证**：`scripts/verify-sync-repair.ts`（定向反例与同快照字节对照）。

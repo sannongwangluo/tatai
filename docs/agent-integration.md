@@ -245,6 +245,8 @@ HTTP 读口：`GET /api/projects/:id/arch/dataflow`（只读，与 `get_arch` �
 
 ## 4.3 六图完整状态的读取（2026-09-26 V09-19；DESIGN.md §6.4／§6.7、附录 E.18 四）
 
+常规接续优先 `task_brief`，旧连接未提供时使用 `project_entry`。简报默认 detail=summary，复用完整判据，保留所有理由的阻断标记及短摘要、当前任务完整约束、所有权、版本和必读材料；摘要省略部分不能当作已读。按返回指引用 detail=reason 与 reason_index/reasons_revision 补取，版本改变需重取摘要；detail=full 保留旧完整简报。状态未变且没有新动作时不重复拉取。阶段材料按 `required_reads.path` 与实时 `range` 读原文，其 `section` 是哈希绑定定位，不是 `read_design`/`read_plan` 的同名参数。条目另带 `purpose` 分类（`required_content` 先读正文／`trace_reference` 按需回读／`resume_context` 续接现场）；设计引用派生条目另带 `resolution`／`source_ref`，`resolution=unresolved` 表示该条依据**现在定位不到**（**不是已读、不是已通过**），按 `source_ref` 用 `read_design(index=true)` 或按 `range` 补取核实，**不得用近似标题顶替**。同步阻断存在时，简报的 `sync.repair_plan` 在默认 `detail=summary` 下是**紧凑导航**（`nav:true`；现行批次数、逐 `verdict` 项数、阻断批次数、等待派生计数、有界每批摘要与结构化 `refetch`），`detail=full` 与 `read_sync_status` 仍给**完整逐项**修复计划（不删 `expected`/`actual`/原因/候选）。涉及架构判断时，仍按下述方式取齐完整图。
+
 **Agent 不该为了拼出六图先去读仓库代码。** 接续入口 `project_entry` 现在带一份**六图摘要**，
 完整状态由 `get_project_graphs` 一次给全：
 
@@ -318,6 +320,8 @@ HTTP 读口：`GET /api/projects/:id/arch/dataflow`（只读，与 `get_arch` �
 源清单按两步登记：先 `store`（`kind=source_manifest`、`source_manifest:[{path:"src/x.ts"}]`，载体绑定声明 `revision_kind=code`），取回 `evidence.source_manifest.fingerprint` 和 `evidence.sha256`；再登记自检/独审，用该指纹填 `binding.revision`、用该证据地址填检查项 `evidence_sha256`。载体登记时的版本标识只是自报，检查采用服务端现读得出的清单指纹。历史无清单记录保留，但不能据此宣称当前源码已验证。
 
 - `manage_baseline`：正向成套图纸入口。`op=read` 只读两份源与生效基线（零副作用）；`op=preserve` 存不可变历史；`op=activate` 用**已有**图纸做技术审定激活（固定 `delegated_technical_review`，须带两份源 `expected.{design,plan}_content_sha256` 与 `approved_by`/`approval_basis`；零差异、不调模型、不写用户 Gate）。示例：`manage_baseline {op:"activate", role:"designer", approved_by:"gpt-6", approval_basis:"技术审定", expected:{design_content_sha256:"…", plan_content_sha256:"…"}}`。
+
+- `preflight_task_result`（V09-47／P2，只读预检）：`submit_task_result` **同形输入**（面向前述已取得合法认领的执行者）；提交前**一次列清**可预判缺项与**锁内未查项**（`not_checked` 与 `not_applicable` 分开、不混用）。**只读**：不写事件/证据/租约、不自愈、不产生认领；**不是门禁、不是通行票**——预检到提交之间版本/认领/租约可能变化，提交时在唯一写入服务临界区内按当前事实**重核**（`recheck_on_commit=true`）。响应带 `supported_contract:"preflight/v1"`；命中已提交的同一幂等键 ⇒ 短路、只返回 `already_submitted`＋原回执（**不冒称当前校验通过**）。宿主不支持该只读路由（旧宿主）⇒ `UNSUPPORTED_BY_HOST`，**绝不回退**到 `submit_task_result`，也不在 MCP 进程本地另算一套判据。宿主侧路由 `POST /api/work/preflight`（`claim_token` 业务秘密走 body，与传输令牌 `x-tatai-work-token` 头是两回事；只读远程模式下由远程红线先拒）。
 
 四件事分开记：**阶段自报**（`report_task_status` 的 v2 `doing`/`blocked`/协调器 `ready`；`done` 不在这里写，走 `submit_task_result`）／**提交**（`submit_task_result`，带证据/认领/版本五查；相同请求重试拿回原回执 `duplicate=true`）／**执行回执**（`report_execution`）／**证据与审计**（`record_work_evidence`）。四类写一律经唯一写入服务转接，MCP 进程不自己追加事件（§2.6）。完整旅程（真 stdio MCP + 真 `index.ts`）见 `scripts/verify-forward-journey.ts`（`pnpm verify:forward-journey`）。
 

@@ -46,6 +46,7 @@ import { projectEntryTool } from "../src/mcp/tools/projectEntry";
 import { TOOLS } from "../src/mcp/tools/index";
 // 安装包文件名带产品版本号；唯一来源见 src/shared/version.ts（读仓库根 package.json）
 import { APP_VERSION } from "../src/shared/version";
+import { verifySmallGraphPagination } from "./lib/verify-small-graph-pagination";
 
 let pass = 0;
 let fail = 0;
@@ -375,10 +376,34 @@ const snap = sixGraphsOf("tatai");
     `⑤ 逐对象带稳定 ID/状态键/短标/颜色口径/证据状态/有效版本/阻断/用户待验（样本 ${cap?.id}：${cap?.object.status_key}／${cap?.object.status_short}／${cap?.object.status_color?.hex}／${cap?.object.evidence_state}／${cap?.object.effective_version}）`,
   );
   const arch = snap.graphs.architecture!;
+  // 2026-10-08 §6.1 精确已审维护：旧期望 14（12 个设计能力组 + github/public 两个未归属组）。
+  // V09-61 已补登 public/ 与 .github/ 的真实来源责任；当前受检基线使两模块归入 plan:cap:01，
+  // 模块仍在、组内可达，不再另画两个“未归属”组。旧/新逐组证据与 SHA 留在
+  // .工作台/project-completion-20261008/v0919-group-pin-review.json（旧 live-after 与当前蓝图对照）。
+  // 新期望精确为以下 12 个稳定组 ID，并核两模块仍可达；保留同组关系 ≥132 的原判据。
+  const expectedArchitectureGroups = Array.from({ length: 12 }, (_, i) => `plan:cap:${String(i + 1).padStart(2, "0")}`);
+  const architectureGroupsMatch = (value: typeof arch): boolean =>
+    value.counts.groups === 12 &&
+    JSON.stringify(value.groups.map((g) => g.key).sort()) === JSON.stringify(expectedArchitectureGroups) &&
+    ["plan:code:github", "plan:code:public"].every((id) =>
+      value.groups.some((g) => g.key === "plan:cap:01" && g.members.includes(id)),
+    ) &&
+    value.counts.intra_relations >= 132;
   ok(
-    // 2026-09-28 开源 CI 轮给仓库加 .github（ecb6006），蓝图重生成后多一个未归属模块组 github ⇒ 组数钉值 12→13
-    arch.counts.groups === 13 && arch.counts.intra_relations >= 132,
-    `⑤ 分组与同组关系逐条可见（系统架构 ${arch.counts.groups} 组／${arch.counts.intra_relations} 条同组关系；≥ V09-18 当时的 132）`,
+    architectureGroupsMatch(arch),
+    `⑤ 分组与同组关系逐条可见（精确 12 个设计组、github/public 归属可达；实测 ${arch.counts.groups} 组／${arch.counts.intra_relations} 条同组关系；≥ V09-18 当时的 132）`,
+  );
+  ok(
+    !architectureGroupsMatch({ ...arch, groups: arch.groups.slice(1) }),
+    "⑤ 反例：删一个设计组，即使 counts 仍报 12 也必须失败",
+  );
+  ok(
+    !architectureGroupsMatch({ ...arch, groups: arch.groups.map((g) => ({ ...g, members: g.members.filter((id) => id !== "plan:code:github") })) }),
+    "⑤ 反例：组数正确但 github 模块从组内丢失仍必须失败",
+  );
+  ok(
+    !architectureGroupsMatch({ ...arch, counts: { ...arch.counts, intra_relations: 131 } }),
+    "⑤ 反例：同组关系低于原 132 下限仍必须失败",
   );
   const df = snap.graphs.data_flow!;
   const tech = df.tech as { current_implementation?: { is_business_data_flow?: boolean }; target_semantics?: unknown; chains?: unknown[]; coverage?: unknown; deliverable_blocked?: boolean } | undefined;
@@ -437,6 +462,7 @@ section("⑥ 四档读取（全部六图／单图／节点／关系）");
 
 // ═════════════════════════ ⑦ 反例簇（分页／缺图／表损坏／旧读口兼容） ═════════════════════════
 section("⑦ 反例簇：大图分页、缺图、旧 get_arch 兼容");
+verifySmallGraphPagination(ok);
 {
   const paged = sixGraphsOf("tatai", { limit: 50 });
   const pagedCursors = Object.entries(paged.completeness.cursors);
@@ -469,7 +495,8 @@ section("⑦ 反例簇：大图分页、缺图、旧 get_arch 兼容");
     let cur: string | null = first.completeness.cursors[key] ?? null;
     let last = first;
     let rounds = 0;
-    while (cur !== null && rounds < 600) {
+    const maxContinuations = Math.ceil(fullSeq[key]!.length / limit);
+    while (cur !== null && rounds < maxContinuations) {
       const page = sixGraphsOf("tatai", { graph: key, limit, cursor: cur });
       last = page;
       pages.push(seqOf(page.graphs[key]!));
@@ -507,12 +534,11 @@ section("⑦ 反例簇：大图分页、缺图、旧 get_arch 兼容");
   for (const key of SIX_GRAPH_KEYS) {
     const g = sixGraphsOf("tatai", { graph: key }).graphs[key]!;
     const bounds = [
-      1,
       g.nodes.length,
       g.nodes.length + 1,
       g.nodes.length + g.edges.length,
       g.nodes.length + g.edges.length + 1,
-    ].filter((x) => x >= 1 && x <= 60); // 限 ≤60：大页只验证语义，不让脚本跑成分钟级
+    ].filter((x) => x >= 1); // 保留真实跨段边界；limit=1 穷举移到隔离小夹具。
     const detail: string[] = [];
     let allOk = true;
     for (const limit of [...new Set(bounds)]) {
@@ -522,6 +548,17 @@ section("⑦ 反例簇：大图分页、缺图、旧 get_arch 兼容");
       allOk = allOk && v.good;
     }
     if (detail.length > 0) ok(allOk, `⑦ 跨段边界续取不跳段（${key}：${detail.join(" ")}）`);
+    for (const boundary of new Set([g.nodes.length, g.nodes.length + g.edges.length])) {
+      const start = Math.max(0, boundary - 1);
+      const actual: string[] = [];
+      let cursor: string | null = `${snap.snapshot_id}:overview:${key}:${start}`;
+      for (let n = 0; n < 3 && cursor !== null; n++) {
+        const page = sixGraphsOf("tatai", { graph: key, limit: 1, cursor });
+        actual.push(...seqOf(page.graphs[key]!));
+        cursor = page.completeness.cursors[key] ?? null;
+      }
+      ok(JSON.stringify(actual) === JSON.stringify(fullSeq[key]!.slice(start, start + 3)), `⑦ 真实 limit=1 段边界 ${key}@${boundary} 三页逐对象精确对账`);
+    }
   }
   let staleRejected = false;
   try {
@@ -550,7 +587,8 @@ section("⑦ 反例簇：大图分页、缺图、旧 get_arch 兼容");
     let cur: string | null = first.parsed.completeness.cursors?.functional ?? null;
     let rounds = 0;
     let last = first.parsed;
-    while (cur !== null && rounds < 200) {
+    const maxContinuations = Math.ceil(fullSeq.functional!.length / 5);
+    while (cur !== null && rounds < maxContinuations) {
       const p = callTool({ project_id: "tatai", graph: "functional", cursor: cur, limit: 5 });
       last = p.parsed;
       pages.push(...seqOf(p.parsed.graphs.functional));
@@ -622,7 +660,9 @@ section("⑦ 反例簇：大图分页、缺图、旧 get_arch 兼容");
 // ═════════════════════════ ⑧ project_entry 六图摘要同源 ═════════════════════════
 section("⑧ project_entry 的 graph_summary 与整图同源");
 {
-  const out = projectEntryTool.handler({ project_id: "tatai", role: "executor", client_capabilities: "continuable" }) as { content: { text: string }[] };
+  // 03f676c（2026-10-02）起 handler 为 async（续接/增量读取并入 worker）；此前同步直返。
+  // 本行曾长期不 await 而碰巧成立（handler 当时是同步的），async 化后必须 await，否则 out.content undefined。
+  const out = (await projectEntryTool.handler({ project_id: "tatai", role: "executor", client_capabilities: "continuable" })) as { content: { text: string }[] };
   const entry = JSON.parse(out.content[0].text) as Record<string, unknown>;
   const gs = entry.graph_summary as {
     snapshot_id: string;
@@ -648,10 +688,21 @@ section("⑧ project_entry 的 graph_summary 与整图同源");
 }
 
 // ═════════════════════════ ⑨ 工具面与文档同源 ═════════════════════════
-section("⑨ 工具面 19 个与文档同源");
+section("⑨ 工具面与文档同源");
 {
   const names = TOOLS.map((t) => t.name);
-  ok(names.length === 19 && names.includes("get_project_graphs") && names.includes("get_arch"), `⑨ 注册表 ${names.length} 个工具且含 get_project_graphs（新）与 get_arch（旧，保留）`);
+  // 2026-10-06 定向更新（五要素留档）：
+  //   旧期望＝19｜依据＝本卡批次之后工具面持续扩张——V09-16/V07-02（需求与变更与重绑、受检导入）、
+  //   V07-04（doctor）、V09-23（同步契约三件）、V09-27（执行回执与证据）、V09-28（基线入口）、
+  //   V09-35（expand_module）、V09-39（project_index）、V09-41（task_brief）等各批新增后，注册表现有 29 个；
+  //   README 同源 29（本段下一条）、29 个工具在真 stdio tools/list 逐个点名在场
+  //   （见 verify:forward-journey 0-3/0-4）——不是静默丢工具，是钉值没跟着更新｜
+  //   新期望＝29｜保留意图＝注册表必须仍在且点名 get_project_graphs（新）与 get_arch（旧，保留）
+  //   两条关键读口，工具静默丢失要立刻红｜判据不放宽：仍是精确钉值并与 README 同源对账，
+  //   未放宽成「存在即可」或「≥N」。
+  // 2026-10-08 定向维护：29→31；V09-47 preflight_task_result 与 V09-52 feature_ledger
+  // 已正式登记且README为31；保持精确数并点名两项增量，不放宽成下限。
+  ok(names.length === 31 && ["get_project_graphs","get_arch","preflight_task_result","feature_ledger"].every(name=>names.includes(name)), `⑨ 注册表 ${names.length} 个工具且含六图、新旧架构读口与两项正式增量`);
   const readme = read(path.join(REPO, "README.md"));
   const m = /- (\d+) 个 stdio MCP 工具/.exec(readme);
   ok(m !== null && Number(m[1]) === names.length, `⑨ README 工具计数与注册表同源（README=${m?.[1]}／注册表=${names.length}）`);

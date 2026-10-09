@@ -31,7 +31,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { getProject, resolveDataDir } from "../registry";
 import { projectWorkDir } from "../workstation";
-import { readAuditRecords, type AcceptanceRecord } from "./audit";
+import { auditEntityId, readAuditRecords, type AcceptanceRecord } from "./audit";
 import { leaseStateOf, liveClaimRecord, claimRecordsOf, readClaimEvents, RESUME_PRECONDITIONS, type ClaimRecord, type TaskClaim } from "./claims";
 import {
   buildContextPackage,
@@ -48,6 +48,8 @@ import { livenessOf, readExecutions, type ExecutionRecord, type RunSiteState } f
 import { importTaskDefinitions, taskDefinitionHash, type TaskDefinition } from "./plan";
 import {
   acceptanceDimensionOf,
+  checkEffectiveness,
+  checksFromAudit,
   checksFromFacts,
   collectProjectFacts,
   eventsSnapshotOf,
@@ -60,12 +62,32 @@ import {
   type StatusProjectionSet,
 } from "./statusProjection";
 import { alignDefinitionsAndStates, readTaskStates, TASK_STATUS_LABELS, type TaskState } from "./tasks";
+// V09-53（B3）：唯一义务/状态派生入口（§2.6）——入口的投影与逐项工作包出自**同一份** factsSnapshot.obligations。
+import {
+  definitionBindingKey,
+  deriveObligations,
+  requiredChecksOf,
+  type DefinitionBindingVerdict,
+  type ObligationSet,
+} from "./obligations";
+import {
+  buildWorkPackage,
+  type CapabilityClass,
+  type SourceMode,
+  type WorkPackageFailure,
+  type WorkPackageFactsSnapshot,
+  type WorkPackageFull,
+  type WorkPackageOwnership,
+} from "./workPackage";
 import { loadStageReads, STAGE_READS_REL, type StageReadKind, type StageReadsLoad } from "./stageReads";
-import { computeSyncBlock, SYNC_INBOX_REL, type SyncBlockInfo } from "./sync";
+import { evaluateEntrySync, SYNC_INBOX_REL, type SyncBlockInfo } from "./sync";
 import { preconditionsOf, type EntryPreconditions } from "./preconditions";
-import type { SyncVerdict } from "../../shared/syncEvidence";
+import type { SyncRepairPlan, SyncVerdict } from "../../shared/syncEvidence";
+import { parseMarkdownSections, type MarkdownSectionNode } from "../../shared/materialSection";
+import { resolveDesignRefStrict, isDesignRefToken, STRICT_REF_REASON_TEXT } from "../../shared/designRefStrict";
 import { WorkError } from "./types";
 import { compareIsoTime, latestByTime } from "../time";
+import { withDerivationScope } from "./derivationScope";
 
 // ── §6.7 契约常量（输入、只读返回、next_action 枚举；验证脚本按这些常量对账） ──
 
@@ -149,6 +171,23 @@ export interface ProjectEntryOptions {
    * 不新增门禁、不改 next_action/reasons）。这是轻量选项：默认省略该字段，需要时显式索取。
    */
   preconditions?: boolean;
+  /**
+   * V09-53（B3／DESIGN §2.7）：请求附一份**逐 check 工作包**（`work_package`）。默认 **false**＝不附，
+   * 保持 §6.7 只读返回**恰好九个字段**的既有默认契约；true = 从**本次已算的同一份** `facts.obligations`
+   * 派生（`buildWorkPackage`）。只读派生，不改 next_action/reasons/门禁。这是轻量选项：默认省略，需要时显式索取。
+   */
+  work_package?: boolean;
+  /**
+   * V09-53：工作包分页（**只在 `work_package=true` 时有意义**）。游标绑定 `package_revision`，跨版本 ⇒
+   * 工作包显式 `REVISION_CHANGED`（不静默返回跨版本数据）。产品路径不传（取整包）；测试/读口按需用。
+   */
+  work_package_paging?: { limit?: number; cursor?: string; offset?: number };
+  /**
+   * V09-53：调用方持有的 `package_revision`（可选）。与 `work_package_paging` 正交——
+   * 不符即让工作包显式 `REVISION_CHANGED`（与功能清单读口的 `expected_revision` 同口径，§2.9/§6.11）。
+   * 它与 MCP 工具入口的 `expected_revision` 参数**真实相连**（不是只有纯函数支持、工具层没接）。
+   */
+  work_package_expected_revision?: string;
   /**
    * V09-31：**本次请求已经现读的事件快照**（`.工作台/work/` 同一 workDir、同一截点）。宿主只读入口一次
    * 取快照后，把它同时喂给入口、六图摘要与同步判据——三者出自**同一版事实**，不再各读一遍盘。
@@ -362,12 +401,39 @@ export interface EntryReason {
 
 export interface RequiredRead {
   path: string;
+  /** 显式章节绑定时 revision 是该章节哈希，不能当作整文件版本。 */
+  section?: string;
   /** 取值 = `stageReads.STAGE_READ_KINDS` 的既有联合（项目级指针不发明新 kind） */
   kind: StageReadKind;
   why: string;
   revision?: string | null;
+  /**
+   * 阶段材料显式章节绑定时**派生**的起止行（1 基闭区间，标题行 → 子树末行；非设计图那段 `section` 参数）：
+   * 执行方按 `path`+`range` 原样读回标题与整棵子树，随当前解析现算、不保存行号。
+   */
   range?: { start: number; end: number } | null;
+  /**
+   * 用途分类（P1／§5.4）：本轮必读正文 `required_content`／追溯指针 `trace_reference`／中断续接现场 `resume_context`。
+   * **恒给**（订阅方不必区分"没有"与"未分类"）；只影响读者怎么用（先读必读正文、追溯指针按需回读），
+   * **不改判定、不新增授权、不改门禁**——每条仍在必读清单里并带 `why`。
+   */
+  purpose: RequiredReadPurpose;
+  /**
+   * 该条是否已解析到**当前版本**的确定位置。**仅设计引用派生条目给出**：
+   * `resolved` = 已落成 `section`+`range`+`revision`；`unresolved` = 本任务声明的设计依据现在定位不到
+   * （不是已读、不是已通过、不是"可跳过"——读者须按 `source_ref` 补取核实，§5.5）。
+   */
+  resolution?: RequiredReadResolution;
+  /** `unresolved` 时的原因（章节缺失／每级路径不唯一／引用归一到不存在的章节／形态无法证明完整展开）。 */
+  resolution_detail?: string;
+  /** 原始引用 token（来自 `TaskDefinition.design_refs`），供人核对与补取。 */
+  source_ref?: string;
 }
+
+/** 用途分类（§5.4 的闭集；只影响读者怎么用） */
+export type RequiredReadPurpose = "required_content" | "trace_reference" | "resume_context";
+/** 设计引用派生条目的解析态（§5.1；只在这类条目上给出） */
+export type RequiredReadResolution = "resolved" | "unresolved";
 
 export interface CurrentRun {
   task_id: string;
@@ -479,14 +545,27 @@ export interface ProjectEntry {
    * 不新增门禁、不改 `next_action`/`reasons`（见 `preconditions.ts`）。
    */
   preconditions?: EntryPreconditions;
+  /**
+   * V09-53（B3／§2.7）：逐 check 工作包。**只在 `opts.work_package===true` 时给出**（默认**省略**，
+   * 保持 §6.7 九字段默认契约）。只读派生，与功能清单/六图出自**同一份** `facts.obligations`；
+   * 不改 `next_action`/`reasons`/门禁。旧字段逐字保留，本字段是**兼容扩展**。
+   * `WorkPackageFailure` = 分页游标/入参显式失效（**不静默返回跨版本数据**，带重读入口）。
+   */
+  work_package?: WorkPackageFull | WorkPackageFailure;
 }
 
-/** 同步证据的响应层摘要（判据来源＝sync.computeSyncBlock，与 claimTask / 写口**同一份**） */
+/** 同步证据的响应层摘要（判据来源＝sync 的同一份阻断评估，与 claimTask / 写口**同一份**） */
 export interface EntrySyncSummary {
   configured: boolean;
   overall: SyncVerdict;
   blocked: boolean;
   blocking_batches: { batch_id: string; title: string; verdict: SyncVerdict; reasons: string[] }[];
+  /**
+   * P3 / V09-48：**只读修复计划**（现行批次逐项原因/来源漂移/可复用工件/契约代次/登记人/建议角色/
+   * 结构化下一读取入口与补证动作）。与 `blocked`/`blocking_batches` **同一次**同步评估（不另调
+   * `readSyncStatus`，全量评估不翻倍）。只读附加——不改任何门禁。
+   */
+  repair_plan?: SyncRepairPlan;
 }
 
 // ── 现场事实（只读；读不出来如实标 unreadable，不假装空状态） ──
@@ -502,6 +581,14 @@ export interface EntryFacts {
   statesByName: Record<string, { missing_fields: string[] }>;
   align: ReturnType<typeof alignDefinitionsAndStates>;
   projection: StatusProjectionSet;
+  /**
+   * V09-53（§2.6）：唯一义务/状态派生的结论集（`deriveObligations` 的产物）。入口的 `projection` 就是它的
+   * `projection`——**同一次派生**既供入口判定、又供逐项工作包（`buildWorkPackage`）与功能清单，不各算一份。
+   * 事实读不出来时为 null（对应 `unreadable`，判定层 fail-closed）。
+   */
+  obligations: ObligationSet | null;
+  /** 同一份 `ProjectFacts`（`collectProjectFacts` 的产物；`obligations` 由它派生）。读不出来为 null。 */
+  projectFacts: ProjectFacts | null;
   byId: Record<string, StatusProjection>;
   acceptances: AcceptanceRecord[];
   audit: ReturnType<typeof readAuditRecords>;
@@ -528,6 +615,8 @@ export interface EntryFacts {
   stageReads: StageReadsLoad;
   /** 同步证据阻断（V09-23／DESIGN §2.10；未配置项目为 null，保持兼容） */
   syncBlock: SyncBlockInfo | null;
+  /** P3/V09-48：只读修复计划（与 `syncBlock` **同一次**评估；未配置为空计划，读不出为 null） */
+  syncRepairPlan: SyncRepairPlan | null;
   /**
    * 同步阻断**读不出来**的原因（V09-31 复审）：非 null = 同步现场未知——不能与「未配置」混为一谈
    * （`syncBlock` 为 null 且本字段为 null 才是"没配置/老项目"；读失败是另一种事实）。
@@ -540,6 +629,13 @@ export interface EntryFacts {
   eventsShared: boolean;
   /** 快照读不出来的原因（`eventsShared=false` 时给；成功时 null） */
   eventsSnapshotUnreadable: string | null;
+  /**
+   * 事件实体 id / 事件 id → **服务端账本 seq**（来自本次同一份现读快照；拿不到 = null）。
+   * 用途：需要"按账本序"而不是"按可自报的 `occurred_at`"判定的只读派生（两轮同因诊断等）——
+   * `at` 只到秒，同一秒的多条记录会让`at` 比较失去确定性（B3-REVIEW-WATCH 12:04）。
+   * 快照读不出来时恒返回 null（调用方退回"读不到就不据此下结论"，**不**用自报时间顶替）。
+   */
+  eventSeqOf: (ref: string) => number | null;
   design: ReturnType<typeof loadDocument>;
   plan: ReturnType<typeof loadDocument>;
   context: ContextPackage | null;
@@ -569,6 +665,18 @@ export function projectWithReleases(facts: {
    * 给了就直接用，**不再调 `collectProjectFacts`**——消除 `gatherFacts` 里「直接算一次 + 本函数内再算一次」
    * 的重复派生；缺省行为不变（自己现算，老调用点逐字照旧）。
    */
+  projectFacts?: ProjectFacts;
+  byId?: never;
+}): StatusProjectionSet {
+  // 同 `sixGraphsOf`：整段跑在一次派生的只读复用作用域里（作用域随本次调用结束即丢，跨请求不缓存）。
+  return withDerivationScope(() => projectWithReleasesInScope(facts));
+}
+
+function projectWithReleasesInScope(facts: {
+  projectId: string;
+  dataDir: string;
+  definitions: TaskDefinition[];
+  events?: EventsSnapshot;
   projectFacts?: ProjectFacts;
   byId?: never;
 }): StatusProjectionSet {
@@ -644,10 +752,26 @@ export function baselineRevalidateOf(
     return { messages, source_changed: false, valid: false };
   }
   const nowPlan = current.plan_definition_revision ?? current.plan_revision;
-  const sourceChanged =
+  // V09-53（实测缺陷修复）：源**读不到**（文件被删/读不动 ⇒ 修订为 null）**不等价于「没变」**。
+  // 旧判据只在「修订非 null 且不等」时置 sourceChanged——设计书/施工图被删时修订为 null，旧判据算成
+  // `source_changed=false`，于是入口继续放行（实测：删 DESIGN 后 current revision=null 仍 claim）。
+  // 当前图纸版本无法确认，等价于源已变：一律 fail-closed，不派发新任务（§2.9/§5.6）。**无关源**变化不经此路径。
+  const designMissing = current.design_revision === null;
+  const planMissing = nowPlan === null;
+  const changed =
     (current.design_revision !== null && current.design_revision !== baseline.design_revision.content_sha256) ||
     (nowPlan !== null && nowPlan !== baseline.plan_revision.definition_sha256);
-  if (sourceChanged) {
+  const sourceChanged = designMissing || planMissing || changed;
+  if (designMissing || planMissing) {
+    const missing = [designMissing ? "设计书" : null, planMissing ? "施工图" : null]
+      .filter((x): x is string => x !== null)
+      .join("、");
+    messages.push(
+      `现行${missing}源**读不到**（缺失或不可读，修订为 null）：当前图纸版本无法确认，等价于源已变——影响待查，` +
+        "fail-closed 不派发新任务（DESIGN.md §2.9/§5.6；「读不到」不等于「没变」）",
+    );
+  }
+  if (changed) {
     messages.push(
       `设计/施工图源在基线激活后变过（基线 design=${baseline.design_revision.content_sha256.slice(0, 12)}… / ` +
         `plan 定义=${baseline.plan_revision.definition_sha256.slice(0, 12)}…；设计比内容哈希、施工图比定义哈希）：影响待查（§5.6）`,
@@ -709,6 +833,16 @@ function gatherFacts(
   }
   const eventsShared = eventsSnapshot !== null;
   const sharedEvents = eventsSnapshot === null ? undefined : eventsSnapshot.events;
+  // 账本序解析器（B3-REVIEW-WATCH 12:04）：同一次快照里 `entity_id`/`event_id` → `seq`，
+  // 供"按服务端序、不按自报 at"的只读判定（两轮同因诊断）用。快照读不出来 ⇒ 恒 null（不拿自报时间顶替）。
+  const entitySeqOf = new Map<string, number>();
+  if (sharedEvents !== undefined) {
+    for (const e of sharedEvents) {
+      if (typeof e.entity_id === "string" && e.entity_id !== "") entitySeqOf.set(e.entity_id, e.seq);
+      if (typeof e.event_id === "string" && e.event_id !== "") entitySeqOf.set(e.event_id, e.seq);
+    }
+  }
+  const eventSeqOf = (ref: string): number | null => entitySeqOf.get(ref) ?? null;
 
   let unreadable: string | null = null;
   let states: Record<string, TaskState> = {};
@@ -724,12 +858,16 @@ function gatherFacts(
   // blocked=false（老项目零影响）；读不出来**不抛**——入口如实按"读不出"处理（见 decideNextAction 第 1.6 步）。
   // V09-30：喂同一份快照，使同步判据与上面的任务/认领、下面的投影出自**同一版**事实（同版接续，V09-31 请求内部分）。
   let syncBlock: SyncBlockInfo | null = null;
+  let syncRepairPlan: SyncRepairPlan | null = null;
   let syncBlockUnreadable: string | null = null;
   try {
-    syncBlock = computeSyncBlock(projectId, dataDir, {
+    // P3/V09-48：**同一次**评估同时产出阻断判据与只读修复计划（不另调 readSyncStatus → 全量评估不翻倍）。
+    const evaluated = evaluateEntrySync(projectId, dataDir, {
       ...(syncDiscoveryIssues === undefined ? {} : { discoveryIssues: syncDiscoveryIssues }),
       ...(sharedEvents === undefined ? {} : { events: sharedEvents }),
     });
+    syncBlock = evaluated.block;
+    syncRepairPlan = evaluated.repair_plan;
   } catch (e) {
     syncBlockUnreadable = e instanceof Error ? e.message : String(e);
     unreadable ??= `同步证据现场读不出来（${syncBlockUnreadable}）`;
@@ -772,14 +910,34 @@ function gatherFacts(
   })();
 
   let projection: StatusProjectionSet = { objects: [], by_id: {}, summary: { counts: {} as never, unmapped: [], blocking_findings: [], basis: "" } };
+  let obligations: ObligationSet | null = null;
   try {
-    projection = projectWithReleases({
-      projectId,
-      dataDir,
-      definitions,
-      ...(eventsSnapshot === null ? {} : { events: eventsSnapshot }),
-      ...(project_facts === null ? {} : { projectFacts: project_facts }),
-    });
+    if (project_facts === null) {
+      // 事实读不出来：仍走既有回退路径（本函数内会再尝试并如实记 unreadable），判定层 fail-closed。
+      projection = projectWithReleases({
+        projectId,
+        dataDir,
+        definitions,
+        ...(eventsSnapshot === null ? {} : { events: eventsSnapshot }),
+      });
+    } else {
+      // V09-53（§2.6）：唯一义务/状态派生入口——入口的 `projection` **就是**它的 `projection`，
+      // 后续逐项工作包（`buildWorkPackage`）复用同一份 `obligations`，不另算一份状态、不各写一套绿公式。
+      //
+      // B3-REVIEW-WATCH 12:05：**必须**把**本次同一份**原始事件（`sharedEvents`，与 `facts` 同一快照）传进来——
+      // 否则记录级「record→账本 seq→当时不可变定义」的语义核验（`deriveObligations` 内 `checkDefinitionBindingsOf`）
+      // 在生产入口/宿主路径上被**跳过**，同 stableID 改要求仍能继承旧绿（fail-open 假绿）。
+      // 这里复用已在上面现读/传入的同一快照，**不另读一遍盘**：`deriveObligations` 与 `collectProjectFacts`
+      // 出自同一份事件，入口/六图/工作包同一版事实。拿不到快照（`sharedEvents === undefined`）时不传，
+      // 与既有"与 events 无关的调用行为逐字不变"口径一致（读失败如实回退，不伪装）。
+      obligations = deriveObligations({
+        project_id: projectId,
+        data_dir: dataDir,
+        facts: project_facts,
+        ...(sharedEvents === undefined ? {} : { events: sharedEvents }),
+      });
+      projection = obligations.projection;
+    }
   } catch (e) {
     unreadable ??= `状态投影算不出来（${(e as Error).message}）`;
   }
@@ -839,6 +997,8 @@ function gatherFacts(
     statesByName,
     align,
     projection,
+    obligations,
+    projectFacts: project_facts,
     byId: projection.by_id,
     acceptances: Object.values(audit.acceptances),
     audit,
@@ -864,9 +1024,11 @@ function gatherFacts(
     baselineSourceChanged,
     stageReads,
     syncBlock,
+    syncRepairPlan,
     syncBlockUnreadable,
     eventsShared,
     eventsSnapshotUnreadable,
+    eventSeqOf,
     design,
     plan,
     context,
@@ -1150,13 +1312,16 @@ function decideNextAction(input: DecideInput): Decision {
     basis_revision: facts.baseline.plan_revision.content_sha256,
   });
 
-  // ── 3. 源在基线激活后变过 → 影响待查，不派发 ──
+  // ── 3. 源在基线激活后变过（**或读不到**）→ 影响待查，不派发 ──
+  // V09-53：源被删/读不动时 `baselineSourceChanged` 也为 true（见 `baselineRevalidateOf`）——「读不到」不等于「没变」，
+  // 一律 fail-closed；精确原因（改了 / 读不到哪个源）在 `baseline.revalidate` 与下面的括注里逐条点名。
   if (facts.baselineSourceChanged) {
     reasons.push({
       code: "impact_unknown",
       text:
-        `设计/施工图源在基线激活后发生了变化：受影响对象**影响待查**，查清前不作为就绪任务派发（DESIGN.md §5.6）。` +
-        "先做影响分析并重绑/重审基线，再回来取下一项",
+        `设计/施工图源在基线激活后发生了变化（**或已读不到**）：受影响对象**影响待查**，查清前不作为就绪任务派发（DESIGN.md §5.6）。` +
+        "先做影响分析并重绑/重审基线，再回来取下一项" +
+        (facts.baselineRevalidate.length > 0 ? `（${facts.baselineRevalidate.join("；")}）` : ""),
       blocking: true,
     });
     return { action: "blocked", reasons, required_reads: reads };
@@ -1339,6 +1504,15 @@ function decideNextAction(input: DecideInput): Decision {
       blocking: true,
     });
     return { action: "review_result", reasons, required_reads: requiredReads(facts, target.def) };
+  }
+
+  // 人验仍是必需义务；技术项均已有效通过时停止向 Agent 重派复审。
+  const humanPending = all.find(c => technicalReviewState(facts, c.def.task_id).onlyHumanPending);
+  if (humanPending) {
+    const review = technicalReviewState(facts, humanPending.def.task_id);
+    reasons.push({code:"role_mismatch",text:`等待真实用户或测试人：${review.gaps.join("；")}。Agent 不代验。`,
+      ...packOf(humanPending,facts),blocking:true});
+    return {action:"await_role",reasons,required_reads:requiredReads(facts,humanPending.def)};
   }
 
   // ── 9. 有就绪候选但角色不符 → await_role（保留完整交接） ──
@@ -1596,6 +1770,199 @@ function packOf(
   };
 }
 
+/**
+ * 一个任务的**技术复审是否仍未收口**（B4/V09-54，DESIGN §5.4「复审有退出条件」）。
+ *
+ * 判据**只消费 canonical 事实**（`facts.obligations` 的逐项结论 + 状态投影），不另算绿公式：
+ *   · 必需检查逐项生效通过、`independence_required` 的检查有**非作者**证据、无必须拦截缺陷、源未失效
+ *     ⇒ **已收口**（不再列复审候选，不反复派已完成的卡）；
+ *   · 任一未达 ⇒ 未收口，逐项点名列出来——**部分/旧/错误**的审计记录都不算满足（不看"有没有审计记录"）。
+ */
+function technicalReviewState(facts: EntryFacts, taskId: string): { outstanding: boolean; gaps: string[]; needsIndependentAudit: boolean; onlyHumanPending?: boolean } {
+  const proj = facts.byId[taskId] ?? null;
+  if (proj === null) {
+    return {
+      outstanding: true,
+      gaps: [`${taskId}：状态投影缺失——无法判技术复审是否收口（不按「已收口」放行）`],
+      needsIndependentAudit: false,
+    };
+  }
+  const gaps: string[] = [];
+  let humanPendingCount = 0;
+  let needsIndependentAudit = false;
+  const defs = facts.obligations === null ? null : requiredChecksOf(facts.obligations, taskId);
+  if (defs !== null) {
+    for (const def of defs) {
+      const basis = proj.evidence_basis.find((b) => b.check_id === def.check_id) ?? null;
+      if (basis?.effective === "not_checked" && basis.pending) {
+        humanPendingCount++;
+        gaps.push(`${def.check_id}（等待 ${basis.pending.role}：${basis.pending.reason}；${basis.pending.basis}）`);
+        continue;
+      }
+      // 独审义务（B4 复审 11:36 第 1 条）：只要该检查**没有**「非作者的有效通过」，独审义务就没满足——
+      // 包含**从未记录**（`basis === null`）与 missing/unknown/stale，而不只是「作者自检撑着」那一种；
+      // 非作者审计判失败待复测同样在此列。否则真正缺独审的卡（一条审计记录都没有）无人接：
+      // auditor 分支只认 `needsIndependentAudit`，不拿"有没有审计记录"当判据。
+      // 只对 `independence_required` 的检查置位——作者自己的普通缺项不错误交审计。
+      const independentPassed = basis !== null && basis.effective === "passed" && basis.independence === "independent";
+      if (def.independence_required && !independentPassed) needsIndependentAudit = true;
+      if (basis === null || basis.effective !== "passed") {
+        gaps.push(`${def.check_id}（${basis === null ? "无记录" : basis.effective}）`);
+      } else if (def.independence_required && basis.independence !== "independent") {
+        gaps.push(`${def.check_id}（独审必需：当前只有作者自检，§2.7/§5.8）`);
+      }
+    }
+  } else {
+    for (const m of proj.missing) gaps.push(`${m.check_id}（${m.why}）`);
+  }
+  for (const f of proj.open_findings.filter((x) => x.must_block)) gaps.push(`${f.finding_id}（必须拦截的缺陷未收口）`);
+  if (proj.freshness !== "fresh") gaps.push(`证据/来源不在最新版本（freshness=${proj.freshness}）：须先复验受影响项再收口（§5.6）`);
+  if (gaps.length === 0 && (proj.display_status !== "verified" || proj.mapping !== "mapped")) {
+    gaps.push(`canonical 主状态未到 verified（display_status=${proj.display_status ?? "null"}／mapping=${proj.mapping}）：不按集合为空当作收口`);
+  }
+  return { outstanding: gaps.length > 0, gaps, needsIndependentAudit,
+    onlyHumanPending: humanPendingCount > 0 && gaps.length === humanPendingCount && proj.mapping === "mapped" };
+}
+
+/**
+ * 两轮同因诊断（B4/V09-54，DESIGN §5.4「两轮同因」；已审方案 §4A M3）：从**既有**结果回执识别
+ * 「同一原因连续两轮无进展」，提示转协调者查共同机制与前置——**不是**两轮后自动放行/免验/放弃；
+ * 不新增事件类型、不建持久完成表（只读派生当时事实）。
+ *
+ * 判据是**两个条件的合取**（B4 复审 11:36 第 2 条）：① 最后两条回执的 `untested` + `known_issues`
+ * 逐字相同且非空；② 两轮之间**确实没有**真实进展（无新增有效通过、无修复/复测、canonical 也未收口）。
+ * 只有备注相同**不算**"无进展"——否则「备注没改但检查真变少了」的卡会被误判成停滞。
+ *
+ * **B3-REVIEW-WATCH 12:04 后的收紧（三条都按「归属本任务」＋按服务端账本 seq）**：
+ *   · **归属链**：本任务在册缺陷（`finding.object_id === taskId`）→ 修复/复测只认这些缺陷；
+ *     别的任务（B）的任意修复/复测**不**解除本任务（A）的停滞。
+ *   · **服务端序**（不按可自报的 `occurred_at`）：窗口 = `(prev.seq, last.seq]`；`fix` 自带 `seq`，
+ *     `retest` 与 `evidence_basis` 的 `record_ref` 经 `facts.eventSeqOf`（同一现读快照的 `entity_id → seq`）
+ *     解析出账本序。`at` 只到秒——同一秒内的记录用 `at` 比较会漏判/误判，故一律用 seq。
+ *   · **有效缺口减少才算进展**：新增**此前从未_有效_通过**的本任务检查通过（重复同 check 通过不改有效缺口 ⇒
+ *     不算）、本任务缺陷的修复、本任务缺陷的**通过**复测（失败复测不算）。任何一条成立即**不**报停滞。
+ *   · **B3-REVIEW-WATCH 12:20 的收紧（"曾通过过"≠"仍然有效"）**：先前通过的记录一律再用**同一份**
+ *     `checksFromFacts`（含源清单现读复核）＋ `checkEffectiveness` 复核**当前是否仍有效通过**；只有仍有效的
+ *     旧通过才占位（防止重复记同 check 假推进）。**曾通过→相关源改→旧证据失效（stale）**的旧通过**不占位**：
+ *     本轮复验新通过即算真实进展，**不**因"历史上通过过"而永不推进。判据是"窗口前的**可复用有效**通过集合"，
+ *     **不是**"历史上出现过的通过记录"。
+ *   · **B3-REVIEW-WATCH 12:40 的收紧（定义语义也要看）**：`checkEffectiveness` 只看代码/源绑定，**看不见
+ *     定义语义**。同 stableID 改定义正文（code 未变）时，它仍把旧通过判 `passed` ⇒ 旧通过错误占位、本轮
+ *     新定义下的复验被挤成"重复通过"。这里**复用唯一义务层现成的记录级定义绑定结论**
+ *     （`obligations.check_identity.definition_bindings` 的 `verdict="changed"`，与投影/身份归一同一份）：
+ *     语义已变的旧通过**不占位**。
+ *   · **B3-REVIEW-WATCH 12:51 的收紧（不可证明 ≠ 停滞）**：同一条结论里 `verdict="unknown"`、或窗口前那条
+ *     旧通过**在结论里根本没有条目**（不可变定义快照读不到、记录时点无在效定义、取不到记录绑定）时，
+ *     "它当时按哪一版定义验的、现在是否仍有效"**证明不了**——该旧通过**不占位**，并把 `historyUnprovable`
+ *     置真、最终判未知（`return null`）。**只有 `match` + `checkEffectiveness=passed` 的旧通过才占位**
+ *     （重复同 check 通过仍诊断），不拿"证明不了"当"无进展"的证据。
+ *   · **不可证明则判未知、不断言停滞**：账本序读不到（快照不可读/记录无 `record_ref`）时，既证明不了"有进展"
+ *     也证明不了"没有"——如实判未知（`return null`），**不**把不确定说成"无进展"。
+ */
+function repeatDiagnosisOf(facts: EntryFacts, taskId: string): string | null {
+  const subs = Object.values(facts.audit.submissions)
+    .filter((s) => s.task_id === taskId)
+    .slice()
+    .sort((a, b) => a.round - b.round || a.seq - b.seq);
+  if (subs.length < 2) return null;
+  const prev = subs[subs.length - 2];
+  const last = subs[subs.length - 1];
+  const gapSig = (s: typeof prev): string => JSON.stringify({ untested: s.untested, known: s.known_issues });
+  if (gapSig(prev) !== gapSig(last) || (last.untested.length === 0 && last.known_issues.length === 0)) return null;
+
+  const proj = facts.byId[taskId] ?? null;
+  const taskFindingIds = new Set<string>();
+  for (const f of facts.projectFacts?.findings ?? []) if (f.object_id === taskId) taskFindingIds.add(f.finding_id);
+  for (const f of facts.openFindings) if (f.task_id === taskId) taskFindingIds.add(f.finding_id);
+
+  const seqOf = facts.eventSeqOf;
+  const inWindow = (seq: number | null): boolean => seq !== null && seq > prev.seq && seq <= last.seq;
+
+  // ① 本任务在册缺陷的修复（`fix` 记录自带账本 seq）。
+  const fixedInWindow = Object.values(facts.audit.fixes).filter(
+    (f) => taskFindingIds.has(f.finding_id) && f.seq > prev.seq && f.seq <= last.seq,
+  );
+  // 「历史状态不可证明」标志：账本序读不到时，既证明不了"有进展"、也证明不了"没有"——不据此断言停滞。
+  let historyUnprovable = false;
+  // ② 本任务在册缺陷的**通过**复测（`retest` 不自带 seq：经 `record_id → retest:<id> 实体 seq` 解析；
+  //    `result !== "pass"` 的失败复测**不算**推进——同一缺陷反复失败复测不得假推进）。
+  const retestedInWindow = Object.values(facts.audit.retests).filter((r) => {
+    if (!taskFindingIds.has(r.finding_id) || r.result !== "pass") return false;
+    const seq = seqOf(auditEntityId("audit.retest_recorded", r.record_id));
+    if (seq === null) historyUnprovable = true;
+    return inWindow(seq);
+  });
+  // ③ 本任务必需检查的**新增**有效通过：该 check 在窗口**之前从未**_有效_通过（否则只是重复记一次通过，
+  //    有效缺口没变 ⇒ 不算进展），且其通过记录经 `record_ref` 解析到账本 seq 落在窗口内。
+  //
+  //    B3-REVIEW-WATCH 12:20：判据是「窗口之前**有效**通过」，**不是**「历史上曾经通过过」——用**同一份**
+  //    `checksFromFacts`（含源清单现读复核）＋ `checkEffectiveness`（与投影同一判据）复核那条旧通过**当前**
+  //    是否仍有效：曾通过 → 相关源改 → 旧证据失效（stale）的旧通过**不占位**，否则「本轮复验新通过」会被
+  //    当成"历史上通过过"而永不推进。`effective` 与独立性无关，故 `authorIds` 传空集（只判有效性，不判独立性）。
+  const revisionFacts = facts.projectFacts;
+  const priorChecks = revisionFacts !== null ? checksFromFacts(revisionFacts) : checksFromAudit(facts.audit);
+  const revisions = revisionFacts?.revisions ?? {};
+  const segments = revisionFacts?.binding_segments ?? null;
+  //    B3-REVIEW-WATCH 12:40／12:51：`checkEffectiveness` 只看**代码/源绑定**，看不见**定义语义**——同 stableID
+  //    改定义正文（code 未变）时，它仍会把旧通过判 `passed`。这里**复用唯一义务层现成的记录级定义绑定结论**
+  //    （`obligations.check_identity.definition_bindings`，与投影/身份归一同一份、不另造一套）逐条取判词：
+  //      · `changed` ⇒ 记录时点的定义语义已变，该旧通过**不占位**（本轮在新定义下的复验才算真实进展）；
+  //      · `match`   ⇒ 定义未变，可按既有 `checkEffectiveness` 判它是否仍有效（重复同 check 通过仍算"无进展"）；
+  //      · `unknown`／**该记录在结论里根本没有条目**（不可变定义快照读不到、记录时点无在效定义、取不到记录绑定）
+  //        ⇒ 既证明不了"有进展"也证明不了"没有"：该旧通过**不占位**，并置 `historyUnprovable`
+  //        ——**不把不确定说成"无进展"**（B3-REVIEW-WATCH 12:51：不可证明不是停滞的证据）。
+  const definitionVerdicts = new Map<string, DefinitionBindingVerdict>();
+  for (const b of facts.obligations?.check_identity.definition_bindings ?? []) {
+    if (b.record_ref === null || b.record_ref === "") continue;
+    definitionVerdicts.set(definitionBindingKey(b.object_id, b.check_id, b.record_ref), b.verdict);
+  }
+  const passedBefore = new Set<string>();
+  for (const c of priorChecks) {
+    if (c.object_id !== taskId || c.result !== "passed") continue;
+    const seq = c.record_ref === undefined ? null : seqOf(c.record_ref);
+    if (seq === null) {
+      // 旧通过的账本序读不到：它是否在窗口之前、当前是否仍有效都无从证明 ⇒ 不据此下结论。
+      historyUnprovable = true;
+      continue;
+    }
+    if (seq > prev.seq) continue;
+    // 记录时点的**定义绑定判词**（唯一义务层同一份结论；窗口前的记录才看它）。
+    const verdict =
+      c.record_ref === undefined
+        ? undefined
+        : definitionVerdicts.get(definitionBindingKey(c.object_id, c.check_id, c.record_ref));
+    // 语义已变（同 stableID）⇒ 该旧通过**不占位**：它不该把本轮复验挤成"重复通过"。
+    if (verdict === "changed") continue;
+    // 判词不是 `match`（`unknown` 或结论里没有这条记录）⇒ 证明不了这条旧通过按当前语义仍然有效：
+    // 不占位（否则会把本轮新复验挤成"重复通过"），并如实标"历史状态不可证明"，最终**不**断言停滞。
+    if (verdict !== "match") {
+      historyUnprovable = true;
+      continue;
+    }
+    if (checkEffectiveness(c, revisions, new Set<string>(), segments).effective === "passed") {
+      passedBefore.add(c.check_id);
+    }
+  }
+  const newlyPassedInWindow = (proj?.evidence_basis ?? []).filter((b) => {
+    if (b.effective !== "passed" || passedBefore.has(b.check_id)) return false;
+    return inWindow(b.record_ref === null ? null : seqOf(b.record_ref));
+  });
+
+  if (fixedInWindow.length > 0 || retestedInWindow.length > 0 || newlyPassedInWindow.length > 0) return null;
+  // 历史状态**不可证明**时不据此断言"无进展"：如实判未知（账本序读不到时，既不谎报进展，也不把
+  // 不确定说成停滞——B3-REVIEW-WATCH 12:20「确无可证明历史状态应如实判断未知，不能断言无进展」）。
+  if (historyUnprovable) return null;
+  // 缺口已收口到位（canonical 主状态已 verified 且源新鲜）也无事可诊断。
+  if (proj !== null && proj.freshness === "fresh" && proj.display_status === "verified") return null;
+
+  return (
+    `两轮同因无进展（round ${prev.round} 与 ${last.round} 的未测/已知问题逐字相同，` +
+    "且两轮之间**没有**新增有效通过、也没有修复/通过复测记录）：这不是「再试一次」能解的信号——" +
+    "停止盲目重复同一操作，转协调者查**共同根因与前置**（补证据／拆小任务／调整路径／换验证手段），" +
+    "并**点名**导致两轮同因的具体检查项与来源；**不是**自动放行、免验或放弃（DESIGN.md §5.4）"
+  );
+}
+
 function reviewCandidates(
   facts: EntryFacts,
   role: string,
@@ -1603,29 +1970,40 @@ function reviewCandidates(
 ): { task_id: string; def: TaskDefinition; why: string; requirements: string[] }[] {
   const cls = roleClassOf(role);
   const submissions = Object.values(facts.audit.submissions);
-  const audits = Object.values(facts.audit.independent_audits);
   const out: { task_id: string; def: TaskDefinition; why: string; requirements: string[] }[] = [];
   for (const c of all) {
     const st = c.state;
     if (st === null) continue;
     const isSubmitted = st.status === "result_submitted" || submissions.some((s) => s.task_id === st.task_id);
     if (!isSubmitted) continue;
-    const hasAudit = audits.some((a) => a.task_id === st.task_id);
+    // B4/V09-54：复审**有退出条件**——当前必需检查/独审/阻断都收口 ⇒ 不再列复审候选（不反复派已完成的卡）。
+    const review = technicalReviewState(facts, st.task_id);
+    if (!review.outstanding) continue;
+    if (review.onlyHumanPending && cls !== "user" && role !== "human_tester") continue;
+    const gapText =
+      review.gaps.slice(0, 6).join("；") + (review.gaps.length > 6 ? `…（共 ${review.gaps.length} 项）` : "");
+    const repeat = repeatDiagnosisOf(facts, st.task_id);
+    const repeatText = repeat === null ? "" : `；${repeat}`;
     const requirements = c.completion_requirements;
+    if (review.onlyHumanPending && (cls === "user" || role === "human_tester")) {
+      out.push({task_id:st.task_id,def:c.def,why:`待真人检查：${gapText}；此项不是最终 Gate 代签`,requirements});
+      continue;
+    }
     if (cls === "coordinator") {
       out.push({
         task_id: st.task_id,
         def: c.def,
-        why: `协调器收件：任务 ${st.task_id} 已提交结果${hasAudit ? "（已有独立审计记录，复核范围与集成）" : "（还没有独立审计记录，按 §5.4 分派审计）"}`,
+        why: `协调器收件：任务 ${st.task_id} 已提交结果，技术复审**未收口**——还差：${gapText}${repeatText}`,
         requirements,
       });
       continue;
     }
-    if (cls === "auditor" && !hasAudit) {
+    // 审计者只在**独审义务未满足 / 非作者审计判失败待复测**时接手；"有没有审计记录"不作判据
+    if (cls === "auditor" && review.needsIndependentAudit) {
       out.push({
         task_id: st.task_id,
         def: c.def,
-        why: `待独立审计：任务 ${st.task_id} 已提交结果且还没有独立审计记录（作者自检不能当独立审计，§5.5）`,
+        why: `待非作者复核：任务 ${st.task_id} 已提交结果，但独审义务未满足或非作者审计判失败待复测——还差：${gapText}${repeatText}`,
         requirements,
       });
     }
@@ -1756,90 +2134,228 @@ function pendingDecisions(facts: EntryFacts): DecisionRecord[] {
 const WORKBENCH_REL = ".工作台";
 const WORK_DIR_REL = `${WORKBENCH_REL}/work`;
 
+/**
+ * 去重键（P1／§5.3）：统一为 `kind + path + section`（无 `section` 视作空串）。
+ * 旧实现有两套键（硬编码条目 `kind:path`、阶段条目 `kind:path#section`），行为差异只是"同文件多段必读互相顶掉"。
+ * 另加一条 Codex 纠正：**无 `section` 的引用条目把 `source_ref` 并入键**——否则同一文件的两条失败引用
+ * （或两条追溯指针）会被吞掉第二条，读者看不到"还有一条依据没定位到"。
+ */
+function requiredReadKey(r: RequiredRead): string {
+  const section = r.section ?? "";
+  const ref = section === "" && r.source_ref !== undefined ? `@${r.source_ref}` : "";
+  return `${r.kind}\u0000${r.path}\u0000${section}${ref}`;
+}
+
+/** 「空依据」写法（卡面写「无」时不造引用条目）；只在整条 token 就是这个写法时命中，不吞正常引用 */
+const EMPTY_DESIGN_REF_RE = /^(?:无|none|n\/a|—|-|－|–)[。.．]?$/i;
+
+/**
+ * 任务的设计引用 → 精确取材条目（P1／§5.2、§5.3）。
+ * - 严格解析入口（`designRefStrict`）逐个显式编号、唯一精确匹配；范围必须能证明完整展开；附录不降级；
+ * - 一次求值只把设计书解析一次（`parseMarkdownSections`），同卡全部引用共用同一棵章节树（§5.2-7）；
+ * - 非章节类 token（需求 ID／报告／外部文档）不进章节解析，以 `trace_reference` 条目带出原始引用（§5.2-8）。
+ */
+function designReferenceReads(facts: EntryFacts, def: TaskDefinition | null): { reads: RequiredRead[]; resolved: number } {
+  const reads: RequiredRead[] = [];
+  if (def === null || facts.design === null) return { reads, resolved: 0 };
+  const refs = Array.isArray(def.design_refs) ? def.design_refs : [];
+  if (refs.length === 0) return { reads, resolved: 0 };
+  const designPath = facts.design.source.rel_path;
+  const parsed = parseMarkdownSections(facts.design.text);
+  const sections: MarkdownSectionNode[] = parsed.ok ? parsed.sections : [];
+  let resolved = 0;
+  for (const raw of refs) {
+    const token = typeof raw === "string" ? raw.trim() : "";
+    if (token === "" || EMPTY_DESIGN_REF_RE.test(token)) continue; // 「无」这类空依据不是引用，别造一条空指针
+    // 认不出的设计引用**不得**被无条件当外部追溯而少读（P1 复核第 5 条）：显式编号、指名设计书、
+    // 或整条就是某章节的完整标题路径都要进严格解析；只有确实的外部文档/报告/需求才作追溯指针。
+    if (!isDesignRefToken(token, sections)) {
+      reads.push({
+        path: designPath,
+        kind: "design",
+        purpose: "trace_reference",
+        source_ref: token,
+        why: `任务 ${def.task_id} 的设计依据「${token}」是非设计章节引用（需求 ID／审计报告／外部文档）：只作追溯指针，按需回读，不占本轮必读正文`,
+      });
+      continue;
+    }
+    const result = resolveDesignRefStrict(token, sections);
+    for (const target of result.targets) {
+      if (target.resolution === "resolved") {
+        resolved += 1;
+        reads.push({
+          path: designPath,
+          kind: "design",
+          section: target.path,
+          revision: target.sha256,
+          range: { start: target.line_start, end: target.line_end },
+          purpose: "required_content",
+          resolution: "resolved",
+          source_ref: token,
+          why:
+            `任务 ${def.task_id} 的设计依据「${token}」→ ${target.path}（当前行 ${target.line_start}–${target.line_end}）：` +
+            "按 path+range 读回该章节标题与整棵子树，不整篇读取（section 是绑定定位，不转传 read_design/read_plan 的 section 参数）",
+        });
+      } else {
+        reads.push({
+          path: designPath,
+          kind: "design",
+          purpose: "required_content",
+          resolution: "unresolved",
+          source_ref: token,
+          resolution_detail: `${STRICT_REF_REASON_TEXT[target.reason]}（子目标 ${target.token_part}）`,
+          why:
+            `任务 ${def.task_id} 的设计依据「${token}」当前定位不到：${STRICT_REF_REASON_TEXT[target.reason]}。` +
+            "unresolved 不是已读、不是已通过、不是可跳过——按 source_ref 用 read_design(index=true) 或按 range 补取核实，不得用近似标题顶替",
+        });
+      }
+    }
+  }
+  return { reads, resolved };
+}
+
+/** 用途强弱（P1 复核第 6 条）：同目标合并时强的取胜，弱指针不得顶掉强必读 */
+const PURPOSE_RANK: Readonly<Record<RequiredReadPurpose, number>> = {
+  required_content: 3,
+  resume_context: 2,
+  trace_reference: 1,
+};
+
+/**
+ * 同一目标（同 kind+path+section…）出现多条时的**合并**（P1 复核第 6 条）：
+ * 早先的窄范围/追溯指针**不得**吞掉后来的更强必读——保留更强的 `purpose`、更完整的范围
+ * （任一条是整文件 ⇒ 合并为整文件；否则取并集）与全部来源理由（`why` 逐条并列）。
+ */
+function mergeRequiredRead(prev: RequiredRead, next: RequiredRead): RequiredRead {
+  const purpose = PURPOSE_RANK[next.purpose] > PURPOSE_RANK[prev.purpose] ? next.purpose : prev.purpose;
+  const prevRange = prev.range ?? null;
+  const nextRange = next.range ?? null;
+  const range =
+    prevRange === null || nextRange === null
+      ? null
+      : { start: Math.min(prevRange.start, nextRange.start), end: Math.max(prevRange.end, nextRange.end) };
+  const why = prev.why === next.why ? prev.why : `${prev.why}；同目标另有必读要求：${next.why}`;
+  const merged: RequiredRead = {
+    ...prev,
+    purpose,
+    range,
+    why,
+    revision: prev.revision ?? next.revision ?? null,
+    section: prev.section ?? next.section,
+  };
+  const resolution = prev.resolution ?? next.resolution;
+  if (resolution !== undefined) merged.resolution = resolution;
+  const detail = prev.resolution_detail ?? next.resolution_detail;
+  if (detail !== undefined) merged.resolution_detail = detail;
+  const sourceRef = prev.source_ref ?? next.source_ref;
+  if (sourceRef !== undefined) merged.source_ref = sourceRef;
+  return merged;
+}
+
 /** 必读原文入口（§6.7「给的是结构化事实及原文入口，不要求它从截图猜进度」） */
 function requiredReads(facts: EntryFacts, def: TaskDefinition | null): RequiredRead[] {
+  const refReads = designReferenceReads(facts, def);
   const out: RequiredRead[] = [];
+  const indexOfKey = new Map<string, number>();
+  const push = (r: RequiredRead): void => {
+    const key = requiredReadKey(r);
+    const at = indexOfKey.get(key);
+    if (at === undefined) {
+      indexOfKey.set(key, out.length);
+      out.push(r);
+      return;
+    }
+    out[at] = mergeRequiredRead(out[at] as RequiredRead, r);
+  };
+
   if (facts.plan !== null) {
-    out.push({
+    push({
       path: facts.plan.source.rel_path,
       kind: "plan",
       why: def === null ? "施工图原文（任务定义、依赖与验收的权威来源）" : `任务 ${def.task_id} 的卡区原文（定义、依赖、验收、文件责任）`,
       revision: facts.plan.revision.content_sha256,
       range: def?.section_lines === null || def?.section_lines === undefined ? null : { start: def.section_lines[0], end: def.section_lines[1] },
+      purpose: "required_content",
     });
   }
   if (facts.design !== null) {
-    out.push({
+    // 整份设计书入口**始终保留**；有解析到的设计引用时它降为追溯指针，否则仍是本轮必读正文（§5.3）。
+    push({
       path: facts.design.source.rel_path,
       kind: "design",
       why: "设计书原文（契约与禁止越界事项的权威来源；按任务的设计依据章节读）",
       revision: facts.design.revision.content_sha256,
+      purpose: refReads.resolved > 0 ? "trace_reference" : "required_content",
     });
+    for (const r of refReads.reads) push(r);
   } else {
-    out.push({
+    push({
       path: ".工作台/design.md",
       kind: "design",
       why: "设计书源缺失：先确认项目登记的设计书路径（§2.9），别拿摘要当依据",
+      purpose: "required_content",
     });
   }
   if (facts.baseline !== null) {
-    out.push({
+    push({
       path: `${WORKBENCH_REL}/baselines.jsonl`,
       kind: "baseline",
       why: `生效基线 ${facts.baseline.baseline_id}（审定依据与两修订哈希）`,
       revision: facts.baseline.baseline_id,
+      purpose: "trace_reference",
     });
   }
-  out.push({
+  push({
     path: `${WORK_DIR_REL}/events.jsonl`,
     kind: "task_facts",
     why: "任务执行状态的事实源（唯一写入服务追加的事件流；状态是它的投影）",
+    purpose: "trace_reference",
   });
   if (Object.keys(facts.audit.submissions).length > 0) {
-    out.push({
+    push({
       path: `${WORK_DIR_REL}/events.jsonl`,
       kind: "audit",
       why: "交付/审计记录同在事件流里（提交、自检、独立审计、复测、人工验收各占实体前缀）",
+      purpose: "trace_reference",
     });
   }
   const checkpointFile = checkpointPath(facts.projectId, facts.dataDir);
   if (fs.existsSync(checkpointFile)) {
-    out.push({
+    push({
       path: `${WORK_DIR_REL}/context-resume.json`,
       kind: "checkpoint",
       why: "上一轮中断留下的续接位置（服务器保留的现场：已确认来源、未读清单、续读游标）",
+      purpose: "resume_context",
     });
   }
   // 项目级阶段必读（`.工作台/work/stage-reads.json` 派生指针）：本阶段必须读到的原文——
-  // 项目总图、AGENTS.md、当前交接等。指针合法才追加；同一个 `kind+path` 已在上面出现就不重复列。
+  // 项目总图、AGENTS.md、当前交接等。指针合法才追加；同一个 `kind+path（+section）` 已在上面出现就不重复列。
+  // 带 `section` 的条目另透传**派生** `range`（该章节当前起止行，非指针 JSON 键）：执行方按 `path`+`range`
+  // 读回标题与整棵子树，不把 `section` 当 `read_design`/`read_plan` 的章节参数转传（两套口径）。
   // 指针缺失/不合法**不在这里**表达：缺失=老项目原样兼容，不合法由判定层给 blocked（见 decideNextAction 第 1.5 步）。
   if (facts.stageReads.status === "ok") {
-    const listed = new Set(out.map((r) => `${r.kind}:${r.path}`));
     for (const entry of facts.stageReads.entries) {
-      const key = `${entry.kind}:${entry.path}`;
-      if (listed.has(key)) continue;
-      listed.add(key);
-      out.push({
+      push({
         path: entry.path,
         kind: entry.kind,
         why: `本阶段必读（项目级指针 ${STAGE_READS_REL}）：${entry.why}`,
         revision: entry.revision,
+        ...(entry.section === undefined ? {} : { section: entry.section }),
+        ...(entry.range === undefined ? {} : { range: entry.range }),
+        purpose: "required_content",
       });
     }
   }
   // 同步证据阻断时带出证据入口（V09-23／DESIGN §2.10）：让接续 Agent 一眼看到缺哪一批、证据包放哪
-  // （`kind` 复用既有枚举 evidence；同一 kind+path 不重复列）。
+  // （`kind` 复用既有枚举 evidence；P1／§5.4 把这类"续接现场"标为 resume_context）。
   if (facts.syncBlock !== null && facts.syncBlock.blocked) {
-    const listed = new Set(out.map((r) => `${r.kind}:${r.path}`));
     for (const b of facts.syncBlock.batches) {
       const rel = `${SYNC_INBOX_REL}/${b.batch_id}.evidence.json`;
-      const key = `evidence:${rel}`;
-      if (listed.has(key)) continue;
-      listed.add(key);
-      out.push({
+      push({
         path: rel,
         kind: "evidence",
         why: `同步批次「${b.title}」（${b.batch_id}）未当前通过（verdict=${b.verdict}）：见证它缺什么、期望与实际差在哪；blocks_entry 阻断接续与认领`,
+        purpose: "resume_context",
       });
     }
   }
@@ -1852,7 +2368,77 @@ function requiredReads(facts: EntryFacts, def: TaskDefinition | null): RequiredR
  * 求一次项目入口（§6.7）。**只读**：不提交事件、不写文件、不认领、不调模型。
  * 输入校验只认 §6.7 的五个字段；`dataDir`/`now` 是进程内选项，不进契约。
  */
+/**
+ * V09-53（B3/§2.7）：由**本次已算的同一份** `facts.obligations` 派生逐 check 工作包。
+ * **不改判定**——`taskId`/`nextAction`/角色能力都取自 `evaluateProjectEntry` 本次已定结论，这里只组织形态。
+ * 事实读不出来（`obligations`/`projectFacts` 为 null）⇒ 返回 null（不假装有包；入口本身已 `blocked`）。
+ */
+function workPackageOf(input: {
+  facts: EntryFacts;
+  role: string;
+  capability: ClientCapabilityClass;
+  capabilityFlags: { read: boolean; continue: boolean; coordinate: boolean };
+  taskId: string | null;
+  nextAction: ProjectEntryAction;
+  /** 入口已定的下一动作由哪个角色推进（不重算；无从得知 = null） */
+  nextActionRole: string | null;
+  paging?: { limit?: number; cursor?: string; offset?: number; expected_revision?: string };
+}): WorkPackageFull | WorkPackageFailure | null {
+  const { facts } = input;
+  const obligations = facts.obligations;
+  const projectFacts = facts.projectFacts;
+  if (obligations === null || projectFacts === null) return null;
+  const roleClass = roleClassOf(input.role);
+  const sourceMode: SourceMode =
+    roleClass === "coordinator" || input.capability === "coordination" ? "coordinator_managed" : "direct_tatai";
+  const taskId = input.taskId;
+  const changeId = taskId === null ? null : (facts.states[taskId]?.change_id ?? null);
+  const live = taskId === null ? null : (facts.live[taskId] ?? null);
+  const ownership: WorkPackageOwnership | null =
+    live === null
+      ? null
+      : {
+          owner_id: live.owner_id ?? "",
+          run_id: live.run_id ?? "",
+          attempt_id: live.attempt_id ?? "",
+          lease_expires_at: live.lease_expires_at ?? "",
+          workspace: live.workspace ?? "",
+        };
+  const snapshot: WorkPackageFactsSnapshot = {
+    project_id: facts.projectId,
+    data_dir: facts.dataDir,
+    role: input.role,
+    role_class: roleClass,
+    capability: input.capability,
+    capability_flags: input.capabilityFlags,
+    now: facts.now,
+    obligations,
+    facts: projectFacts,
+    baseline: {
+      design_revision: projectFacts.baseline?.design_revision ?? projectFacts.revisions.design ?? null,
+      plan_revision: projectFacts.baseline?.plan_revision ?? projectFacts.revisions.plan ?? null,
+      baseline_id: projectFacts.baseline?.baseline_id ?? null,
+    },
+    task_id: taskId,
+    change_id: changeId,
+    source_mode: sourceMode,
+    next_action: input.nextAction,
+    next_action_role: input.nextActionRole,
+    ownership,
+  };
+  const result = buildWorkPackage(snapshot, { scope_id: changeId }, input.role, input.paging ?? {});
+  return result.ok ? result.work_package : result;
+}
+
 export function evaluateProjectEntry(input: ProjectEntryInput, opts: ProjectEntryOptions = {}): ProjectEntry {
+  // 2026-10-07 运行时阻塞修复：整段跑在一次派生的只读复用作用域里——事实快照、
+  // 图纸源读取解析、不可变修订对象读+核哈希、源清单复核、git 忽略探针在同一次派生内只算一次。
+  // 作用域随本次调用结束即丢、**跨请求不缓存**（下一次调用照旧现读现算，源一变立刻可见）。
+  // 证据：E/runtime-profile-only/REPORT.md、E/runtime-final/COORDINATOR-HYPOTHESES.md。
+  return withDerivationScope(() => evaluateProjectEntryInScope(input, opts));
+}
+
+function evaluateProjectEntryInScope(input: ProjectEntryInput, opts: ProjectEntryOptions = {}): ProjectEntry {
   const projectId = typeof input?.project_id === "string" ? input.project_id.trim() : "";
   const role = typeof input?.role === "string" ? input.role.trim() : "";
   if (projectId === "") throw new WorkError("INVALID_COMMAND", "project_entry 缺入参 project_id", { field: "project_id" });
@@ -1902,6 +2488,39 @@ export function evaluateProjectEntry(input: ProjectEntryInput, opts: ProjectEntr
   // V09-34：本次动作指向的任务（取自已定 decision 的 reasons；只为前置说明定位，不重算判定）。
   const chosenTaskId =
     decision.reasons.map((r) => r.task_id).find((id): id is string => typeof id === "string" && id !== "") ?? null;
+
+  // V09-53（B3）：默认**不加**该字段（保持 §6.7 九字段默认契约）；`opts.work_package===true` 时才从
+  // 本次同一份 facts 派生，**不改**上面的 next_action/reasons。分页游标跨版本由 `buildWorkPackage` 显式拒。
+  // `next_action_role` 由**入口已定的动作 + 调用方角色档**推（不猜候选角色）；`expected_revision` 与工具入口相连。
+  const callerClass = roleClassOf(role);
+  const nextActionRole: string | null =
+    decision.action === "claim_task" || decision.action === "resume_task"
+      ? role
+      : decision.action === "review_result"
+        ? callerClass === "unknown"
+          ? role
+          : callerClass
+        : decision.action === "blocked" || decision.action === "await_decision"
+          ? "coordinator"
+          : decision.action === "complete"
+            ? ""
+            : null; // await_role：具体角色由候选卡的责任角色决定，这里不猜
+  const workPackage =
+    opts.work_package === true
+      ? workPackageOf({
+          facts,
+          role,
+          capability: capability.effective,
+          capabilityFlags: capability.declared,
+          taskId: chosenTaskId,
+          nextAction: decision.action,
+          nextActionRole,
+          ...(opts.work_package_paging === undefined ? {} : { paging: opts.work_package_paging }),
+          ...(opts.work_package_expected_revision === undefined
+            ? {}
+            : { paging: { ...(opts.work_package_paging ?? {}), expected_revision: opts.work_package_expected_revision } }),
+        })
+      : null;
 
   return {
     project: {
@@ -1973,6 +2592,8 @@ export function evaluateProjectEntry(input: ProjectEntryInput, opts: ProjectEntr
             overall: facts.syncBlock.overall,
             blocked: facts.syncBlock.blocked,
             blocking_batches: facts.syncBlock.batches.map((b) => ({ batch_id: b.batch_id, title: b.title, verdict: b.verdict, reasons: b.reasons })),
+            // P3/V09-48：只读修复计划（与上面的阻断判据**同一次**评估；只读附加，不改门禁）。
+            ...(facts.syncRepairPlan === null ? {} : { repair_plan: facts.syncRepairPlan }),
           },
     // V09-34：轻量选项——默认**不加**该字段（保持 §6.7 九字段契约）；`opts.preconditions===true` 时
     // 从本次同一份 facts 派生说明，不改上面的 `next_action`/`reasons` 任何一项。
@@ -1989,6 +2610,8 @@ export function evaluateProjectEntry(input: ProjectEntryInput, opts: ProjectEntr
           }),
         }
       : {}),
+    // V09-53：逐 check 工作包（仅 opt-in；旧字段逐字保留，本字段是兼容扩展）。
+    ...(workPackage === null ? {} : { work_package: workPackage }),
   };
 }
 

@@ -140,7 +140,15 @@ async function main(): Promise<void> {
   //   保留意图：SDK 引用仍只允许出现在 src/mcp/、白名单验证脚本与 src/server/memory.ts——不是删断言、不是改成
   //     "任何 verify-* 都放行"（白名单仍是**逐族点名**，新增一族要在这里留痕）。
   //   判据不放宽：允许面只增加了 v0.9 批次的验证脚本族（它们与 v06 族做同一件事：真起 stdio 客户端验收）。
-  const SDK_WHITELIST_RE = /^scripts\/verify-(?:m\d|u2|des-v06-current|v06-\d+|v06-\d+-[a-z0-9]+|v09-\d+|v09-\d+-[a-z0-9]+)\.ts$/;
+  // 2026-10-08（共同夹具修复批）定向更新：`verify-forward-journey.ts`（V09-29 正向闭环完整旅程，真 stdio
+  //   MCP 客户端 + 真 `src/mcp/index.ts` 子进程）不落在原命名形式里（它既非 m\d／u2／v06-\d+／v09-\d+ 任一形式），
+  //   被这条白名单判成"越界的 SDK 引用"而一直红。五要素留档：
+  //   旧期望＝上面的正则（不含 forward-journey）｜依据＝历史上按命名形式逐族点名登记；
+  //   新期望＝**按名点名**加上 `forward-journey`（不引入通配、不改成"任意 verify-* 都放行"）｜
+  //   保留意图＝SDK 引用仍只允许出现在 src/mcp/、白名单验证脚本与 B2 客户端；新增一族仍要在这里留痕。
+  //   旁证（真实 SDK client，非第二个 server）：下面新增一条独立断言——scripts/ 下每个命中脚本的 SDK 引用
+  //   只 import client 子路径（`@modelcontextprotocol/sdk/client/*`），没有一个 import server 子路径。
+  const SDK_WHITELIST_RE = /^scripts\/verify-(?:m\d|u2|forward-journey|des-v06-current|v06-\d+|v06-\d+-[a-z0-9]+|v09-\d+|v09-\d+-[a-z0-9]+)\.ts$/;
   const hits: string[] = [];
   const walk = (dir: string, relPrefix: string) => {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -164,7 +172,16 @@ async function main(): Promise<void> {
   );
   ok(
     hits.every((h) => h.startsWith("src/mcp/") || SDK_WHITELIST_RE.test(h) || h === B2_CLIENT),
-    "SDK 引用只在 src/mcp/、verify-{m*,u2,des-v06-current,v06-*} 与 B2 客户端 memory.ts（唯一 MCP server 入口；u2 用 SDK client 测随包 server，2026-09-18 审计订正白名单；2026-09-20 V06-10 端到端脚本点名加白；同因再加补修脚本的命名形式 `verify-v06-NN-<字母>`；2026-09-23 再加 `verify-des-v06-current.ts`——DES 两卡等价检查要真起 stdio MCP 读回工具数与原文）",
+    "SDK 引用只在 src/mcp/、verify-{m*,u2,forward-journey,des-v06-current,v06-*,v09-*} 与 B2 客户端 memory.ts（唯一 MCP server 入口；u2 用 SDK client 测随包 server，2026-09-18 审计订正白名单；2026-09-20 V06-10 端到端脚本点名加白；同因再加补修脚本的命名形式 `verify-v06-NN-<字母>`；2026-09-23 再加 `verify-des-v06-current.ts`；2026-10-08 再加 `verify-forward-journey.ts`——完整旅程要真起 stdio MCP 客户端）",
+  );
+  // 白名单只证明"名字在族里"；再按**真实 import 子路径**证伪"第二个 server"：scripts/ 下的 SDK 引用
+  // 一条都不能 import server 子路径（server 只能有一个，在 src/mcp/）。这条是独立判据，不放宽原白名单。
+  const scriptSdkImports = hits
+    .filter((h) => h.startsWith("scripts/"))
+    .flatMap((h) => fs.readFileSync(path.join(REPO_ROOT, h), "utf8").match(/from\s+["']@modelcontextprotocol\/[^"']+["']/g) ?? []);
+  ok(
+    scriptSdkImports.length > 0 && scriptSdkImports.every((i) => i.includes("/client/")),
+    `白名单脚本都是真实 SDK client（只 import client 子路径、不是第二个 server；样本 ${scriptSdkImports.length} 条引用）`,
   );
 
   await client.close();

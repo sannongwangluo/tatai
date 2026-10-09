@@ -33,6 +33,9 @@ from playwright.sync_api import sync_playwright
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 SHOT_DIR = os.path.join(REPO, ".工作台", "verify", "v06-06")
+# 测试只访问本次隔离的回环服务，显式直连：ambient 代理会把 127.0.0.1 探活转成 502（同
+# `scripts/verify-forward-baseline-ui.py` 的既有口径）。判据不变，只是不让代理插手回环。
+DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 MAIN = "v0606-main"
 BIG = "v0606-big"
 DRAFT = "v0606-draft"
@@ -91,7 +94,7 @@ def http(url, method="GET", body=None, timeout=60, headers=None):
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with DIRECT.open(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8")
             return resp.status, (json.loads(text) if text.strip().startswith(("{", "[")) else text)
     except urllib.error.HTTPError as e:
@@ -351,7 +354,7 @@ def start_vite(port, backend_port, log_path):
         if proc.poll() is not None:
             raise RuntimeError("vite 起不来（进程已退出）")
         try:
-            with urllib.request.urlopen(f"http://localhost:{port}/", timeout=5) as resp:
+            with DIRECT.open(f"http://localhost:{port}/", timeout=5) as resp:
                 if resp.status == 200:
                     return proc
         except Exception:
@@ -514,10 +517,59 @@ def assert_dependency_vs_integration(page, tag):
     return dep, integ
 
 
+def launch_browser(p):
+    """真浏览器：优先 Playwright 自带 chromium；本机未装（ms-playwright 空）时退回系统 Edge。
+    两者都是真 Chromium 内核，判据不变（同 `scripts/verify-forward-baseline-ui.py` 的既有口径）。"""
+    chan = os.environ.get("TATAI_UI_BROWSER_CHANNEL", "")
+    if chan:
+        return p.chromium.launch(headless=True, channel=chan)
+    try:
+        return p.chromium.launch(headless=True)
+    except Exception as e:  # noqa: BLE001
+        info("自带 chromium 起不来（%s），退回系统 Edge" % str(e).splitlines()[0][:120])
+        return p.chromium.launch(headless=True, channel="msedge")
+
+
+def open_notes_fold(page):
+    """把「口径注释」按**用户操作顺序**展开，不改任何断言、不绕过界面。
+
+    现场是**两层**折叠：外层 `details.tt-graph-guide`（2026-09-27 用户指令：默认收起成一行）里
+    再套着内层 `[data-project-notes-summary]`（更早的收起改动）。按 HTML `<details>` 的 UA 折叠
+    语义，外层没展开时内层 summary 是**不可见**的（`not visible`），点不到——这不是功能坏了，
+    是点之前少开了一层。先点**外层** summary，再点**内层** summary。"""
+    outer = page.locator("details.tt-graph-guide > summary").first
+    if outer.count():
+        outer.click()
+        page.wait_for_timeout(200)
+    inner = page.locator("[data-project-notes-summary]").first
+    if inner.count():
+        inner.click()
+        page.wait_for_timeout(300)
+
+
+def expand_detail_folds(page):
+    """把节点详情里**所有**折叠 `<details>` 按用户操作顺序逐个点开，再读全文。
+
+    为什么：详情各段现在"**短线摘要在外、全文在里**"——`ProjectGraphView.tsx` 渲染 `s.summary`，
+    把 `s.lines`（含"来源时间：图生成 …"、出处段的"设计书章节：…/施工卡：…／基线：…；派生器 …"）
+    收在每段自己的 `<details data-detail-original=…>` 里；第⑤段「技术资料与原始定位」是
+    `<details data-detail-technical>`。折叠时 `inner_text` 取不到全文，**不是内容没了**，是没展开。
+    逐个点开 summary，断言一字未改、判据未放宽。"""
+    for _ in range(16):
+        folds = page.locator("[data-project-detail] details:not([open]) > summary")
+        if folds.count() == 0:
+            return
+        try:
+            folds.first.click(timeout=3000)
+        except Exception:
+            return
+        page.wait_for_timeout(120)
+
+
 def run_browser(vite_port, backend_port):
     os.makedirs(SHOT_DIR, exist_ok=True)
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = launch_browser(p)
         page = browser.new_context(viewport={"width": 1600, "height": 950}).new_page()
         page_errors = []
         page.on("pageerror", lambda e: page_errors.append(str(e)))
@@ -540,10 +592,9 @@ def run_browser(vite_port, backend_port):
         ok(len(states) >= 4, f"功能全景渲染 {len(states)} 个能力分组节点（不足 5 个也照常出图）")
         note = page.locator("[data-project-scope]").inner_text()
         ok("显示全部" in note, f"顶栏显示当前范围（{note[:48]}…）")
-        # 2026-09-27：口径注释区默认收起成一行，读全文前先点开折叠
-        if page.locator("[data-project-notes-summary]").count():
-            page.locator("[data-project-notes-summary]").first.click()
-            page.wait_for_timeout(300)
+        # 2026-09-27：口径注释区默认收起成一行；2026-10-08：外层又套了一层 `details.tt-graph-guide`
+        # 折叠（同一次改动的两个落点）。按用户操作顺序先开外层、再开内层——断言一字未改、判据未放宽。
+        open_notes_fold(page)
         overview_note = page.locator("[data-project-notes]").inner_text()
         ok(
             "不补假节点" in overview_note or "不足 5" in overview_note,
@@ -569,6 +620,10 @@ def run_browser(vite_port, backend_port):
             and order[5:] == (["provenance"] if len(order) > 5 else []),
             f"详情五段顺序 = §3.2（作用 → 当前情况与原因 → 设计/施工出处 → 验证结果 → 技术资料）：{order}",
         )
+        # 2026-10-08：详情各段「短线摘要在外、全文在里」——"来源时间"在 situation 段的
+        # `[data-detail-original]` 里（另有第⑤段 `[data-detail-technical]`）。按用户操作逐个展开再读全文，
+        # 断言一字未改（展开 helper 见模块级 expand_detail_folds）。
+        expand_detail_folds(page)
         detail = page.locator("[data-project-detail]").inner_text()
         ok("未映射" in detail or "状态口径" in detail, "第②段给出状态与状态口径（不空集判绿）")
         ok("来源时间" in detail, "第②段带来源时间（图生成 / 本次读取）")
@@ -590,6 +645,12 @@ def run_browser(vite_port, backend_port):
 
         # ── ④ 图已过期 / 图正在更新：继续显示上次有效图 ──
         step["now"] = "主夹具：过期提示"
+        # 2026-10-08：过期/更新提示现为折叠 `<details data-project-freshness>`（正文里才有"继续显示上次有效图"
+        # 与原因），先按用户操作逐个点开再读；判据一字未改。
+        fr = page.locator("[data-project-freshness] > summary")
+        for i in range(fr.count()):
+            fr.nth(i).click()
+        page.wait_for_timeout(300)
         banners = page.eval_on_selector_all(
             "[data-project-freshness]",
             "els => els.map(e => [e.getAttribute('data-project-freshness'), e.innerText])",
@@ -875,10 +936,9 @@ def run_browser(vite_port, backend_port):
             "空仓里没有任何节点被判绿（不假绿、不空集判绿，§4.2）",
         )
         page.screenshot(path=os.path.join(SHOT_DIR, "14-big-empty-repo-gray.png"))
-        # 2026-09-27：口径注释区默认收起成一行，读全文前先点开折叠
-        if page.locator("[data-project-notes-summary]").count():
-            page.locator("[data-project-notes-summary]").first.click()
-            page.wait_for_timeout(300)
+        # 2026-09-27：口径注释区默认收起成一行；2026-10-08：外层又套了一层 `details.tt-graph-guide`
+        # 折叠（同一次改动的两个落点）。按用户操作顺序先开外层、再开内层——断言一字未改、判据未放宽。
+        open_notes_fold(page)
         note = page.locator("[data-project-notes]").inner_text()
         ok("超量聚合" in note and "另外 3 个" in note, f"18 个能力超上限 → 概览聚合并显示数量（说明里：{note.splitlines()[-1][:56]}…）")
         agg = page.locator("[data-project-aggregate]").count()
@@ -903,6 +963,10 @@ def run_browser(vite_port, backend_port):
             draft_banner.get_attribute("data-project-draft") == "draft_unaudited",
             f"未激活基线的项目：画布顶部挂**草稿图**横幅（data-project-draft={draft_banner.get_attribute('data-project-draft')}）",
         )
+        # 2026-10-08：草稿横幅是折叠 `<details data-project-draft>`（身份/边界与"未发布原因 baseline_missing"
+        # 在正文里），按用户操作先点开再读；判据一字未改。
+        draft_banner.locator("summary").click()
+        page.wait_for_timeout(250)
         dtext = draft_banner.inner_text()
         ok(
             "草稿" in dtext and "未审定" in dtext and "不能当施工依据" in dtext,
@@ -1031,7 +1095,9 @@ def main():
                 elif s == "executing":
                     facts.submit(f"task:{tid}", "task.status_changed", {"status": "executing"})
                 elif s == "result_submitted":
-                    facts.submit(f"task:{tid}", "task.result_submitted", {})
+                    # P2/V09-47 返工：只置状态走既有状态边界（task.status_changed），不是结果交付提交
+                    # （task.result_submitted 现在一律按交付提交被锁内核实：缺认领 token/证据即拒）
+                    facts.submit(f"task:{tid}", "task.status_changed", {"status": "result_submitted"})
                 else:
                     facts.submit(f"task:{tid}", "task.status_changed", {"status": s})
         facts.submit("task:T-3", "task.blocked", {"reason": "导出通道被上游格式变更卡住，等 T-2 定稿"})

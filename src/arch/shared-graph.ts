@@ -68,6 +68,24 @@ export interface GraphNode {
   plan_refs?: string[];
 }
 
+/**
+ * 共用层节点的**下钻可达性**（§3.3 规则 3 / §4.3 第 2 招）：能不能从这个节点就地展开出真实子级。
+ * 唯一判定出处——技术详情两张图（方框图、思维导图）都从这里取，不各写一套：
+ *   · 聚合节点（`__more__`）不可下钻（它代表的是"没画出来的那批"，不是可解析的子树）；
+ *   · 聊天补全层节点（`origin:"chat"`）不可下钻（概念节点没有可解析的子树）；
+ *   · **没有真实路径的节点不可下钻**——规划层并入的灰节点（`path:""`，如 `plan:cap:*` / `plan:task:*`）
+ *     本来就只是一个规划对象，没有目录可展开。**禁止给这种节点画下钻控件**：控件点了没处可去
+ *     （A4 的 `expandDirectory` 收到空路径只会拒绝），等于一个死控件，且会让人误以为"这里还能往下看"。
+ *   `path` 为空串与 `path === "."`（根散文件模块的真实路径）是两回事：后者可下钻。
+ */
+export function canDrillSharedNode(n: {
+  path: string;
+  aggregate?: boolean;
+  origin?: "chat";
+}): boolean {
+  return n.aggregate !== true && n.origin !== "chat" && n.path !== "";
+}
+
 /** 聚合依赖边（§4.3 第 3 招）：from = 依赖方、to = 被依赖方（DEP_EDGE_DIRECTION） */
 export interface GraphEdge {
   from: string;
@@ -76,6 +94,12 @@ export interface GraphEdge {
   /** V06-05：本边来自规划层（审定图纸派生）而非 import 聚合——视图可按来源分样式，
    *  不许把它当"静态 import 聚合边"（§3.2：静态 import 不称为运行时业务流）。 */
   origin?: "plan";
+  /** 2026-10-05 六图修复：规划边**保真**的原关系类型/确定性（`PlanLayerEdge.kind/certainty`，
+   *  如 implementation_map/observed、task_design_ref/declared）。此前合并时被丢掉、读侧一律
+   *  标成 `static_import/observed`——规划声明的依赖被冒充成实测代码 import（现场核查实锤）。
+   *  仅 `origin === "plan"` 的边携带；静态边不设。 */
+  plan_kind?: string;
+  plan_certainty?: string;
 }
 
 /** 生效的硬上限数值（各维都是数字；具体口径字面量集中在 `config.ts` 的 `ARCH_LIMITS` /
@@ -396,8 +420,15 @@ export interface CappedChildren<T> {
  * @param children 已按渲染顺序排好的子级（A4 口径：子目录 → 文件，各自按名字升序）
  * @param parentId 父节点 id —— 聚合节点 id 带父级后缀（`<聚合 id>:<父 slug>`）：同一张图里可能
  *                 同时展开多个巨枝，聚合节点 id 必须唯一，否则 React Flow 的节点键会撞
- * @param limit    生效上限（缺省走 config.ts 数值口径；验证脚本可传小值构造夹具）
+ * @param limit    生效上限（缺省走 `defaultChildLimit()`；验证脚本可传小值构造夹具）
  */
+/** 单枝子级硬上限的**默认值**（数值口径仍在 `config.ts`，实现与取值出口都在共用数据层）。
+ *  给 `expand.ts` 的 A4 调用方用的：分页窗口的页长与"没传上限"时的缺省都是它——
+ *  A4 只**调用**这份口径，自己不引 `ARCH_LIMITS`（§4.3 第 1 招「截断实现全仓唯一」红线）。 */
+export function defaultChildLimit(): number {
+  return ARCH_LIMITS.MAX_CHILDREN;
+}
+
 export function capChildren<T extends { name: string }>(
   children: readonly T[],
   parentId: string,
@@ -435,6 +466,10 @@ export interface SelectedEdge {
   bidirectional?: true;
   /** 边色角色（F3 取色值；null = 中性色 / 该模式不着色） */
   color_role: "flow_source" | "flow_relay" | null;
+  /** 规划边标记与原关系类型（2026-10-05 保真；见 GraphEdge.plan_kind）——选择器全程不丢 */
+  origin?: "plan";
+  plan_kind?: string;
+  plan_certainty?: string;
 }
 
 /** 视图要画的节点：共用节点集合**原样复用**（一个都不过滤），DATA_FLOW 额外带流向角色 */
@@ -506,6 +541,12 @@ interface FlowStepEdge {
   weight: number;
   /** 互惠对归并标记（merge_mutual_pair 步产出） */
   bidirectional?: true;
+  /** 规划边标记与原关系类型（2026-10-05 保真：过滤/归并/翻转全程不丢——互惠对里静态边与
+   *  规划边归并成一条时，取**先入者**（E_ALL 顺序：静态边在前）的字段；这类混合对本身极罕见，
+   *  归并后的边仍如实带 plan 标记，读侧照旧按标记分流文案）。 */
+  origin?: "plan";
+  plan_kind?: string;
+  plan_certainty?: string;
 }
 
 type FlowStepName = (typeof DATA_FLOW_EDGE_RULE.steps)[number];
@@ -525,12 +566,18 @@ const FLOW_STEPS: Record<
   merge_mutual_pair: (edges, stats) => {
     // 权重按 (from,to) 聚合，键走 pairKey（无歧义的内部索引）——不用 `from>to` 拼串再 split，
     // 否则 id 含 `>` 时端点会被切碎（R1-ZS-002 的同类写法，本文件内一并对齐）
-    const weightOf = new Map<string, { from: string; to: string; weight: number }>();
+    const weightOf = new Map<string, { from: string; to: string; weight: number; origin?: "plan"; plan_kind?: string; plan_certainty?: string }>();
     for (const e of edges) {
       const k = pairKey(e.from, e.to);
       const cur = weightOf.get(k);
       if (cur !== undefined) cur.weight += e.weight;
-      else weightOf.set(k, { from: e.from, to: e.to, weight: e.weight });
+      else
+        weightOf.set(k, {
+          from: e.from,
+          to: e.to,
+          weight: e.weight,
+          ...(e.origin === "plan" ? { origin: "plan" as const, plan_kind: e.plan_kind, plan_certainty: e.plan_certainty } : {}),
+        });
     }
     const handled = new Set<string>();
     const out: FlowStepEdge[] = [];
@@ -538,7 +585,8 @@ const FLOW_STEPS: Record<
       if (handled.has(key)) continue;
       const { from, to, weight } = cur;
       const rev = pairKey(to, from);
-      const wRev = weightOf.get(rev)?.weight ?? 0;
+      const revEntry = weightOf.get(rev);
+      const wRev = revEntry?.weight ?? 0;
       handled.add(key);
       const mutual = wRev > 0;
       if (mutual) {
@@ -546,11 +594,16 @@ const FLOW_STEPS: Record<
         stats.merged_mutual_pairs++;
       }
       const flip = wRev > weight;
+      // 规划边标记保真（2026-10-05）：单条规划边与**纯规划对**（两侧都是规划边）归并后仍带 plan
+      // 标记（对内取 cur 侧的类型；同一对节点的两条规划关系归并成一条，方向按权重规则，类型如实择一）。
+      // 混合对（一侧静态一侧规划）按静态身份出——归并边里确实有实测 import，读侧文案按静态口径。
+      const keepPlan = cur.origin === "plan" && (!mutual || (revEntry !== undefined && revEntry.origin === "plan"));
       out.push({
         from: flip ? to : from,
         to: flip ? from : to,
         weight: weight + wRev,
         ...(mutual ? { bidirectional: true as const } : {}),
+        ...(keepPlan ? { origin: "plan" as const, plan_kind: cur.plan_kind, plan_certainty: cur.plan_certainty } : {}),
       });
     }
     return out;
@@ -603,10 +656,13 @@ export function selectDataFlowEdges(
   const roleOf = (id: string) => roles.get(id) ?? flowRoleOf(inDeg.get(id) ?? 0, outDeg.get(id) ?? 0);
 
   // ── 按 DATA_FLOW_EDGE_RULE.steps 的顺序逐步过滤（顺序换不得：先归并再翻转）──
+  // 规划边标记（origin/plan_kind/plan_certainty）全程随边保真（2026-10-05：读侧不许把声明关系
+  // 冒充成实测静态 import）。
   let stepped: FlowStepEdge[] = edges.map((e) => ({
     from: e.from,
     to: e.to,
     weight: e.weight,
+    ...(e.origin === "plan" ? { origin: "plan" as const, plan_kind: e.plan_kind, plan_certainty: e.plan_certainty } : {}),
   }));
   for (const step of DATA_FLOW_EDGE_RULE.steps) stepped = FLOW_STEPS[step](stepped, stats);
 
@@ -616,6 +672,7 @@ export function selectDataFlowEdges(
     to: e.to,
     weight: e.weight,
     ...(e.bidirectional ? { bidirectional: true as const } : {}),
+    ...(e.origin === "plan" ? { origin: "plan" as const, plan_kind: e.plan_kind, plan_certainty: e.plan_certainty } : {}),
     color_role: edgeColorRoleOf(roleOf(e.from)), // 上游 = 渲染方向起点 = 数据提供者
   }));
   // 渲染顺序确定化（与 E_ALL 同口径：权重降序 → id 升序），保证重渲染边序稳定
@@ -772,7 +829,8 @@ export function mergePlanningLayer(graph: SharedGraph, layer: PlanLayerInput): S
     const key = pairKey(from, to);
     if (seen.has(key)) continue; // 同一对节点已有静态边：不重复画（规划关系不改变静态依赖口径）
     seen.add(key);
-    edges.push({ from, to, weight: 1, origin: "plan" });
+    // 2026-10-05：原关系类型/确定性随边保真带出（读侧据此区分「声明的规划关系」与「实测 import」）
+    edges.push({ from, to, weight: 1, origin: "plan", plan_kind: e.kind, plan_certainty: e.certainty });
   }
 
   return { ...graph, nodes, edges };

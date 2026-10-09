@@ -9,7 +9,8 @@
 //      `classifyPlanRegions` 的注释里，机器可判，不靠"看标题猜"。三类：
 //        · 任务定义区 = 第一张表头同时含「卡号/依赖/完成证据」的表（同一张表里**除「状态」列**以外
 //          的单元格）+ 表内每个卡号对应的 `###` 卡片小节正文（**除**「**施工备注**」段与勾选位）；
-//        · 派生状态区 = 那张表的「状态」列 + 卡片小节的「**施工备注**」段 + 检查项行的勾选位
+//        · 派生状态区 = 那张表的「状态」列 + 卡片小节的「**施工备注**」独立段（判据见 `isStateParagraph`：
+//          **以**状态标签开头、且不含勾选位；段落里只是提到状态/备注不整段剔除）+ 检查项行的勾选位
 //          （`- [x]` 的 x）。判据：DESIGN.md §2.6「tasks/progress 与 PLAN 标记的状态区是兼容投影」，
 //          它们的唯一写入者是状态投影，因此**不进定义哈希**；
 //        · 历史归档区 = 其余全部（表头缺必需列的表、标题不以表内卡号开头的小节，如
@@ -44,6 +45,7 @@ import {
   type PlanTask,
 } from "./planValidate";
 import { WorkError } from "./types";
+import { memoizedForDerivation } from "./derivationScope";
 
 // 卡号形态判据 2026-09-21 下沉到 planValidate（激活校验与导入路径共用同一份）；此处转发再导出，旧导入方零改动。
 export { CARD_ID_RE, isCardIdToken } from "./planValidate";
@@ -296,17 +298,45 @@ function paragraphs(lines: string[]): { text: string; start: number; end: number
   return out;
 }
 
-/** 卡片小节里哪些段落是派生状态段（「**施工备注**」一类） */
+/**
+ * 段落第一个非空行去掉引用块前缀与列表符后的**行首加粗字段标签**（`**X**：`）；不是这一形态时 null。
+ * 只认行首（字段位），不认段落中间出现的强调文字——判据与 `isFieldLabelBoundary` 的「字段位」同源。
+ */
+function leadingBoldFieldLabel(text: string): string | null {
+  const firstLine = text.split("\n").find((l) => l.trim() !== "") ?? "";
+  const stripped = firstLine.replace(/^\s*(?:>\s*)*/, "").replace(/^\s*[-*+]\s+/, "");
+  // 标签本体可带很长的括注、甚至括注内还有 `**强调**`（`**施工备注（…且**被中断后续跑**、…）**：`），
+  // 故取「从行首 `**` 到本行第一个 `**：`」之间的全部文字当标签——与旧口径「按前缀正则判长括注」同义，
+  // 但**锚定在行首字段位**（不再匹配段落中间出现的强调文字）。
+  const m = /^\*\*([^\n]*?)\*\*\s*[：:]/.exec(stripped);
+  return m === null ? null : m[1];
+}
+
+/**
+ * 卡片小节里哪些段落是**独立**的派生状态段（「**施工备注**」一类）。
+ *
+ * 判据（2026-10-08 修正，共同机制、不为单卡特判），对齐 DESIGN §2.6
+ * 「派生状态区 = 状态列 + 卡片小节的「施工备注」段 + 检查项行的勾选位」：
+ *   ① 段落**以**状态标签开头——去引用块前缀后，行首字段标签**归一后恰为** `施工备注`/`备注`/`状态`
+ *      （标签可带长括注：`**施工备注（2026-09-20 交付；证据 …）**：` → `施工备注`）；
+ *      非加粗的引用块写法 `> 施工备注（U2 落地时补…）：…` 按同一判据判（`>` 前缀只影响排版）。
+ *   ② 段落里没有勾选位行（`- [ ]`/`- [x]`）——勾选位是**行级**派生位；整段不因“状态字样”剔除，
+ *      否则验收列表里一条谈状态/备注的义务会把同段其它验收条一起吞掉。
+ *
+ * 旧口径（“段落里出现 `**…状态…：`/`**…备注…：` 就把整段剔除”，含 `.includes()` 子串匹配）会把
+ * **不是独立状态段的定义内容**一并吞掉，实测：① V09-09 十条检查因正文含 `**文档／状态／蓝图三方同步**：`
+ * 整段被剔除（零 checkbox）；② V06-03/05/10 的「契约对齐登记」与 V06-13 的「状态口径」段因正文尾部/标题
+ * 含 `状态`二字被误剔。新口径下这些定义回到定义区，而真正的「**施工备注**」独立段（含引用块/长括注）照旧排除。
+ */
 function isStateParagraph(text: string): boolean {
-  // 标签常带很长的括注（`**施工备注（2026-09-20 交付；证据 `.工作台/…`，流水 PROGRESS 同日条）**：`），
-  // 故按**前缀**正则判，不用整段等值——否则长括注的施工备注会被当成定义内容。
-  if (/\*\*\s*(施工备注|备注|状态)[^*]*\*\*\s*[：:]/.test(text)) return true;
-  const labels = [...text.matchAll(FIELD_LABEL_RE)].map((m) => m[1]);
-  if (labels.some((l) => STATE_LABEL_HINTS.some((h) => l.includes(h)))) return true;
-  // 无标签但以「备注」开头的段落同样按状态段处理（不猜内容，只按标签/前缀判）
-  // V08-04：**引用块里的备注也是备注**（`> 施工备注（U2 落地时补，卡片内容未改）：…`）——
-  // 引号前缀只影响排版，不影响"这是派生状态段"这件事；去掉前导 `>` 后按同一判据判
-  //（标签与冒号之间的括注同样允许，与上面 `**施工备注（…）**：` 那条口径一致）。
+  // ② 带勾选位的段落是验收列表——勾选位逐行是派生位，段落整体不整段当派生状态段
+  for (const line of text.split("\n")) {
+    if (/^\s*[-*]\s*\[[xX ]\]/.test(line)) return false;
+  }
+  // ① 行首加粗标签归一后恰为状态标签（归一去掉尾随长括注）
+  const bold = leadingBoldFieldLabel(text);
+  if (bold !== null && STATE_LABEL_HINTS.includes(normalizeFieldLabel(bold))) return true;
+  // ①′ 无加粗的引用块写法 `> 施工备注（…）：…`（去引用块前缀后按同一前缀判据判）
   const stripped = text.replace(/^\s*(?:>\s*)+/, "");
   return /^\s*(备注|施工备注|状态)\s*(?:[（(][^）)\n]*[）)])?\s*[：:]/.test(stripped);
 }
@@ -356,6 +386,34 @@ function requirementMapTableRanges(lines: string[]): { start: number; end: numbe
     if (!text.startsWith("|")) continue;
     if (requirementMapHeaderCols(text) === null) continue;
     // 下一行必须是 Markdown 分隔行（|---|），否则不当表处理
+    if (!/^\|?[\s:|-]+\|?$/.test((lines[i + 1] ?? "").trim())) continue;
+    let end = i + 2;
+    while (end < lines.length && (lines[end] ?? "").trim().startsWith("|")) end++;
+    out.push({ start: i + 1, end });
+    i = end - 1;
+  }
+  return out;
+}
+
+// ── 功能→任务/检查/集成映射表（B2/V09-52／DESIGN.md §2.5.2，PLAN 侧）──
+
+/**
+ * 表头判定：同时含「功能 ID」「承接卡」两列的表＝功能映射表（B2/V09-52）。
+ * 不含「需求」列，故与需求映射表（含「需求」「承接卡」）**不重叠**、各归各的判据。
+ */
+function isFunctionalMapHeader(line: string): boolean {
+  const text = line.trim();
+  if (!text.startsWith("|")) return false;
+  const cells = text.replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+  return cells.some((c) => c.includes("功能 ID")) && cells.some((c) => c.includes("承接卡"));
+}
+
+/** 文档里全部功能映射表的行范围（含表头与分隔行；1-based，供区边界判定） */
+function functionalMapTableRanges(lines: string[]): { start: number; end: number }[] {
+  const out: { start: number; end: number }[] = [];
+  for (let i = 0; i < lines.length - 1; i++) {
+    if (!isFunctionalMapHeader(lines[i] ?? "")) continue;
+    // 下一行必须是 Markdown 分隔行（|---|），否则不当表处理（与需求映射表同一口径）
     if (!/^\|?[\s:|-]+\|?$/.test((lines[i + 1] ?? "").trim())) continue;
     let end = i + 2;
     while (end < lines.length && (lines[end] ?? "").trim().startsWith("|")) end++;
@@ -420,8 +478,9 @@ export function requirementMapForCards(rows: readonly RequirementMapRow[]): Map<
  *
  * 判据（逐条可复算，不靠标题名字猜）：
  *   1. 表内行 = 任务定义区（除「状态」列）——列级的派生位另记在 `state_columns`；
- *   2. 标题首个 token 等于表内某卡号的小节 = 任务定义区；小节内带「施工备注/备注/状态」标签的
- *      段落 = 派生状态区；
+ *   2. 标题首个 token 等于表内某卡号的小节 = 任务定义区；小节内**以「施工备注/备注/状态」标签开头
+ *      且不含勾选位**的**独立**段落 = 派生状态区（判据见 `isStateParagraph`；段落里只是提到状态/备注、
+ *      或与验收勾选位同段时**不**整段剔除）；
  *   2′. **需求映射表**（V09-03／附录 E.2-5：表头同时含「需求」「承接卡」列的表）= 任务定义区——
  *      改映射改变施工定义哈希，被承接卡的任务定义哈希也随之变（`requirement_ids` 进 canonical）；
  *   3. 其它表（表头不同时含「卡号/依赖/完成证据」、也非需求映射表）= 历史归档区（解析器不读）；
@@ -457,6 +516,20 @@ export function classifyPlanRegions(markdown: string): PlanRegionMap {
     regions.push({
       kind: "definition",
       reason: "需求映射表（表头同时含「需求」「承接卡」列）：进施工定义区——改映射改变施工定义哈希，被承接卡重新受检（附录 E.2-5）",
+      line_start: range.start,
+      line_end: range.end,
+      task_ids: [],
+      shape: "table",
+    });
+  }
+
+  // B2/V09-52（DESIGN.md §2.5.2，PLAN 侧）：功能→任务/检查/集成映射表（表头同时含「功能 ID」「承接卡」）进施工定义区——
+  // 改功能映射/必需检查/集成检查改变施工定义哈希；「结果状态」是**派生列**，不进定义哈希（definitionOnlyText 逐列剔除）。
+  // **向后兼容**：既有项目 PLAN 无此类表 ⇒ 定义区不变、定义哈希逐字不变。
+  for (const range of functionalMapTableRanges(lines)) {
+    regions.push({
+      kind: "definition",
+      reason: "功能→任务/检查/集成映射表（表头同时含「功能 ID」「承接卡」列）：进施工定义区——改映射/必需/集成改变施工定义哈希（DESIGN.md §2.5.2）",
       line_start: range.start,
       line_end: range.end,
       task_ids: [],
@@ -584,14 +657,27 @@ export function definitionOnlyText(markdown: string, map = classifyPlanRegions(m
       if (col.includes(PLAN_COLUMN_STATE)) stateCols.add(idx);
     });
   }
+  /** 表区首行（表头）的单元格（用于按表自己的表头剔除派生列） */
+  const headerCellsOf = (region: PlanRegion): string[] =>
+    (lines[region.line_start - 1] ?? "")
+      .trim()
+      .replace(/^\||\|$/g, "")
+      .split("|")
+      .map((c) => c.trim());
   const out: string[] = [];
   for (const region of map.regions) {
     if (region.kind !== "definition") continue;
+    // B2/V09-52：功能映射表的「结果状态」是**派生列** ⇒ 按**该表自己的表头**剔除含「状态」的列；
+    // 其余表（卡表 / 需求映射表）沿用既有口径（`map.table` 的 `状态` 列索引）——既有项目定义哈希逐字不变。
+    const isFunctionalMap = region.shape === "table" && isFunctionalMapHeader(lines[region.line_start - 1] ?? "");
+    const blankCols = isFunctionalMap
+      ? new Set(headerCellsOf(region).map((c, idx) => (c.includes(PLAN_COLUMN_STATE) ? idx : -1)).filter((idx) => idx >= 0))
+      : stateCols;
     for (let i = region.line_start; i <= region.line_end; i++) {
       let text = lines[i - 1] ?? "";
-      if (region.shape === "table" && stateCols.size > 0 && text.trim().startsWith("|")) {
+      if (region.shape === "table" && blankCols.size > 0 && text.trim().startsWith("|")) {
         const cells = text.trim().slice(1, -1).split("|");
-        for (const col of stateCols) {
+        for (const col of blankCols) {
           if (col < cells.length) cells[col] = " ";
         }
         text = `|${cells.join("|")}|`;
@@ -786,6 +872,54 @@ export interface ImportTaskOptions {
  *     并逐条进 `report.tasks[].missing_fields`——不编造、不用默认值冒充。
  */
 export function importTaskDefinitions(markdown: string, options: ImportTaskOptions = {}): TaskImportResult {
+  // 2026-10-07 运行时阻塞修复：同一份图纸正文 + 同一组调用方选项在**一次派生**内只解析一次。
+  // 现场实测一次六图派生里同一份 PLAN 被 `importTaskDefinitions` 重解析 18 次（占该次派生 CPU 约三成）。
+  // 键 = 正文内容哈希 + 全部调用方选项的**稳定完整**序列化（见 `stableOptionsKey`；选项不同即另算）；
+  // 作用域随本次调用结束即丢、**跨请求不缓存**——所以正文一变（新的内容哈希）下一次调用立刻重解析，
+  // 判据与结果逐字段不变。
+  const key = `${sha256Hex(markdown)}\u0000${stableOptionsKey(options)}`;
+  const hit = memoizedForDerivation("plan:import-definitions", key, () =>
+    importTaskDefinitionsUncached(markdown, options),
+  );
+  // 返回**深独立副本**：definitions 的元素与 report 都在调用方之间不共享（改它不会串到同一派生的
+  // 别处、也不会回写记忆）——与不引入复用时的可见行为一致。
+  return { definitions: structuredClone(hit.definitions), report: structuredClone(hit.report) };
+}
+
+/**
+ * `ImportTaskOptions` 的**稳定、完整**序列化：对象键**递归**排序、数组保持原序、null/原始值按 JSON 语义。
+ *
+ * 为什么不能用 `JSON.stringify(options, Object.keys(options).sort())`：那个数组形式的 replacer 是**全层**
+ * 属性白名单——它只保留名字出现在该数组里的属性，**任何层**都如此。于是 `revisions` / `requirement_ids`
+ * 这类**嵌套**对象（键是卡号）会被清成 `{}`：`revisions{V99-1:2}` 与 `revisions{V99-1:1}` 生成同一个键，
+ * 选项不同也命中同一条记忆 → 返回错误的修订号与需求 id（真实反例见
+ * `E/runtime-final/ROOT-OPTIONS-ACTUAL.json`）。
+ */
+function stableOptionsKey(value: unknown): string {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "number":
+      return Number.isFinite(value) ? String(value) : "null";
+    case "boolean":
+      return value ? "true" : "false";
+    case "string":
+      return JSON.stringify(value);
+    default:
+      break;
+  }
+  if (Array.isArray(value)) return `[${value.map(stableOptionsKey).join(",")}]`;
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    return `{${Object.keys(obj)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableOptionsKey(obj[k])}`)
+      .join(",")}}`;
+  }
+  // undefined / function / symbol 这类不进选项的取值——统一当 "null"，与 JSON.stringify 的取舍一致
+  return "null";
+}
+
+function importTaskDefinitionsUncached(markdown: string, options: ImportTaskOptions = {}): TaskImportResult {
   const map = classifyPlanRegions(markdown);
   const lines = markdown.split(/\r?\n/);
   const table = map.table;

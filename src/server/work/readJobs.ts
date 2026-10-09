@@ -18,9 +18,11 @@ import { graphSummaryOf } from "../../arch/sixGraphs";
 import { readSyncStatus, SYNC_INBOX_REL, planSyncScan, prepareSyncEvidenceCheck, prepareClaimSyncGate, type SyncScanPlan, type SyncEvidencePreparation, type SyncClaimGatePrep } from "./sync";
 import type { LedgerContentFingerprint, WorkCommand } from "./types";
 import { activeBaseline, loadDocument } from "./documents";
+import { readFeatureLedger, type FeatureLedgerParams, type FeatureLedgerResult } from "./featureLedger";
 import { graphInputsOf } from "./syncGraph";
 import type { SyncStatusReport } from "../../shared/syncEvidence";
 import { computeArchBlueprintRead, computeArchRenderRead } from "./archReadWorker";
+import { withDerivationScope } from "./derivationScope";
 
 const WORKBENCH = ".工作台";
 
@@ -63,7 +65,7 @@ function sameLedgerContent(a: LedgerContentFingerprint | null, b: LedgerContentF
 const EVENTS_REL = `${WORKBENCH}/work/events.jsonl`;
 
 /** 只读作业种类（worker 协议的一部分；新增须同步 `readWorker.ts` 的分派与宿主路由） */
-export type ReadJobKind = "entry" | "sync_status" | "sync_scan" | "sync_prep" | "arch_blueprint" | "arch_render";
+export type ReadJobKind = "entry" | "sync_status" | "sync_scan" | "sync_prep" | "arch_blueprint" | "arch_render" | "feature_ledger";
 
 export interface EntryReadArgs {
   projectId: string;
@@ -72,6 +74,15 @@ export interface EntryReadArgs {
   input: ProjectEntryInput;
   /** V09-34：是否附前置说明（默认不加，保持九字段契约） */
   preconditions?: boolean;
+  /**
+   * V09-53（B3/§2.7）：是否随入口附**逐 check 工作包**。默认 **false/缺省**＝不附，
+   * 宿主只读入口的既有回包契约为**逐字不变**（不新增字段）；调用方（MCP `project_entry`）显式索取时才附加。
+   */
+  workPackage?: boolean;
+  /** V09-53：工作包分页（只在 `workPackage=true` 时生效）；游标绑定 `package_revision` 与本次请求 */
+  workPackagePaging?: { limit?: number; cursor?: string; offset?: number };
+  /** V09-53：调用方持有的 `package_revision`（不符即工作包显式 `REVISION_CHANGED`） */
+  workPackageExpectedRevision?: string;
   /** 宿主进程自己的后台发现错误（产品路径不传＝读本进程汇；仅供测试显式注入） */
   syncDiscoveryIssues?: string[];
 }
@@ -204,21 +215,33 @@ export function computeEntryView(args: EntryReadArgs): EntryView {
     }
     const sharedOpt = snapshot === null ? {} : { events: snapshot };
 
-    // 入口：喂同一份快照（含同步判据；`sync_summary` 与宿主读口同源）。
-    const entry = evaluateProjectEntry(input, {
-      dataDir,
-      ...sharedOpt,
-      ...(args.preconditions === true ? { preconditions: true } : {}),
-      ...(args.syncDiscoveryIssues === undefined ? {} : { syncDiscoveryIssues: args.syncDiscoveryIssues }),
+    // 入口与图摘要同属**一次**派生：用同一个只读复用作用域包住（六图摘要此前自带作用域，二者各自
+    // 重读同一批图纸/源清单——实测一次只读入口里 `verifySourceManifest` 被整份重算两次、共 1718 次读盘）。
+    // 注意：`sourceIdentityOf`/`ledgerIdentityOf` 的**前后复核**在作用域**之外**现读，保真"计算期间源变过"
+    // 的判据——复用只覆盖同一次派生里同一瞬间的重复现读，不跨请求、不吞掉回包前的重读。
+    const { entry, graphSummary } = withDerivationScope(() => {
+      const entryInScope = evaluateProjectEntry(input, {
+        dataDir,
+        ...sharedOpt,
+        ...(args.preconditions === true ? { preconditions: true } : {}),
+        // V09-53（B3/§2.7）：逐 check 工作包与入口同一份 `facts.obligations` 派生——同一次现读快照，
+        // 因此宿主只读入口也能一次带回「入口 + 图 + 同步 + 逐项工作包」四者同版。默认不附（既有契约逐字不变）。
+        ...(args.workPackage === true ? { work_package: true } : {}),
+        ...(args.workPackage === true && args.workPackagePaging !== undefined ? { work_package_paging: args.workPackagePaging } : {}),
+        ...(args.workPackage === true && args.workPackageExpectedRevision !== undefined
+          ? { work_package_expected_revision: args.workPackageExpectedRevision }
+          : {}),
+        ...(args.syncDiscoveryIssues === undefined ? {} : { syncDiscoveryIssues: args.syncDiscoveryIssues }),
+      });
+      // 图摘要：同一份快照（与整图同一份事实与判据；唯一例外是快照读不出——那时图自己现读，如实算）。
+      let graphSummaryInScope: unknown;
+      try {
+        graphSummaryInScope = graphSummaryOf(projectId, { dataDir, ...sharedOpt });
+      } catch (e) {
+        graphSummaryInScope = graphSummaryFallback(projectId, e instanceof Error ? e.message : String(e));
+      }
+      return { entry: entryInScope, graphSummary: graphSummaryInScope };
     });
-
-    // 图摘要：同一份快照（与整图同一份事实与判据；唯一例外是快照读不出——那时图自己现读，如实算）。
-    let graphSummary: unknown;
-    try {
-      graphSummary = graphSummaryOf(projectId, { dataDir, ...sharedOpt });
-    } catch (e) {
-      graphSummary = graphSummaryFallback(projectId, e instanceof Error ? e.message : String(e));
-    }
 
     // ── 回包前**必要源复核**：账本正文 + 设计/施工/基线/图输入前后（逐字节）比对 ──
     const after = sourceIdentityOf(projectId, dataDir);
@@ -339,6 +362,27 @@ export interface ArchReadArgs {
   projectId: string;
   /** 仅 arch_render 用：全量上限（同一 builder 的另一组参数） */
   full?: boolean;
+  /** 仅 arch_render 用（2026-10-08 五图补齐）：并入已发布规划层，与 MCP 同名图同源。缺省 = 旧静态口径 */
+  planning?: boolean;
+}
+
+/**
+ * 功能清单只读读口作业参数（V09-52 / DESIGN §6.12，2026-10-07 运行时负载修复）。
+ *
+ * 为什么进 worker：设计页每 5s 轮询 `GET /api/projects/:id/feature-ledger`，此前该路由在**主线程内联**
+ * 跑（一次现读派生 2–7s）——主线程事件循环被它占住，同为主线程服务的 `/api/work/health` 与
+ * `/api/work/entry` 请求排队（实测 60s UI 负载窗口 health 8/11、entry 4/5 超预算）。
+ * 判据/参数/错误语义与 HTTP 内联路径**逐字同一份**（worker 调同一个 `readFeatureLedger`）。
+ */
+export interface FeatureLedgerReadArgs {
+  projectId: string;
+  dataDir: string;
+  /** 已由宿主 `parseFeatureLedgerParams` 严格校验过的参数（worker 侧读口会再核一次，同判据） */
+  params: FeatureLedgerParams;
+  /** 项目是否注册（宿主按 `getProject` 判；读口据此走 404，与内联路径同一口径） */
+  projectExists: boolean;
+  /** 调用方显式给的 code 修订（生产读口不给= null，与内联路径一致） */
+  codeRevision?: string | null;
 }
 
 /**
@@ -378,7 +422,7 @@ export function computeSyncStatusView(args: SyncStatusReadArgs): SyncStatusRepor
 }
 
 /** 作业总数（同步性自检用） */
-export const READ_JOB_KINDS: readonly ReadJobKind[] = ["entry", "sync_status", "sync_scan", "sync_prep", "arch_blueprint", "arch_render"];
+export const READ_JOB_KINDS: readonly ReadJobKind[] = ["entry", "sync_status", "sync_scan", "sync_prep", "arch_blueprint", "arch_render", "feature_ledger"];
 
 /** 说明常量：worker/宿主读口引用的收件目录（对本模块之外只读，避免复制字符串） */
 export const READ_JOBS_SYNC_INBOX_REL = SYNC_INBOX_REL;
@@ -393,9 +437,20 @@ export function computeArchBlueprintJob(args: ArchReadArgs): unknown {
   return computeArchBlueprintRead(args.projectId);
 }
 
-/** 计算 arch render 只读图合成（UI 重；`full` 用同一 builder 的另一组上限） */
+/** 计算 arch render 只读图合成（UI 重；`full` 用同一 builder 的另一组上限；`planning` 并入已发布规划层） */
 export function computeArchRenderJob(args: ArchReadArgs): unknown {
-  return computeArchRenderRead(args.projectId, args.full === true);
+  return computeArchRenderRead(args.projectId, args.full === true, args.planning === true);
+}
+
+/**
+ * 计算功能清单只读投影（与 HTTP 内联路径**同一函数**：`readFeatureLedger`）。
+ * 读口自带的参数再校验、来源读取兜底、错误码映射一律照旧——本作业只换执行线程，不改判据。
+ */
+export function computeFeatureLedgerJob(args: FeatureLedgerReadArgs): FeatureLedgerResult {
+  return readFeatureLedger(args.projectId, args.dataDir, args.params, {
+    project_exists: () => args.projectExists,
+    code_revision: args.codeRevision ?? null,
+  });
 }
 
 /** 执行锁外准备作业（受信 worker/主线程共用）；抛 WorkError 时由协议带结构回执。 */
@@ -415,5 +470,6 @@ export function runReadJobLocal(kind: ReadJobKind, args: unknown): unknown {
   if (kind === "sync_prep") return runSyncPrepJob(args as SyncPrepArgs);
   if (kind === "arch_blueprint") return computeArchBlueprintJob(args as ArchReadArgs);
   if (kind === "arch_render") return computeArchRenderJob(args as ArchReadArgs);
+  if (kind === "feature_ledger") return computeFeatureLedgerJob(args as FeatureLedgerReadArgs);
   throw new Error(`未知只读作业种类：${String(kind)}（只认 ${READ_JOB_KINDS.join("/")}）`);
 }

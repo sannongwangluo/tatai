@@ -53,6 +53,10 @@ KEEP = os.environ.get("V0922_KEEP_TMP") == "1"
 # 主夹具项目 id：内置自建、只落临时区，经安装版后端 API 注册进隔离 home。
 MAIN_PROJECT = "v0922-ui-main"
 MAIN_BIG_CHILDREN = 50
+# 主夹具规划层：8 个能力分组 ＋ 8 张任务卡；全部锚到夹具里真实存在的静态模块 mod-01
+# （见 build_main_blueprint 说明：锚到实测模块只挂 plan_refs、不新建灰节点，技术详情图不被扰动）
+MAIN_CAP_COUNT = 8
+MAIN_PLAN_ANCHOR = "mod-01"
 VIEW = (1600, 950)
 
 passes = [0]
@@ -830,10 +834,57 @@ def build_main_tree(d):
 
 
 def make_main_fixture(tmp):
-    """主夹具：modules.json ＋磁盘真文件树（只落本脚本自建临时区）。"""
+    """主夹具：modules.json ＋磁盘真文件树 ＋**已发布规划图**（只落本脚本自建临时区）。"""
     d = make_fixture(tmp, MAIN_PROJECT, build_main_modules())
     build_main_tree(d)
+    arch = os.path.join(d, ".工作台", "arch")
+    with open(os.path.join(arch, "blueprint.json"), "w", encoding="utf-8") as f:
+        json.dump(build_main_blueprint(), f, ensure_ascii=False)
     return d
+
+
+def build_main_blueprint():
+    """主夹具的**已发布规划图**（`.工作台/arch/blueprint.json`，`publish.published=true`）。
+
+    为什么必须有：功能全景（能力分组）与施工依赖（任务节点）两张主视图的节点**只来自规划图**
+    （`GET /arch/blueprint` 的已发布蓝图经 `buildViewModel` 取节点）——夹具没有已发布蓝图时，
+    两张主视图只能落到「无规划」空态（`.react-flow__node=0`），而 step0 要求三主图节点非空。
+    原 `make_main_fixture` 只造 modules.json ＋磁盘真文件树（**缺规划层**），测试前提不成立；
+    这里补齐规划层，测试前提才成立（形状复用 `probe-v09-22-mainviews-installed.py` 的已发布蓝图语义，
+    去掉与本卡无关的 MCP 对照逻辑）。
+
+    规划节点用 `source_refs.kind="code_module"` 锚到夹具里**真实存在的静态模块**（`MAIN_PLAN_ANCHOR`）：
+    `mergePlanningLayer`（`.工作台` 规划层并入共用数据层的唯一合并点）命中实测模块时**只把规划 id
+    记进该静态节点的 `plan_refs`、不新建灰节点**——于是技术详情三图（module_map/data_flow/mind_map，
+    读 `?planning=1`）的节点集合与纯静态口（`/arch/render`，不带 planning）一致，step1/step5 的
+    「画布节点数 === 非规划 API 节点数」耦合不被扰动（否则规划灰节点会被追加进画布、把两条断言打红）。"""
+    ref = {"kind": "code_module", "path": MAIN_PLAN_ANCHOR, "locator": MAIN_PLAN_ANCHOR, "sha256": None}
+    nodes, edges = [], []
+    for i in range(1, MAIN_CAP_COUNT + 1):
+        k = "%02d" % i
+        nodes.append({"id": "plan:cap:%s" % k, "kind": "capability", "name": "能力 %s" % k,
+                      "source_refs": [dict(ref)], "related_ids": []})
+        nodes.append({"id": "plan:task:T%s" % k, "kind": "task", "name": "任务 T%s" % k,
+                      "source_refs": [dict(ref)], "related_ids": []})
+        # 任务 → 所属能力（task_design_ref）：让两张主视图有真实关系（非孤点），口径与 probe 夹具同源
+        edges.append({"source": "plan:task:T%s" % k, "target": "plan:cap:%s" % k,
+                      "kind": "task_design_ref", "source_refs": [], "certainty": "declared"})
+    return {
+        "version": 1, "baseline_id": "bl-v0922-ui-main-fixture",
+        "generator_version": "verify-v09-22-ui-installed.main-fixture",
+        "generated_at": "2026-01-01T00:00:00+08:00", "source_manifest": [],
+        "nodes": nodes, "edges": edges,
+        "coverage": {"design_sections": {"total": 0, "mapped": 0, "unmapped": []},
+                     "plan_tasks": {"total": MAIN_CAP_COUNT, "mapped": MAIN_CAP_COUNT, "unmapped": []},
+                     "code_modules": {"total": 1, "mapped": 1, "unmapped": []},
+                     "nodes_total": len(nodes), "nodes_kept": len(nodes),
+                     "edges_total": len(edges), "edges_kept": len(edges),
+                     "note": "V09-22 安装版 UI 验证主夹具：已发布规划图（能力/任务锚到夹具静态模块）"},
+        "omitted": [], "model_receipt": None,
+        "publish": {"published": True, "reason": None, "validated_at": "2026-01-01T00:00:00+08:00"},
+        "based_on": {"model_key": "v0922-ui-main-fixture", "full_key": "v0922-ui-main-fixture",
+                     "design_content_sha256": None, "plan_definition_sha256": None, "semantic": False},
+    }
 
 
 def register_project(backend, fid, name, path):

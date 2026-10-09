@@ -10,9 +10,10 @@
 //      note 留痕（2026-09-19 主人拍板）：首报带 note 落盘、再报不传 note 保留旧值、再报传新 note 覆盖
 //   ⑤ update_progress 改模块四色状态，progress.json 里 gate.current_step 未被动
 //   ⑥ select_project 的 project_id / path 两种入参各调一次
-//   ⑦ listTools 恰好 28 个（一期 8 + §6.4 两件 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 +
+//   ⑦ listTools 恰好 30 个（一期 8 + §6.4 两件 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 +
 //      V07-04 doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口 +
-//      V09-32/33/35 read_plan/expand_module + V09-39 project_index 逐个点名）；V06-10
+//      V09-32/33/35 read_plan/expand_module + V09-39 project_index + V09-41 task_brief +
+//      V09-47 preflight_task_result 逐个点名）；V06-10
 //      三件套的入参 schema 点到点 + 各真调一次（没有 v2 事实的窗口期：入口给只读结论，两个写口明确拒绝）；
 //      C-015 三件套（manage_requirement/manage_change/import_plan_definitions）的 schema 点到点与
 //      负例真链路在 verify-requirements.ts ⑧-5（96 条守着）、写口服务侧校验在 verify-c015-service.ts，
@@ -132,6 +133,18 @@ async function main(): Promise<void> {
   // 2026-10-03（统一优化 V09-39，DESIGN §6.8／契约 U5/U5.1）：持久项目说明索引 project_index，注册表 27 → 28。
   // 同一个口径（**逐个点名登记**、数量判据仍是"恰好"）。语义由 verify:unified-index 守；本脚本只做身份/集合断言。
   const V0939_TOOLS = ["project_index"];
+  // 2026-10-04（V09-41 紧凑简报 task_brief，独立集成复审 P1-1）：project_entry 的只读投影工具 task_brief，
+  // 注册表 28 → 29。同一个口径（**逐个点名登记**、数量判据仍是"恰好"，不从注册表动态生成期望）。
+  // 语义由 verify:task-brief（handler + 纯函数投影）守；本脚本只做身份/集合断言。
+  const V0941_TOOLS = ["task_brief"];
+  // 2026-10-06（P2/V09-47 只读预检 preflight_task_result，DESIGN §6.11）：结果提交前的**只读**预检入口，
+  // 注册表 29 → 30。同一个口径（**逐个点名登记**、数量判据仍是"恰好"，不从注册表动态生成期望）。
+  // 语义/反例由 verify:preflight-task-result（handler + 真宿主只读路由）守；本脚本只做身份/集合断言。
+  const V0947_TOOLS = ["preflight_task_result"];
+  // 2026-10-07（B2/V09-52 功能清单只读读口 feature_ledger，DESIGN §6.12）：同一 revision 事实快照 → 唯一义务派生
+  // → feature_item[]；注册表 30 → 31。同一个口径（**逐个点名登记**、数量判据仍是"恰好"）。
+  // 语义/反例由 verify:feature-ledger 守；本脚本只做身份/集合断言。
+  const V0952_TOOLS = ["feature_ledger"];
   ok(
     EXPECTED.every((n) => names.includes(n)) &&
       M5_TOOLS.every((n) => names.includes(n)) &&
@@ -144,6 +157,9 @@ async function main(): Promise<void> {
       V0927_TOOLS.every((n) => names.includes(n)) &&
       V0932_TOOLS.every((n) => names.includes(n)) &&
       V0939_TOOLS.every((n) => names.includes(n)) &&
+      V0941_TOOLS.every((n) => names.includes(n)) &&
+      V0947_TOOLS.every((n) => names.includes(n)) &&
+      V0952_TOOLS.every((n) => names.includes(n)) &&
       names.length ===
         EXPECTED.length +
           M5_TOOLS.length +
@@ -155,8 +171,11 @@ async function main(): Promise<void> {
           V0923_TOOLS.length +
           V0927_TOOLS.length +
           V0932_TOOLS.length +
-          V0939_TOOLS.length,
-    `listTools 恰含一期 8 个 + 扩充 2 个 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 + V07-04 doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口 + V09-32/33/35 两件 + V09-39 project_index（实际 ${names.length} 个）`,
+          V0939_TOOLS.length +
+          V0941_TOOLS.length +
+          V0947_TOOLS.length +
+          V0952_TOOLS.length,
+    `listTools 恰含一期 8 个 + 扩充 2 个 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 + V07-04 doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口 + V09-32/33/35 两件 + V09-39 project_index + V09-41 task_brief + V09-47 preflight_task_result + V09-52 feature_ledger（实际 ${names.length} 个）`,
   );
   ok(!names.includes("write_design"), "权限证伪②：listTools 不存在 write_design");
   ok(
@@ -336,20 +355,40 @@ async function main(): Promise<void> {
   const entryTool = tools.tools.find((t) => t.name === "project_entry");
   const entrySchema = schemaOf("project_entry");
   const entryProps = entrySchema.properties ?? {};
-  // 定向更新（V09-34，2026-10-03）：入参 schema 由 §6.7 的既有五字段 + 一个**可选 boolean** `preconditions`
-  //   变为恰好六字段。判据未放宽——仍是"恰好这几个键、多一个少一个都红"：
-  //     旧期望 ["client_capabilities","known_revision","project_id","resume_hint","role"]｜依据：§6.7 五字段
-  //     新期望 上述五项 + "preconditions"（type=boolean，默认 false 时**不改变**默认 entry 的既有业务字段）
-  //   `required` 不变（仍只 project_id/role），`additionalProperties:false` 仍由实现侧守住。
+  // 定向更新（V09-34，2026-10-03）：入参 schema 由 §6.7 的既有五字段 + 一个**可选 boolean** `preconditions`。
+  // 再定向更新（V09-53，2026-10-08 共同夹具修复批）：V09-53 逐 check 工作包读口并入 `project_entry`
+  //   后，入参又多了三个**可选**字段（`expected_revision` 包版本、`work_package_cursor` 分页游标、
+  //   `work_package_limit` 每页条数），schema 由六字段变**恰好九字段**。判据未放宽——仍是"恰好这几个键、
+  //   多一个少一个都红"；`required` 不变（仍只 project_id/role）、`additionalProperties:false` 由实现侧守住。
+  //   五要素留档：
+  //     旧期望 ["client_capabilities","known_revision","preconditions","project_id","resume_hint","role"]（恰 6）｜
+  //       依据：§6.7 五字段 + V09-34 的 preconditions
+  //     新期望 上述六项 + ["expected_revision","work_package_cursor","work_package_limit"]（恰 9）｜
+  //       依据：`src/mcp/tools/projectEntry.ts` 的 projectEntryTool.inputSchema（V09-53 同口径；
+  //       expected_revision 与功能清单读口一致，不符即 REVISION_CHANGED）
+  //     保留意图：入参面精确钉死，多一个少一个都红；语义/反例由 verify:unified-* / verify:feature-ledger 守。
   ok(
     entrySchema.required?.length === 2 &&
       entrySchema.required[0] === "project_id" &&
       entrySchema.required[1] === "role" &&
       Object.keys(entryProps).sort().join(",") ===
-        ["client_capabilities", "known_revision", "preconditions", "project_id", "resume_hint", "role"].join(",") &&
+        [
+          "client_capabilities",
+          "expected_revision",
+          "known_revision",
+          "preconditions",
+          "project_id",
+          "resume_hint",
+          "role",
+          "work_package_cursor",
+          "work_package_limit",
+        ].join(",") &&
       (entryProps.preconditions as { type?: string } | undefined)?.type === "boolean" &&
+      (entryProps.expected_revision as { type?: string } | undefined)?.type === "string" &&
+      (entryProps.work_package_cursor as { type?: string } | undefined)?.type === "string" &&
+      (entryProps.work_package_limit as { type?: string } | undefined)?.type === "number" &&
       (entryTool?.description ?? "").includes("只读"),
-    "V06-10 project_entry 入参 schema 点到点：原 §6.7 五字段 + V09-34 可选 boolean preconditions（恰 6）、required 仍仅 project_id/role、描述写明只读",
+    "V06-10 project_entry 入参 schema 点到点：§6.7 五字段 + V09-34 preconditions + V09-53 工作包三件（恰 9）、required 仍仅 project_id/role、描述写明只读",
   );
   const claimSchema = schemaOf("claim_task");
   const opEnum = ((claimSchema.properties?.op ?? {}) as { enum?: string[] }).enum ?? [];

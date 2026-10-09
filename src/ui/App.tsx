@@ -29,9 +29,11 @@ import { AddProjectDialog } from "./components/AddProjectDialog";
 import { AgentList } from "./components/AgentList";
 import { AcceptanceView } from "./components/AcceptanceView";
 import { ArchView } from "./components/ArchView";
+import { BuildIdentityPanel } from "./components/BuildIdentityPanel";
 import { ChangesEntry } from "./components/ChangesEntry";
 import { ChatView } from "./components/ChatView";
 import { DesignView } from "./components/DesignView";
+import { DeliveryOverview } from "./components/DeliveryOverview";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { LiveView } from "./components/LiveView";
 import { PlanView } from "./components/PlanView";
@@ -70,8 +72,9 @@ function crossFromHash(): boolean {
   return window.location.hash === CROSS_HASH;
 }
 
-/** 用户主导航：§3.1 的五页（终端不在其中） */
+/** 用户主导航：V09-62 起「交付总览」放首位（人的默认交付入口），其后是 §3.1 的既有五页（终端不在其中） */
 const MAIN_NAV: readonly [ViewKey, string][] = [
+  ["delivery", "交付总览"],
   ["arch", "项目图"],
   ["design", "设计书"],
   ["plan", "施工图"],
@@ -86,7 +89,7 @@ const AUX_NAV: readonly [ViewKey, string][] = [
 ];
 
 /** 上下文背景页（`overview` / `terminal` 两个辅助入口）里主区怎么铺 */
-const FULL_HEIGHT_VIEWS: readonly ViewKey[] = ["chat", "terminal", "arch", "live"];
+const FULL_HEIGHT_VIEWS: readonly ViewKey[] = ["chat", "terminal", "arch", "live", "delivery"];
 
 export default function App() {
   const { theme, toggleTheme } = useTheme();
@@ -108,7 +111,7 @@ export default function App() {
   const viewHostRef = useRef<HTMLDivElement>(null);
   // V06-08：页面/草稿/选中项/滚动位置按项目隔离。未选中时给一个永不显示的占位桶。
   const { scope, patch } = useProjectScope(selectedId ?? "__none__");
-  const view: ViewKey = selectedId === null ? "arch" : scope.view;
+  const view: ViewKey = selectedId === null ? "delivery" : scope.view;
 
   // 换项目/换页时把该「项目 + 页」的滚动位置放回去（内容还没渲染时下一帧再试一次）
   useEffect(() => {
@@ -291,6 +294,8 @@ export default function App() {
           title="塔台 Tatai · 杭州三农网络科技有限公司 · GNU AGPL-3.0"
         >
           <div className="tt-footer-top"><span>Tatai v{APP_VERSION}</span><button data-theme-toggle onClick={toggleTheme} aria-label={theme === "light" ? "切换夜间外观" : "切换浅色外观"} title={theme === "light" ? "切换夜间外观" : "切换浅色外观"} className="tt-theme-toggle"><span aria-hidden="true">{theme === "light" ? "◐" : "◑"}</span><span>{theme === "light" ? "夜间" : "浅色"}</span></button></div><span>杭州三农网络科技有限公司</span><span>GNU AGPL-3.0</span>
+          {/* P0/V09-45：界面诊断显示自身（ui）身份并与运行时后端身份对照偏斜（§4.6） */}
+          <BuildIdentityPanel />
         </div>
       </aside>
 
@@ -350,7 +355,9 @@ export default function App() {
                   : "flex flex-1 items-center justify-center overflow-y-auto"
               }
             >
-              {view === "overview" ? (
+              {view === "delivery" ? (
+                <DeliveryOverview key={selected.id} project={selected} onNavigate={(v, opts) => patch(opts?.liveSub !== undefined ? { view: v, liveSub: opts.liveSub } : { view: v })} />
+              ) : view === "overview" ? (
                 <ProjectOverview project={selected} />
               ) : view === "design" ? (
                 <DesignView project={selected} />

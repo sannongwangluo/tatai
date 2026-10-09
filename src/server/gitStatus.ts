@@ -1054,9 +1054,9 @@ export interface VerificationCheckBasis {
   check_id: string;
   task_id: string | null;
   /** 记录里声明的结果（原始值，未复核） */
-  result: "passed" | "failed";
+  result: "passed" | "failed" | "not_checked";
   /** 复核后的有效性（复用 V06-09 `checkEffectiveness`；证据不在册也在这里撤销通过） */
-  effective: "passed" | "failed" | "stale" | "unknown";
+  effective: "passed" | "failed" | "stale" | "unknown" | "not_checked";
   why: string;
   independence: "author_self" | "independent";
   actor_id: string;

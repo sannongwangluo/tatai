@@ -145,8 +145,9 @@ export function VersionReminder({ project }: { project: ProjectItem }) {
             setMerged(next.merged);
             return;
           }
-          // 跨页面实例（用户**重新打开项目**/刷新）遇到同一批：合并计数，但不重复展开
-          const next: BatchMemory = { fingerprint: fp, merged: memory.merged, page: PAGE_ID };
+          // 跨页面实例（用户**重新打开项目**/刷新）遇到同一批：这次探测**也是一次重复检测**，
+          // 照样进合并计数（V06-12 chk-02「重新打开…合并重复」），但不重复展开、也不翻批次判定。
+          const next: BatchMemory = { fingerprint: fp, merged: memory.merged + 1, page: PAGE_ID };
           writeJson(fingerprintKey, next);
           setMerged(next.merged);
           setBatchNew(false);

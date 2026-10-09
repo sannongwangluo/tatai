@@ -1,6 +1,6 @@
 // V09-22 返工（契约 1／3）：**未聚合并集取回** `archItemsOf` ＋ 无上限构建缓存 `unlimitedGraphOf`。
 //
-// 要解决的问题：六图的概览/全量两档都有"安全上限"（ARCH_LIMITS / RENDER_FULL / MCP_FULL），
+// 要解决的问题：六图的概览/全量两档都有"安全上限"（概览档上限 / RENDER_FULL / MCP_FULL，数值与口径见 config.ts），
 // 超限的节点/边被聚合成「还有 N 个」——**看得到却取不回**。本模块提供"上限外逐项可取"的读口：
 //   ① `unlimitedGraphOf`：与 `/arch/render` 同一 builder 管线（readModules → buildSharedGraphFrom
 //      → mergeSupplement），但上限用 `ARCH_UNLIMITED_LIMITS`（五维全 1e9，builder 不聚合/不截断/

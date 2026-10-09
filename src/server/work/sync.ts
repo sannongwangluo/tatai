@@ -26,14 +26,17 @@ import {
   syncContractSha256,
   validateSyncContract,
 } from "./syncContract";
+import { resolveProjectRelative } from "./documents";
 import {
   batchIdOfEvidenceFile,
   businessEventsFingerprint,
   evaluateBatch,
   SYNC_LOCK_REVIEW_MAX_BYTES,
+  SYNC_TARGET_MAX_BYTES,
   type BatchEvaluation,
   type EvalContext,
 } from "./syncChecks";
+import { buildRepairPlan, type RepairBatchInput, type TargetShaReader } from "./syncRepair";
 import { syncGraphProbe, syncGraphSourceProbe, type SyncGraphProbe, type SyncGraphProbeResult } from "./syncProbe";
 import {
   SYNC_BATCH_ID_RE,
@@ -44,7 +47,10 @@ import {
   SYNC_VERDICTS,
   type SyncBatchReport,
   type SyncContract,
+  type SyncEvidencePackage,
   type SyncItemVerdict,
+  type SyncRegisteredBy,
+  type SyncRepairPlan,
   type SyncStatusReport,
   type SyncVerdict,
 } from "../../shared/syncEvidence";
@@ -162,6 +168,39 @@ function realpathOrNull(p: string): string | null {
 function isInside(root: string, p: string): boolean {
   const rel = path.relative(root, p);
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+/**
+ * 只读**目标读器**（P3：修复计划/候选证据装配用；`syncRepair` 自己不碰 fs）：项目根内相对路径 → 当前
+ * **整文件** sha256。路径守卫（项目根内、非逃逸）、常规文件与大小上限与 `syncChecks` 同款；不可读/非法/
+ * 超界 → null（**不冒充一致**）。一次装配内按路径**去重缓存**（同一目标只读一遍）。
+ */
+function readTargetShaOf(projectId: string, dataDir: string): TargetShaReader {
+  let root: string | null = null;
+  try {
+    const project = getProject(projectId, dataDir);
+    if (project !== undefined) root = path.resolve(project.path);
+  } catch {
+    root = null;
+  }
+  const cache = new Map<string, string | null>();
+  return (rel: string): string | null => {
+    if (root === null) return null;
+    const hit = cache.get(rel);
+    if (hit !== undefined) return hit;
+    let out: string | null = null;
+    try {
+      const guard = resolveProjectRelative(root, rel);
+      if (guard.ok) {
+        const st = fs.statSync(guard.abs);
+        if (st.isFile() && st.size <= SYNC_TARGET_MAX_BYTES) out = crypto.createHash("sha256").update(fs.readFileSync(guard.abs)).digest("hex");
+      }
+    } catch {
+      out = null;
+    }
+    cache.set(rel, out);
+    return out;
+  };
 }
 
 /**
@@ -286,6 +325,8 @@ interface FoldedBatch {
   contract_sha256: string;
   registeredSeq: number;
   active: boolean;
+  /** 契约**登记事件**的角色/actor（只读修复计划的 registered_by；登记人≠责任人，仅作追溯） */
+  registered: SyncRegisteredBy;
 }
 interface SyncFold {
   batches: Map<string, FoldedBatch>;
@@ -310,7 +351,13 @@ function foldSync(events: readonly WorkEvent[]): SyncFold {
       if (existing.contract_sha256 !== sha) problems.push(`批次 ${contract.batch_id} 被重复登记且内容不同（坏领域事实，fail-closed）`);
       continue;
     }
-    batches.set(contract.batch_id, { contract, contract_sha256: sha, registeredSeq: e.seq, active: true });
+    batches.set(contract.batch_id, {
+      contract,
+      contract_sha256: sha,
+      registeredSeq: e.seq,
+      active: true,
+      registered: { role: typeof e.role === "string" ? e.role : "", actor_id: typeof e.actor_id === "string" ? e.actor_id : "" },
+    });
   }
   // supersede：被后来契约显式取代的批次 active=false（只作历史，不再阻断）
   const superseded = new Set<string>();
@@ -629,7 +676,17 @@ function worsenVerdict(a: SyncVerdict, b: SyncVerdict): SyncVerdict {
 }
 
 function emptyReport(projectId: string, configured: boolean, overall: SyncVerdict, scanError: string | null, collection: { complete: boolean; reasons: string[] }): SyncStatusReport {
-  return { project_id: projectId, configured, overall, checked_at: nowIso(), scan_error: scanError, batches: [], unregistered_evidence: [], collection };
+  return {
+    project_id: projectId,
+    configured,
+    overall,
+    checked_at: nowIso(),
+    scan_error: scanError,
+    batches: [],
+    unregistered_evidence: [],
+    collection,
+    repair_plan: buildRepairPlan({ projectId, batches: [], readTargetSha: () => null }),
+  };
 }
 
 /** 读口选项：可由**唯一宿主**注入**同一份**后台发现错误（MCP 另一进程跨进程复用宿主健康；见 syncHost helper）。 */
@@ -678,6 +735,8 @@ export function readSyncStatus(projectId: string, dataDir: string, opts: SyncRea
   const byBatch = new Map(inbox.files.map((f) => [f.batch_id, f]));
 
   const batches: SyncBatchReport[] = [];
+  // P3/V09-48：只对**现行**批次收集修复计划输入（同一次 evaluateBatch 结果，不重算；历史批次不参与）。
+  const repairInputs: RepairBatchInput[] = [];
   const liveHistorical = opts.liveHistorical === true;
   for (const [id, b] of fold.batches) {
     const ev = byBatch.get(id) ?? null;
@@ -735,6 +794,20 @@ export function readSyncStatus(projectId: string, dataDir: string, opts: SyncRea
       verified_at: null,
       items: evaluation.items,
     });
+    // 修复计划**只对现行批次**（即使显式 liveHistorical 复查了历史批次，也不给历史批次修复计划）。
+    if (b.active) {
+      repairInputs.push({
+        batch_id: id,
+        title: b.contract.title,
+        active: true,
+        blocks_entry: b.contract.blocks_entry,
+        contract: b.contract,
+        contract_sha256: b.contract_sha256,
+        registered_seq: b.registeredSeq,
+        registered_by: b.registered,
+        evaluation,
+      });
+    }
   }
   const unregistered = inbox.files
     .filter((f) => !fold.batches.has(f.batch_id))
@@ -764,6 +837,8 @@ export function readSyncStatus(projectId: string, dataDir: string, opts: SyncRea
     batches,
     unregistered_evidence: unregistered,
     collection: { complete: inbox.complete, reasons: inbox.reasons },
+    // P3/V09-48：只读修复计划（现行批次；同一份本次核验事实）。只读附加——不改任何门禁。
+    repair_plan: buildRepairPlan({ projectId, batches: repairInputs, readTargetSha: readTargetShaOf(projectId, dataDir) }),
   };
 }
 
@@ -796,12 +871,23 @@ function syncBlockFingerprint(rows: { batch_id: string; contract_sha256: string;
     .digest("hex");
 }
 
-function evaluateSyncBlock(projectId: string, dataDir: string, opts: SyncBlockOptions = {}): SyncBlockEval {
+interface SyncBlockCore {
+  block: SyncBlockInfo;
+  source_fingerprint: string;
+  repairInputs: RepairBatchInput[];
+}
+
+/**
+ * 阻断评估的**内核**（`withRepair=true` 时顺带收集修复计划输入；**阻断判据一字不改**）。
+ * 阻断只看 active+blocks_entry 批次；`withRepair=false`（claim/写口热路径）**不**评估非阻断现行批次，
+ * 行为与拆分前逐字一致。收集修复计划输入时对**全部现行批次**各评估一次（复用同一次 `evaluateBatch`）。
+ */
+function evaluateSyncBlockCore(projectId: string, dataDir: string, opts: SyncBlockOptions, withRepair: boolean): SyncBlockCore {
   let c: ProjectCtx;
   try {
     c = projectCtx(projectId, dataDir);
   } catch {
-    return { block: { configured: false, blocked: false, overall: "not_configured", batches: [] }, source_fingerprint: syncBlockFingerprint([], true, []) };
+    return { block: { configured: false, blocked: false, overall: "not_configured", batches: [] }, source_fingerprint: syncBlockFingerprint([], true, []), repairInputs: [] };
   }
   let events: readonly WorkEvent[];
   try {
@@ -810,6 +896,7 @@ function evaluateSyncBlock(projectId: string, dataDir: string, opts: SyncBlockOp
     return {
       block: { configured: true, blocked: true, overall: "invalid", batches: [{ batch_id: "<unreadable>", title: "同步域事实读不出", verdict: "invalid", reasons: [e instanceof Error ? e.message : String(e)] }] },
       source_fingerprint: "unreadable",
+      repairInputs: [],
     };
   }
   const fold = foldSync(events);
@@ -817,6 +904,7 @@ function evaluateSyncBlock(projectId: string, dataDir: string, opts: SyncBlockOp
     return {
       block: { configured: true, blocked: true, overall: "invalid", batches: [{ batch_id: "<corrupt>", title: "同步域事实损坏", verdict: "invalid", reasons: fold.problems }] },
       source_fingerprint: "corrupt",
+      repairInputs: [],
     };
   }
   const ctx = evalContext(c, events, opts.sourceOnly === true ? { sourceOnly: true } : {});
@@ -824,14 +912,32 @@ function evaluateSyncBlock(projectId: string, dataDir: string, opts: SyncBlockOp
   const byBatch = new Map(inbox.files.map((f) => [f.batch_id, f]));
   const blocking: SyncBlockBatch[] = [];
   const evalRows: { batch_id: string; contract_sha256: string; evaluation: BatchEvaluation }[] = [];
+  const repairInputs: RepairBatchInput[] = [];
   for (const [id, b] of fold.batches) {
-    if (!b.active || !b.contract.blocks_entry) continue;
+    if (!b.active) continue;
+    const gateRelevant = b.contract.blocks_entry;
+    if (!gateRelevant && !withRepair) continue;
     const ev = byBatch.get(id) ?? null;
     const evidence = ev === null ? null : { path: `${SYNC_INBOX_REL}/${ev.name}`, abs: ev.abs };
     const evaluation = evaluateBatch(b.contract, b.registeredSeq, evidence, ctx);
-    evalRows.push({ batch_id: id, contract_sha256: b.contract_sha256, evaluation });
-    if (evaluation.verdict !== "passed") {
-      blocking.push({ batch_id: id, title: b.contract.title, verdict: evaluation.verdict, reasons: [...evaluation.reasons, ...evaluation.items.filter((i) => i.required && i.verdict !== "passed").map((i) => `${i.id}:${i.verdict}`)] });
+    if (gateRelevant) {
+      evalRows.push({ batch_id: id, contract_sha256: b.contract_sha256, evaluation });
+      if (evaluation.verdict !== "passed") {
+        blocking.push({ batch_id: id, title: b.contract.title, verdict: evaluation.verdict, reasons: [...evaluation.reasons, ...evaluation.items.filter((i) => i.required && i.verdict !== "passed").map((i) => `${i.id}:${i.verdict}`)] });
+      }
+    }
+    if (withRepair) {
+      repairInputs.push({
+        batch_id: id,
+        title: b.contract.title,
+        active: true,
+        blocks_entry: b.contract.blocks_entry,
+        contract: b.contract,
+        contract_sha256: b.contract_sha256,
+        registered_seq: b.registeredSeq,
+        registered_by: b.registered,
+        evaluation,
+      });
     }
   }
   const configured = fold.batches.size > 0;
@@ -847,7 +953,23 @@ function evaluateSyncBlock(projectId: string, dataDir: string, opts: SyncBlockOp
   return {
     block: { configured, blocked: blocking.length > 0, overall: blocking.length > 0 ? worstVerdict(blocking.map((b) => b.verdict)) : configured ? "passed" : "not_configured", batches: blocking },
     source_fingerprint: syncBlockFingerprint(evalRows, inbox.complete, healthIssues),
+    repairInputs,
   };
+}
+
+function evaluateSyncBlock(projectId: string, dataDir: string, opts: SyncBlockOptions = {}): SyncBlockEval {
+  const core = evaluateSyncBlockCore(projectId, dataDir, opts, false);
+  return { block: core.block, source_fingerprint: core.source_fingerprint };
+}
+
+/**
+ * P3 / V09-48：**接续入口的同步段**——一次折叠 / 一次评估同时产出**阻断判据**与**只读修复计划**
+ * （复用**同一次** `evaluateBatch`：不再调一遍 `readSyncStatus`，同步全量评估**不翻倍**）。`project_entry`
+ * 的 `sync_summary` 用它；门禁判据与 `computeSyncBlock` 同一份（只多带 `repair_plan`）。
+ */
+export function evaluateEntrySync(projectId: string, dataDir: string, opts: SyncBlockOptions = {}): { block: SyncBlockInfo; repair_plan: SyncRepairPlan } {
+  const core = evaluateSyncBlockCore(projectId, dataDir, opts, true);
+  return { block: core.block, repair_plan: buildRepairPlan({ projectId, batches: core.repairInputs, readTargetSha: readTargetShaOf(projectId, dataDir) }) };
 }
 
 /** 接续阻断：active 且 blocks_entry 的批次未当前通过时列出差项（entry / claim / 写口同一份判据） */

@@ -46,18 +46,20 @@ import {
   OVERVIEW_MIN,
   PROJECT_VIEWS,
   PROJECT_VIEW_KEYS,
-  aggregateStatusOf,
   applyViewFilter,
+  canonicalScopeStatusOf,
   buildViewModel,
   capOverview,
   detailSectionsOf,
   directStatusOf,
   emptyStateOf,
   freshnessOf,
+  noStatusRecordOf,
   objectIdOf,
   scopeReportOf,
   technicalIdOf,
   type ProjectViewKind,
+  type ViewNode,
 } from "../src/ui/arch/projectGraph";
 
 const REPO = process.cwd();
@@ -879,10 +881,28 @@ ok(
   sections[4].lines.some((l) => l.includes("技术详情对应 id")) || sections[4].lines.some((l) => l.includes("没有对应节点")),
   "第⑤段给出技术资料（技术详情对应 id / 实测模块出处）",
 );
-const unmappedNode =
-  [...vmArchitecture.nodes, ...vmFunctional.nodes].find(
-    (n) => n.status.display === null && n.status.unmapped_reason !== undefined,
-  ) ?? vmFunctional.nodes[0];
+// V09-55 定向更新：能力成员账目统一后，本夹具的能力分组都至少有一个有状态结论的成员
+// （功能全景与系统架构对同一能力给同一账目），因此三视图里可能**没有**「display=null 且带原因」
+// 的分组节点——旧写法找不到就退回 `vmFunctional.nodes[0]`（那时它是未映射的能力），会让这条断言
+// 名不副实。现在显式找一个真正未映射的节点；本夹具没有时，用**声明模块**的真实派生状态
+// （`noStatusRecordOf`：没有任务通过实现映射指向它 ⇒ 无状态记录）合成一个节点，属性仍是真判据。
+const foundUnmapped = [...vmArchitecture.nodes, ...vmFunctional.nodes, ...vmConstruction.nodes].find(
+  (n) => n.status.display === null && n.status.unmapped_reason !== undefined,
+);
+const unmappedNode: ViewNode =
+  foundUnmapped ??
+  {
+    id: "plan:mod:02-01",
+    label: "记录模块",
+    kind: "module",
+    group_key: null,
+    members: [],
+    hidden_members: 0,
+    status: noStatusRecordOf("plan:mod:02-01"),
+    sources: [],
+    technical_id: null,
+    capability_class: null,
+  };
 const unmappedSections = detailSectionsOf({ node: unmappedNode, blueprint: bp, view_notes: vmFunctional.notes });
 // V08-02 C1 定向更新（判据**收紧**，未放宽）：「未映射」原来是一刀切文案，
 // 现在按真实原因分开说（本视图暂无状态来源／对象未映射／没有关联成员／成员都没有状态结论／无状态记录）。
@@ -905,23 +925,18 @@ ok(
   "没有投影时第④段明说「没有验证结论可展示」，不拿空集当通过",
 );
 
-section("⑦ 汇总口径：能力节点永不汇总成绿（fail-closed）");
-const allGreen = [
-  { ...projection["T-4"], object_id: "x1", display_status: "verified" as const, mapping: "mapped" as const },
-  { ...projection["T-4"], object_id: "x2", display_status: "verified" as const, mapping: "mapped" as const },
-];
-const agg = aggregateStatusOf(allGreen);
+section("⑦ 能力状态只读 canonical 义务层投影（本层不判绿）");
+const canon = (display: string | null, mapping: "mapped" | "unmapped" = "mapped") =>
+  ({ object_id: "cap", mapping, display_status: display, display_status_label: display, reasons: [] }) as never;
+const agg = canonicalScopeStatusOf(canon("verified"));
 ok(
-  agg.display === "pending_verification" && agg.basis.includes("不给绿"),
-  `成员全绿时汇总**封顶在橙**并说明理由（${agg.display}）——父级没有自身集成证据就不判绿（§4.2）`,
+  agg.display === "verified",
+  `canonical 投影 verified ⇒ 能力 verified（${agg.display}）——判据在唯一义务层，本层只适配（§2.6／§4.2）`,
 );
-const aggEmpty = aggregateStatusOf([]);
-ok(aggEmpty.kind === "unmapped" && aggEmpty.display === null, "没有任何成员 → 未映射、不着完成色（不空集判绿）");
-const aggMixed = aggregateStatusOf([
-  { ...projection["T-2"], object_id: "y1", display_status: "in_progress" as const },
-  { ...projection["T-3"], object_id: "y2", display_status: "blocked" as const },
-]);
-ok(aggMixed.display === "blocked", "混合状态取优先级最高（阻塞 > 进行中，§4.2 优先级序）");
+const aggEmpty = canonicalScopeStatusOf(null);
+ok(aggEmpty.kind === "unmapped" && aggEmpty.display === null, "没有 canonical 投影 → 未知/未映射、不着完成色（不空集判绿）");
+const aggMixed = canonicalScopeStatusOf(canon("blocked"));
+ok(aggMixed.display === "blocked", "canonical 给 blocked ⇒ 原样为阻塞（不被改写，§4.2 优先级序由义务层判）");
 
 // ══════════════════════════════ ⑧ 布局增量（§3.3 不跳动） ══════════════════════════════
 

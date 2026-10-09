@@ -11,10 +11,10 @@
 // 设计角色落稿/审改，不绑定固定模型）。待议记录【只追加】：本视图没有任何「编辑/删除待议」的接口或
 // 按钮——「追加待议」输入框是提疑权入口，不是编辑设计书，也不是编辑已有待议条目。
 // ███████████████████████████████████████████████████████████████
-import { useCallback, useEffect, useRef, useState } from "react";
+import { createElement, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { DesignDoc, DiscussDoc } from "../../server/workstation";
+import type { DiscussDoc } from "../../server/workstation";
 // 2026-09-20 构建回归修复：GATE_STEPS 的值 import **不许**走 server 模块——
 // 那会把 workstation → work/documents → node:child_process 拉进浏览器包（构建红、dev 页面挂不起来）。
 // 浏览器安全的常量本体在 src/shared/gateSteps.ts；对 server 模块只保留类型导入（构建时擦除）。
@@ -22,19 +22,29 @@ import { GATE_STEPS } from "../../shared/gateSteps";
 import type { ReverseDraftDoc } from "../../server/reverseDraft";
 import {
   getActiveBaseline,
-  getDesign,
+  getDesignVersioned,
   getDiscuss,
   getDiscussions,
+  getFeatureLedger,
   getReverseDraft,
   getReversePlanDraft,
   postDecision,
   postDesignFinalize,
   postDiscuss,
   postReverseDraft,
+  type DesignBaselineHistoryView,
+  type DesignReadDoc,
   type DiscussionEntryView,
   type DiscussionsPayload,
   type ProjectItem,
 } from "../api";
+import type { CoverageDesignSectionRef, FeatureItem, FeatureLedger } from "../../shared/coverageTypes";
+import {
+  FeatureLedgerView,
+  FeatureOverview,
+  type FeatureLedgerBundle,
+  type FeatureLedgerErrorView,
+} from "./FeatureLedgerView";
 // V09-28：正向成套图纸入口——基线摘要/保存/激活的 API（本卡新增，走既有 documents 路由的同一份判据）
 import {
   getDocumentsSummary,
@@ -52,6 +62,13 @@ const DECISION_LABEL: Record<string, string> = {
   accepted: "已采纳",
   rejected: "已驳回",
   superseded: "已被替代",
+};
+
+/** 实际读到的版本档位 → 人话（`data-design-current-mode` 仍带原始档位，供回归与核对用） */
+const VERSION_MODE_LABEL: Record<string, string> = {
+  current: "当前草稿",
+  active: "已审定基线",
+  revision: "历史已替代版本",
 };
 
 const DECISION_TONE: Record<string, string> = {
@@ -118,6 +135,107 @@ const mdComponents: Components = {
   hr: () => <hr className="my-4 border-neutral-800" />,
 };
 
+// ── B6/V09-56：设计正文标题的稳定 id 与反向定位（§3.5）──
+// 行号取 **Markdown AST 的 `node.position.start.line`**（就是这一行在源文本里的行号），不按标题文字
+// 去章节表里猜（Codex 复审 8）：重复标题（两个 `### 3.5 …`）、标题里带强调（`## **x**`）、
+// 同名前缀（`## A` 与 `## A / B`）都会各拿各的真实行号，不再串到首个匹配或找不到。
+const HEADING_LEVELS = ["h1", "h2", "h3", "h4", "h5", "h6"] as const;
+const HEADING_CLASS: Record<(typeof HEADING_LEVELS)[number], string> = {
+  h1: "mt-6 mb-3 text-xl font-bold text-neutral-100",
+  h2: "mt-6 mb-2 border-b border-neutral-800 pb-1 text-lg font-semibold text-neutral-100",
+  h3: "mt-5 mb-2 text-base font-semibold text-neutral-100",
+  h4: "mt-4 mb-1 text-sm font-semibold text-neutral-200",
+  h5: "mt-3 mb-1 text-xs font-semibold text-neutral-200",
+  h6: "mt-3 mb-1 text-xs font-semibold text-neutral-300",
+};
+
+interface MarkdownNodeProps {
+  children?: ReactNode;
+  /** remark/rehype 带下来的 AST 节点（`position.start.line` = 该标题在源文本里的行号） */
+  node?: { position?: { start?: { line?: number } } };
+  [k: string]: unknown;
+}
+
+function headingLineOf(props: MarkdownNodeProps): number | null {
+  const line = props.node?.position?.start?.line;
+  return typeof line === "number" && Number.isInteger(line) && line > 0 ? line : null;
+}
+
+/** 设计正文专用渲染组件：h1–h6 加稳定 id + 反向定位点击（其余样式与 `mdComponents` 一致）。 */
+function makeBodyComponents(onHeading: (line: number) => void, activeLine: number | null): Components {
+  const make = (Tag: (typeof HEADING_LEVELS)[number]): Components["h1"] => {
+    const Comp = (props: MarkdownNodeProps) => {
+      const { children, node, ...rest } = props;
+      void node; // 只用来取行号，绝不透传给 DOM
+      const line = headingLineOf(props);
+      const anchor: Record<string, unknown> =
+        line === null
+          ? {}
+          : {
+              id: `design-h-${line}`,
+              "data-design-heading": String(line),
+              "data-design-heading-level": Tag,
+              "data-design-heading-active": activeLine === line ? "1" : "0",
+              title: "点这里看这一段承载哪些功能/任务（反向定位）",
+              onClick: () => onHeading(line),
+            };
+      return createElement(Tag, { ...rest, ...anchor, className: HEADING_CLASS[Tag] }, children);
+    };
+    return Comp as unknown as Components["h1"];
+  };
+  const out: Record<string, unknown> = { ...mdComponents };
+  for (const Tag of HEADING_LEVELS) out[Tag] = make(Tag);
+  return out as Components;
+}
+
+/**
+ * 分页续读的合并：把后一页并进同一份清单（按 `item_id` 去重）。
+ * 读口给的是同一 `package_revision` 的下一个 offset 页；版本变了会 409，走不到这里。
+ */
+function mergeLedgerPages(prev: FeatureLedger, next: FeatureLedger): FeatureLedger {
+  const seen = new Set(prev.items.map((i) => i.item_id));
+  const merged: FeatureItem[] = [...prev.items, ...next.items.filter((i) => !seen.has(i.item_id))];
+  return { ...next, items: merged };
+}
+
+/** 设计版本三档（当前草稿／已审定基线／历史已替代；§3.5、§2.9） */
+interface VersionOption {
+  value: string;
+  tier: "current" | "active" | "history";
+  label: string;
+  note: string;
+  disabled: boolean;
+}
+function versionOptionsOf(doc: DesignReadDoc | null): VersionOption[] {
+  const out: VersionOption[] = [
+    { value: "current", tier: "current", label: "当前草稿", note: "现行编辑源（未获批准时，覆盖结论不超过「待审」）", disabled: false },
+  ];
+  const history = doc?.baseline_history ?? [];
+  const active = history.find((h) => h.current) ?? null;
+  out.push({
+    value: "active",
+    tier: "active",
+    label: "已审定基线",
+    note:
+      active === null
+        ? "还没有生效基线（读不回已批准快照）"
+        : `审定者 ${active.approved_by} · ${active.approval_kind === "user_confirmed" ? "用户确认" : "技术审定"} · ${active.active_at}`,
+    disabled: active === null,
+  });
+  for (const h of [...history].filter((x) => !x.current).reverse()) {
+    out.push({
+      value: h.design_revision.content_sha256,
+      tier: "history",
+      label: `历史已替代（${h.baseline_id}）`,
+      note:
+        `当时审定者 ${h.approved_by} · ${h.approval_kind === "user_confirmed" ? "用户确认" : "技术审定"} · ${h.active_at} · ` +
+        `快照${h.available ? "可取回" : "读不回（历史状态未知，不套当前结论）"}`,
+      disabled: false,
+    });
+  }
+  return out;
+}
+
 // ── V09-28：设计页输入的**按项目**现场（§3.14「刷新不丢草稿与动作回执」）──
 // 为什么单开一层而不直接 useState：本页接入自动重取（token 前进会触发重取）后，输入必须**按项目**
 // 保留、且在后台重取时**不被清掉**。这里按项目 id 分桶，镜像到 sessionStorage（刷新不丢草稿）；
@@ -133,12 +251,27 @@ interface InputBucket {
   approver: string;
   basis: string;
   dispositions: Record<string, DispositionInput>;
+  /** B6：设计页所选版本（「当前草稿／已审定基线／历史已替代」）——按项目各存各的 */
+  designSelector: string;
+  /** B6：反向定位选中的章节标题行（null = 没选） */
+  activeSectionLine: number | null;
+  /** B6：「我补充一个需求」的未提交草稿——按项目保存，刷新不丢 */
+  ledgerSupplement: string;
 }
 const INPUT_BUCKETS = new Map<string, InputBucket>();
 const INPUT_MIRROR_PREFIX = "tatai.design.inputs.";
 
 function emptyBucket(): InputBucket {
-  return { discuss: "", finalizeNote: "", approver: "", basis: "", dispositions: {} };
+  return {
+    discuss: "",
+    finalizeNote: "",
+    approver: "",
+    basis: "",
+    dispositions: {},
+    designSelector: "current",
+    activeSectionLine: null,
+    ledgerSupplement: "",
+  };
 }
 
 function bucketOf(projectId: string): InputBucket {
@@ -183,7 +316,22 @@ function useInputBucket(projectId: string): [InputBucket, (patch: Partial<InputB
 }
 
 export function DesignView({ project }: { project: ProjectItem }) {
-  const [doc, setDoc] = useState<DesignDoc | null>(null);
+  // B6/V09-56：`designView` = **所选版本**的设计文档（三档：current/active/<revision>）；
+  // 旧 `getDesign` 只读现行草稿、不够用——改为带 `document` query 的同一只读接口（旧 shape 保留）。
+  const [designView, setDesignView] = useState<DesignReadDoc | null>(null);
+  // B6：功能清单（只读派生读口）+ 它自己的加载/失败现场（失败不能假空成功）
+  const [ledger, setLedger] = useState<FeatureLedger | null>(null);
+  const [ledgerError, setLedgerError] = useState<FeatureLedgerErrorView | null>(null);
+  const [ledgerLoading, setLedgerLoading] = useState(false);
+  // B6：**真实分页续读**（cursor + expected_revision）现场：忙/失败/版本已变三槽分开，
+  // 失败保留已载内容（不假空成功），版本已变则作废旧页并重读第一页（Codex 复审 1）。
+  const [ledgerPagingBusy, setLedgerPagingBusy] = useState(false);
+  const [ledgerPagingError, setLedgerPagingError] = useState<string | null>(null);
+  const [ledgerPagingNotice, setLedgerPagingNotice] = useState<string | null>(null);
+  // B6：「我补充一个需求」——复用只追加的待议写口
+  const [supplBusy, setSupplBusy] = useState(false);
+  const [supplError, setSupplError] = useState<string | null>(null);
+  const [supplNote, setSupplNote] = useState<string | null>(null);
   const [discuss, setDiscuss] = useState<DiscussDoc | null>(null);
   const [reverseDraft, setReverseDraft] = useState<ReverseDraftDoc | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -228,6 +376,16 @@ export function DesignView({ project }: { project: ProjectItem }) {
   const setFinalizeNote = (v: string): void => patchInputs({ finalizeNote: v });
   const setApprover = (v: string): void => patchInputs({ approver: v });
   const setBasis = (v: string): void => patchInputs({ basis: v });
+  // B6：设计版本选择与反向定位选中章节——随输入桶**按项目**保存（切项目各读各的、刷新不丢）
+  const designSelector: string = inputs.designSelector === "" ? "current" : inputs.designSelector;
+  const setDesignSelector = (v: string): void => {
+    patchInputs({ designSelector: v });
+    // 换版本 = 换这一版的新读数：上一条分页提示/失败不再适用于新版本
+    setLedgerPagingNotice(null);
+    setLedgerPagingError(null);
+  };
+  const activeSectionLine: number | null = inputs.activeSectionLine;
+  const setActiveSection = (line: number | null): void => patchInputs({ activeSectionLine: line });
 
   // ── 切项目联动（§3.14「切项目不串数据」）：换项目时旧项目的读数与失败标记**在渲染期**先归零 ──
   // 不放在下面的 load effect 里做：effect 在提交之后才跑，换项目那一次提交会先把
@@ -243,9 +401,29 @@ export function DesignView({ project }: { project: ProjectItem }) {
   // 正向基线动作（保存/激活）的**代际**：换项目或发起新动作都 +1；晚到的旧代回执/错误/finally 一律
   // 丢弃，绝不把 A 的成功/失败提示或忙状态写到 B（A→B→A 的旧 A 回包也按代际丢弃，见下面两个 submit）。
   const baselineGenRef = useRef(0);
+  // B6：分页续读的**代际**与「当前项目+版本」键。切项目、换版本、重读第一页都会让在途的
+  // 旧页回包作废（不把 A 的第二页写进 B 的清单，也不把旧版本的页并进新版本）。
+  const ledgerPagingGenRef = useRef(0);
+  const ledgerKeyRef = useRef(`${project.id}\u001f${designSelector}`);
+  ledgerKeyRef.current = `${project.id}\u001f${designSelector}`;
+  // 当前显示的清单（供后台对账判断「是不是同一版本、要不要保住已载入的后页」）
+  const ledgerRef = useRef<FeatureLedger | null>(ledger);
+  ledgerRef.current = ledger;
+  // 读到过 REVISION_CHANGED：下一轮必须**回到第一页重来**（旧页明确作废），不再沿用已载入的后页
+  const ledgerForceResetRef = useRef(false);
+  // B6：「我补充一个需求」的**代际**：只有发起提交的那个项目/那一代才能清草稿与回执（Codex 复审 2）。
+  const supplementGenRef = useRef(0);
   if (stateProjectId !== project.id) {
     setStateProjectId(project.id);
-    setDoc(null);
+    setDesignView(null);
+    setLedger(null);
+    setLedgerError(null);
+    setLedgerPagingBusy(false);
+    setLedgerPagingError(null);
+    setLedgerPagingNotice(null);
+    setSupplBusy(false);
+    setSupplError(null);
+    setSupplNote(null);
     setDiscuss(null);
     setReverseDraft(null);
     setPlanDraft(null);
@@ -263,6 +441,9 @@ export function DesignView({ project }: { project: ProjectItem }) {
     // 数据与动作现场都作废 → 首屏判定与动作代际同时重置；旧代回包随后一律丢弃。
     loadedProjectRef.current = null;
     baselineGenRef.current += 1;
+    // B6：分页续读与补充提交的在途回包同样作废（切项目后迟到成功/失败都不许落进新项目）。
+    ledgerPagingGenRef.current += 1;
+    supplementGenRef.current += 1;
   }
 
   // V09-26：改用**严格有界在途**外壳——同一项目不 abort 在途请求（慢响应最终落地显示），换项目/卸载
@@ -273,18 +454,18 @@ export function DesignView({ project }: { project: ProjectItem }) {
     // 归零已在上面的 stateProjectId 块（渲染期）做完，这里只决定"这次失败记到哪个槽"。
     const firstScreen = loadedProjectRef.current !== project.id;
     return Promise.all([
-      getDesign(project.id, { signal }),
+      getDesignVersioned(project.id, designSelector, { signal }),
       getDiscuss(project.id, { signal }),
       getReverseDraft(project.id, { signal }),
       getReversePlanDraft(project.id, { signal }),
       getDiscussions(project.id, { signal }),
       getActiveBaseline(project.id, { signal }),
     ])
-      .then(([d, dis, rd, pd, disp, base]) => {
+      .then(([dv, dis, rd, pd, disp, base]) => {
         if (signal.aborted) return;
         // 成功才登记「本项目已有数据」：此后同项目的对账失败按「陈旧横幅」处理，不再上错误页。
         loadedProjectRef.current = project.id;
-        setDoc(d);
+        setDesignView(dv);
         setDiscuss(dis);
         setReverseDraft(rd);
         setPlanDraft(pd);
@@ -308,11 +489,13 @@ export function DesignView({ project }: { project: ProjectItem }) {
         if (firstScreen) setLoadError(e.message);
         else setRefreshError(e.message);
       });
-  }, [project.id]);
-  const reload = useBoundedReloader(project.id, load);
+  }, [project.id, designSelector]);
+  // key 含 selector：**切版本 = 换 key** ⇒ 有界在途外壳 abort 旧版本在途请求并丢弃旧回包
+  // （「异步旧响应不串」）；换项目同理（A→B→A 也不会把旧 A 写进新 A）。
+  const reload = useBoundedReloader(`${project.id}\u001f${designSelector}`, load);
   useEffect(() => {
     reload();
-  }, [project.id, reloadTick, refreshToken, reload]);
+  }, [project.id, designSelector, reloadTick, refreshToken, reload]);
 
   // V09-28：成套图纸摘要单独取——它失败只影响审定区，不拖垮设计书正文/待议的刷新。
   // 换项目归零（documents/documentsError）统一在渲染期的 stateProjectId 块里做，这里不再各清一遍。
@@ -332,6 +515,108 @@ export function DesignView({ project }: { project: ProjectItem }) {
   useEffect(() => {
     reloadDocs();
   }, [project.id, reloadTick, refreshToken, reloadDocs]);
+
+  // ── B6/V09-56：功能清单只读读口单独取（与正文**同一 selector**、同一刷新节拍）──
+  // 失败分「未接入（旧服务）」与「读取失败」两种：都显式上屏，绝不假空成功、不回退写路径。
+  const loadLedger = useCallback((signal: AbortSignal): Promise<void> => {
+    setLedgerLoading(true);
+    return getFeatureLedger(project.id, { document: designSelector }, { signal })
+      .then((l) => {
+        if (signal.aborted) return;
+        ledgerPagingGenRef.current += 1;
+        const prev = ledgerRef.current;
+        // 第一页落地 = 这一版的新读数：在途下一页一律作废。
+        // 但**同一版本**的后台对账（每 5s 一轮）不得把人已经翻出来的后页悄悄丢回第一页
+        // （「不隐漏后页」）：包版本一致 ⇒ 已载入的后页仍然有效，保住它们、只刷新结论元数据。
+        // 包版本真的变了 ⇒ 回到第一页，并明说旧页作废（不是静默换数据）。
+        const forceReset = ledgerForceResetRef.current;
+        ledgerForceResetRef.current = false;
+        if (!forceReset && prev !== null && prev.items.length > l.items.length) {
+          const samePackage =
+            prev.package_revision === l.package_revision &&
+            prev.document_selection.requested === l.document_selection.requested;
+          if (samePackage) {
+            setLedger({
+              ...prev,
+              state: l.state,
+              coverage: l.coverage,
+              source_revision: l.source_revision,
+              package_revision_basis: l.package_revision_basis,
+              document_selection: l.document_selection,
+              artifact_ref: l.artifact_ref,
+              artifact_selection: l.artifact_selection,
+              generated_at: l.generated_at,
+            });
+          } else {
+            setLedger(l);
+            if (prev.document_selection.requested === l.document_selection.requested) {
+              setLedgerPagingNotice("清单内容已更新：已回到第一页（之前载入的后页作废，需要重新读取）。");
+            }
+          }
+        } else {
+          setLedger(l);
+        }
+        setLedgerError(null);
+        setLedgerPagingBusy(false);
+      })
+      .catch((e: unknown) => {
+        if (signal.aborted) return;
+        const err = e as { message?: string; status?: number | null; code?: string; unsupported?: boolean };
+        setLedgerError({
+          unsupported: err.unsupported === true,
+          message: err.message ?? String(e),
+          status: typeof err.status === "number" ? err.status : null,
+          code: typeof err.code === "string" ? err.code : "",
+        });
+      })
+      .finally(() => {
+        if (!signal.aborted) setLedgerLoading(false);
+      });
+  }, [project.id, designSelector]);
+  const reloadLedger = useBoundedReloader(`${project.id}\u001f${designSelector}\u001fledger`, loadLedger);
+  useEffect(() => {
+    reloadLedger();
+  }, [project.id, designSelector, reloadTick, refreshToken, reloadLedger]);
+
+  // ── B6：**真实续读下一页**（Codex 复审 1）──
+  // 用读口给的 `paging.cursor`（绑定 package_revision）+ **第一页的 package_revision** 当
+  // `expected_revision`：期间清单版本变了，读口回 409 → 旧页作废、重读第一页，绝不把两版拼一起。
+  // 失败保留已载内容并给原因；切项目/换版本时在途旧页按代际丢弃。
+  const loadMoreLedger = useCallback((): void => {
+    const cur = ledger;
+    if (cur === null || cur.paging.complete || ledgerPagingBusy) return;
+    const cursor = cur.paging.cursor;
+    if (cursor === null) return;
+    const key = `${project.id}\u001f${designSelector}`;
+    const gen = ++ledgerPagingGenRef.current;
+    setLedgerPagingBusy(true);
+    setLedgerPagingError(null);
+    setLedgerPagingNotice(null);
+    getFeatureLedger(project.id, {
+      document: designSelector,
+      cursor,
+      expected_revision: cur.package_revision,
+    })
+      .then((next) => {
+        if (gen !== ledgerPagingGenRef.current || ledgerKeyRef.current !== key) return;
+        setLedger((prev) => (prev === null ? next : mergeLedgerPages(prev, next)));
+      })
+      .catch((e: unknown) => {
+        if (gen !== ledgerPagingGenRef.current || ledgerKeyRef.current !== key) return;
+        const err = e as { message?: string; status?: number | null; code?: string };
+        if (err.code === "REVISION_CHANGED") {
+          // 版本已变：旧页不能并进新清单 —— 明确作废，重读第一页（如实告知，不静默拼接）
+          ledgerForceResetRef.current = true;
+          setLedgerPagingNotice("这份清单的版本已经变了：上一页作废，正在重新读第一页。");
+          setReloadTick((t) => t + 1);
+          return;
+        }
+        setLedgerPagingError(err.message ?? String(e));
+      })
+      .finally(() => {
+        if (gen === ledgerPagingGenRef.current) setLedgerPagingBusy(false);
+      });
+  }, [ledger, ledgerPagingBusy, project.id, designSelector]);
 
   // 待议条目 = `- \` 开头的列表行（与后端 countDiscussEntries 同口径）；处置派生态按 discussion_ref 对齐
   const entries: DiscussionEntryView[] =
@@ -404,6 +689,47 @@ export function DesignView({ project }: { project: ProjectItem }) {
     }
   };
 
+  // B6/V09-56：点清单里的设计章节引用 → 精确定位正文（id 由标题行号给出）。
+  // 定位不到（ref.status !== "located"，或该行标题不在当前所读版本里）**不猜近似标题**——清单已显式报 unresolved。
+  const locateSection = (ref: CoverageDesignSectionRef): void => {
+    setActiveSection(ref.line);
+    const el = document.getElementById(`design-h-${ref.line}`);
+    if (el !== null && typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "start", behavior: "smooth" });
+  };
+
+  // B6/V09-56：「我补充一个需求」——复用既有**只追加**写口 POST /discuss（不新建「改功能状态」写 API）。
+  // 提交后**不自动采纳**、不改已审定设计；只是把它送进待议，由人或获授权设计角色后续处置。
+  //
+  // 草稿语义（Codex 复审 2）：**只有提交成功**才清掉**所属项目**的那份草稿；失败原样保留可重试；
+  // 而且只清「刚提交的那一段」——发送期间继续编辑的新文案不能跟着被清掉。切项目后迟到的成功/失败
+  // 不写当前界面、也不清新项目的草稿（A→B→A 的旧 A 回包按代际丢弃）。
+  const submitSupplement = (text: string): void => {
+    const content = text.trim();
+    if (content === "" || supplBusy) return;
+    const ownerProject = project.id;
+    const gen = ++supplementGenRef.current;
+    setSupplBusy(true);
+    setSupplError(null);
+    setSupplNote(null);
+    postDiscuss(ownerProject, content)
+      .then(() => {
+        if (gen !== supplementGenRef.current) return; // 迟到旧代：不写当前项目、不动当前草稿
+        setSupplNote("已进入待议（只追加）：它不会自动被采纳，也不会改已审定的设计；请在上方「待议记录」查看它的处置去向。");
+        // 只清**仍是刚提交那段**的草稿：期间新写的内容保留（用户不会丢字）
+        if (bucketOf(ownerProject).ledgerSupplement.trim() === content) {
+          patchInputs({ ledgerSupplement: "" });
+        }
+        setReloadTick((t) => t + 1);
+      })
+      .catch((e: Error) => {
+        if (gen !== supplementGenRef.current) return;
+        setSupplError(e.message);
+      })
+      .finally(() => {
+        if (gen === supplementGenRef.current) setSupplBusy(false);
+      });
+  };
+
   // B3：生成/重生成逆向草稿（§9.2「补全设计书」）：扫描 + 记忆 → Flash 起草四块雏形。
   // 已有 design.md 时后端返回 conflict 不覆盖（DoD⑤），这里把冲突提示原样上屏。
   const [conflictHint, setConflictHint] = useState<string | null>(null);
@@ -452,7 +778,7 @@ export function DesignView({ project }: { project: ProjectItem }) {
   // B3 逆向落稿区：无 design.md 才出现（有设计书的项目起草一律走 conflict，不覆盖）；
   // 草稿存在时显示「草稿待定版」横幅 + 确认 Gate 步下拉 + 定版按钮
   const reverseSection =
-    doc && !doc.exists ? (
+    designView !== null && !designView.exists ? (
       <section
         data-reverse-draft
         className="space-y-3 rounded border border-sky-700/50 bg-sky-950/30 p-4"
@@ -868,6 +1194,106 @@ export function DesignView({ project }: { project: ProjectItem }) {
     </section>
   );
 
+  // ── B6/V09-56：版本三档切换器 + 功能概览 + 功能清单（正文与清单共用同一 selector） ──
+  const designVersions = versionOptionsOf(designView);
+  const versionSwitcher = (
+    <section data-design-version-switch className="space-y-2 rounded border border-neutral-800 p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="text-sm font-semibold text-neutral-200">看哪一版（只读）</h3>
+        <span className="text-xs text-neutral-500">
+          当前草稿／已审定基线／历史已替代：历史版只读，读不回来就说读不回来。
+        </span>
+      </div>
+      <div className="flex flex-col gap-1">
+        {designVersions.map((o) => (
+          <label
+            key={o.value}
+            data-version-option={o.tier}
+            data-version-value={o.value}
+            className={`flex items-start gap-2 rounded px-2 py-1 text-xs ${
+              designSelector === o.value ? "bg-neutral-800 text-neutral-100" : "text-neutral-400"
+            }`}
+          >
+            <input
+              type="radio"
+              name={`design-version-${project.id}`}
+              value={o.value}
+              checked={designSelector === o.value}
+              disabled={o.disabled}
+              onChange={() => setDesignSelector(o.value)}
+            />
+            <span className="min-w-0">
+              <span className="font-semibold">{o.label}</span>
+              {o.disabled ? <span className="ml-2 text-neutral-500">（不可用）</span> : null}
+              <span className="ml-2 text-neutral-500">{o.note}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+      {designView?.selection.unreadable !== null && designView?.selection.unreadable !== undefined && (
+        <p data-design-version-unreadable className="text-xs text-amber-300">
+          该版本读不回：{designView.selection.unreadable}
+        </p>
+      )}
+      {designView?.selection.drift !== null && designView?.selection.drift !== undefined && (
+        <p data-design-version-drift className="text-xs text-amber-300">
+          {designView.selection.drift}
+        </p>
+      )}
+    </section>
+  );
+  const bodyComponents = makeBodyComponents(setActiveSection, activeSectionLine);
+  // 概览与清单读**同一份**读口状态（不各算一遍；Codex 复审 4/6/7）
+  const ledgerBundle: FeatureLedgerBundle = {
+    selector: designSelector,
+    ledger,
+    error: ledgerError,
+    loading: ledgerLoading,
+    onRetry: () => {
+      setLedgerPagingError(null);
+      setLedgerPagingNotice(null);
+      setReloadTick((t) => t + 1);
+    },
+    onLoadMore: loadMoreLedger,
+    loadMoreBusy: ledgerPagingBusy,
+    loadMoreError: ledgerPagingError,
+    pagingNotice: ledgerPagingNotice,
+    onLocateSection: locateSection,
+    activeSectionLine,
+    onSupplement: submitSupplement,
+    supplementBusy: supplBusy,
+    supplementError: supplError,
+    supplementNote: supplNote,
+    supplementDraft: inputs.ledgerSupplement,
+    onSupplementDraftChange: (v) => patchInputs({ ledgerSupplement: v }),
+    bodyDesignRevision: designView?.selection.design_revision ?? null,
+  };
+  const overviewPanel = <FeatureOverview {...ledgerBundle} />;
+  const ledgerPanel = <FeatureLedgerView {...ledgerBundle} />;
+  // ── 技术材料 / 既有能力：首屏不占位（概览与正文/清单优先），需要时展开 ──
+  // 默认 `open`：不藏内容、不改变既有入口的可达性（老回归照旧可点）；人可一键收起。
+  const technicalSections = (
+    <>
+      <details data-design-technical="baseline" open className="tt-design-details">
+        <summary data-design-technical-summary="baseline">
+          现有成套图纸 · 审定与激活（
+          {documents === null
+            ? "读取中"
+            : documents.baseline.active === null
+              ? "还没有生效基线"
+              : "已有生效基线"}
+          ）
+        </summary>
+        {baselineSection}
+      </details>
+      <details data-design-technical="discuss" open className="tt-design-details">
+        <summary data-design-technical-summary="discuss">待议记录（{entries.length}）</summary>
+        {discussSection}
+      </details>
+      {reverseSection}
+    </>
+  );
+
   if (loadError) {
     return (
       <div className="mx-auto w-full max-w-3xl p-8">
@@ -883,25 +1309,28 @@ export function DesignView({ project }: { project: ProjectItem }) {
       </div>
     );
   }
-  if (!doc || !discuss) {
+  if (designView === null || !discuss) {
     return (
       <div className="mx-auto w-full max-w-3xl p-8">
         <p className="text-sm text-neutral-500">加载设计书…</p>
       </div>
     );
   }
-  if (!doc.exists) {
+  if (!designView.exists) {
     return (
-      <div className="mx-auto w-full max-w-3xl space-y-4 p-8">
+      <div className="mx-auto w-full max-w-3xl space-y-4 p-8" data-design-view data-design-missing="1">
         <div className="space-y-2">
           <h2 className="text-lg font-semibold">{project.name} · 设计书</h2>
           <p className="text-sm text-neutral-500">
-            该项目还没有设计书。设计稿由会话中的人或获授权的设计角色落稿/审改（§3.5，不再绑定固定模型）。
-            老项目也可以走逆向落稿（§9）：先起草雏形，人确认定版。
+            {designSelector === "current"
+              ? "这个项目还没有设计书。设计稿由会话里人或获授权的设计角色落稿/审改；老项目也可以先让 Agent 起草雏形，人确认后定版。"
+              : "所选版本读不回来：如实标未知，不套用当前通过结论。"}
           </p>
         </div>
-        {reverseSection}
-        {discussSection}
+        {overviewPanel}
+        {versionSwitcher}
+        {technicalSections}
+        {ledgerPanel}
       </div>
     );
   }
@@ -911,14 +1340,15 @@ export function DesignView({ project }: { project: ProjectItem }) {
   // 留一行指引（2026-09-19 主人拍板：底部藏掉只留顶部，同一内容不显示两遍）。
   // 只裁展示：GET /design、MCP read_design、聊天背景注入等数据接口仍返回全文。
   const isSelf = project.self_managed === true || project.id === "tatai";
-  const appendixIdx = isSelf ? doc.content.indexOf("\n## 附录 B") : -1;
+  const designContent = designView.content ?? "";
+  const appendixIdx = isSelf ? designContent.indexOf("\n## 附录 B") : -1;
   const bodyContent =
     appendixIdx > 0
-      ? `${doc.content.slice(0, appendixIdx)}\n\n> （本页自「附录 B：待议记录」起截断——同一内容已在上方待议区显示，2026-09-19 主人拍板；完整原文见仓库根 DESIGN.md。）\n`
-      : doc.content;
+      ? `${designContent.slice(0, appendixIdx)}\n\n> （本页自「附录 B：待议记录」起截断——同一内容已在上方待议区显示，2026-09-19 主人拍板；完整原文见仓库根 DESIGN.md。）\n`
+      : designContent;
 
   return (
-    <div className="mx-auto w-full max-w-4xl space-y-4 self-start p-8" data-design-view>
+    <div className="mx-auto w-full max-w-6xl space-y-4 self-start p-8" data-design-view>
       <header className="space-y-1">
         <div className="flex items-center gap-2">
           <h2 className="text-lg font-semibold">{project.name} · 设计书</h2>
@@ -930,8 +1360,20 @@ export function DesignView({ project }: { project: ProjectItem }) {
           </span>
         </div>
         <p className="text-xs text-neutral-500">
-          只读（§3.5：设计稿由人或获授权的设计角色落稿/审改）· 事实源：
-          <span className="break-all text-neutral-400">{doc.source}</span>
+          只读副本：设计稿由人或获授权的设计角色落稿/审改 ·
+          现在读的是
+          <span
+            data-design-current-mode={designView.selection.mode}
+            className="text-neutral-400"
+          >
+            {VERSION_MODE_LABEL[designView.selection.mode] ?? designView.selection.mode}
+          </span>
+          <details className="tt-inline-details">
+            <summary>技术信息</summary>
+            <span data-design-source className="break-all text-neutral-400">
+              来源文件：{designView.source_rel ?? designView.source ?? "—"}
+            </span>
+          </details>
         </p>
         {refreshError && (
           <p data-design-refresh-error className="text-xs text-amber-300">
@@ -947,13 +1389,20 @@ export function DesignView({ project }: { project: ProjectItem }) {
           </p>
         )}
       </header>
-      {baselineSection}
-      {discussSection}
-      <article className="text-sm leading-6 text-neutral-200">
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-          {bodyContent}
-        </ReactMarkdown>
-      </article>
+      {/* ① 首屏先说结果：有哪些功能、验证到哪一步、缺什么、下一步归谁 */}
+      {overviewPanel}
+      {/* ② 版本选择 + 正文与清单并排 */}
+      {versionSwitcher}
+      <div className="tt-design-columns">
+        <article data-design-body className="text-sm leading-6 text-neutral-200">
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={bodyComponents}>
+            {bodyContent}
+          </ReactMarkdown>
+        </article>
+        {ledgerPanel}
+      </div>
+      {/* ③ 技术材料与既有能力：保留全部入口，放主区之后，可一键收起 */}
+      {technicalSections}
     </div>
   );
 }

@@ -13,8 +13,8 @@
 //     "存不下现场"而崩掉。
 import { useCallback, useSyncExternalStore } from "react";
 
-/** 主工作面页面（§3.1 主导航五个 + 辅助入口两个） */
-export type ViewKey = "arch" | "design" | "plan" | "chat" | "live" | "overview" | "terminal";
+/** 主工作面页面（§3.1 主导航六个 + 辅助入口两个）；V09-62 起「交付总览」为人的默认入口 */
+export type ViewKey = "delivery" | "arch" | "design" | "plan" | "chat" | "live" | "overview" | "terminal";
 
 export interface ProjectScope {
   /** 当前页面（每项目各记各的） */
@@ -35,7 +35,9 @@ const STORAGE_PREFIX = "tatai.scope.";
 
 function emptyScope(): ProjectScope {
   return {
-    view: "arch",
+    // V09-62：无持久选择的新项目默认落到「交付总览」（人的默认入口，DESIGN §3.16）；
+    // 用户主动选过的页面按项目记忆保留（本函数只在首次访问该项目时生效）。
+    view: "delivery",
     chatDraft: "",
     selections: {},
     scroll: {},

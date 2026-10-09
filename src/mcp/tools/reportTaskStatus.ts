@@ -41,6 +41,13 @@ const V2_PHASE_OF: Readonly<Record<string, TaskPhaseReport>> = {
 
 const V2_KEYS = ["expected_revision", "claim_token", "request_id", "reason", "readiness_basis", "owner_id", "change_id", "role"] as const;
 
+/** v2 上报闭键白名单＝本工具公开 inputSchema 的顶层属性集（additionalProperties:false）。
+ *  校验只在 v2 路径生效；v1 原行为（未知键静默忽略）逐字保留。错误只点名未知键名，不回显取值（含 claim_token）。 */
+const V2_ALLOWED_KEYS: readonly string[] = [
+  "project_id", "task_id", "status", "note", "title", "module_id", "reporter",
+  "expected_revision", "claim_token", "owner_id", "role", "change_id", "request_id", "reason", "readiness_basis",
+];
+
 export const reportTaskStatusTool: McpTool = {
   name: "report_task_status",
   description:
@@ -138,6 +145,15 @@ async function v2Report(
   projectId: string,
   taskId: string,
 ): Promise<ToolResult> {
+  // v2 按公开 inputSchema 闭键：未知顶级键一律拒（错误只点名键名，不回显取值，含 claim_token）
+  const unknownKeys = Object.keys(args).filter((k) => !V2_ALLOWED_KEYS.includes(k));
+  if (unknownKeys.length > 0) {
+    return jsonError({
+      ok: false,
+      code: "INVALID_COMMAND",
+      message: `report_task_status(v2) 的入参只收这些键（${V2_ALLOWED_KEYS.join(" / ")}），多出来的键一律拒：${unknownKeys.join("、")}`,
+    });
+  }
   // done/todo 无 v2 映射：done 引导到 submit_task_result，禁止偷写通过
   if (status === "done") {
     return jsonError({

@@ -34,7 +34,14 @@ import { scanDirectoryAsync, SCAN_LIMITS } from "../src/server/scanner";
 import { buildContextPackage, readContextSource, CONTEXT_MAX_CHARS } from "../src/server/work/context";
 import { importTaskDefinitions, taskDefinitionHash } from "../src/server/work/plan";
 import { submitDefinitionImports, submitTaskStatus } from "../src/server/work/tasks";
-import { WorkService, WorkServiceClient } from "../src/server/work/service";
+import {
+  WorkService,
+  WorkServiceClient,
+  descriptorPidAlive,
+  readServiceDescriptor,
+  WORK_TOKEN_HEADER,
+  type WorkServiceDescriptor,
+} from "../src/server/work/service";
 import {
   WATCH_LIMITS,
   listWatchDetails,
@@ -91,6 +98,7 @@ const TIER_DEADLINE_MS = Number(process.env.TATAI_V0614_TIER_DEADLINE_MS ?? 20 *
 const HTTP_SAMPLES = Number(process.env.TATAI_V0614_HTTP_SAMPLES ?? 7);
 /** 原始测量数据落点（不设则只打到 stdout） */
 const RAW_DIR = process.env.TATAI_V0614_RAW_DIR ?? "";
+const ownedBackendChildren = new Set<ChildProcess>();
 /** 变更风暴规模 */
 const STORM_WRITES = Number(process.env.TATAI_V0614_STORM ?? 3000);
 /** 超长日志行数 */
@@ -1159,6 +1167,7 @@ async function startBackend(extraEnv: Record<string, string>): Promise<Backend> 
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  ownedBackendChildren.add(proc);
   const chunks: string[] = [];
   proc.stdout?.on("data", (c: Buffer) => chunks.push(c.toString("utf8")));
   proc.stderr?.on("data", (c: Buffer) => chunks.push(c.toString("utf8")));
@@ -1882,6 +1891,220 @@ function runSelfProof(tiers: TierResult[]): void {
   );
 }
 
+// ── 收尾生命周期：本脚本按需自愈拉起的后台写入服务，收尾必须精确关闭并等**真终态** ──
+
+interface StoppedService {
+  data_dir: string;
+  pid: number;
+  host: string;
+  port: number;
+  url: string;
+  started_at: string;
+  /** 发出让位请求时服务是否可达 */
+  reachable: boolean;
+  /** 真终态：进程已退出（不是 proc.killed 那种「已发信号」） */
+  exited: boolean;
+  /** 等到真终态用的毫秒数 */
+  wait_ms: number;
+  detail: string;
+}
+
+/** 精确关闭本脚本在 `dataDir` 上按需拉起的独立写入服务，并等它**真正退出**（有界） */
+async function stopFixtureWriteService(
+  dataDir: string,
+  desc: WorkServiceDescriptor,
+): Promise<StoppedService> {
+  assertUnderTmp(dataDir);
+  const current = readServiceDescriptor(dataDir);
+  if (!current || current.pid !== desc.pid || current.token !== desc.token || current.url !== desc.url) {
+    throw new Error("夹具描述符已变更，拒绝关闭未知服务");
+  }
+  const t0 = performance.now();
+  let reachable = false;
+  let detail = "";
+  // ① 让位握手：daemon 有 /api/work/admin/shutdown；token 与描述符同源，只有真写者能应答。
+  try {
+    const res = await fetch(`${desc.url}/api/work/admin/shutdown`, {
+      method: "POST",
+      headers: { [WORK_TOKEN_HEADER]: desc.token },
+      signal: AbortSignal.timeout(5_000),
+    });
+    reachable = res.ok;
+    detail = `shutdown HTTP ${res.status}`;
+  } catch (e) {
+    detail = `shutdown 请求失败：${(e as Error).message}（可能已自行退出）`;
+  }
+  // 描述符只能证明握手所需的凭据，不能证明当前 PID 仍是原进程。
+  // 只走认证关闭；超时则如实失败并保留现场，不向仅凭描述符取得的 PID 发终止信号。
+  const deadline = t0 + 15_000;
+  while (performance.now() < deadline && descriptorPidAlive(desc)) {
+    await sleep(Math.min(200, Math.max(0, deadline - performance.now())));
+  }
+  return {
+    data_dir: dataDir,
+    pid: desc.pid,
+    host: desc.host,
+    port: desc.port,
+    url: desc.url,
+    started_at: desc.started_at,
+    reachable,
+    exited: !descriptorPidAlive(desc),
+    wait_ms: round1(performance.now() - t0),
+    detail,
+  };
+}
+
+/** 找临时根下所有由本脚本自建的写入服务描述符（只在**本脚本 TMP** 内扫，不碰系统其它目录） */
+function discoverFixtureWriteServices(): Array<{ dataDir: string; desc: WorkServiceDescriptor }> {
+  const out: Array<{ dataDir: string; desc: WorkServiceDescriptor }> = [];
+  const walk = (d: string, depth: number): void => {
+    if (depth > 3) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const abs = path.join(d, e.name);
+      const desc = readServiceDescriptor(abs);
+      if (desc !== null) out.push({ dataDir: abs, desc });
+      walk(abs, depth + 1);
+    }
+  };
+  walk(TMP, 0);
+  return out;
+}
+
+/** 收尾：精确关闭本脚本拉起的后台写入服务，并等真终态（逐条记录，供 RAW 存证） */
+async function shutdownFixtureServices(): Promise<StoppedService[]> {
+  const found = discoverFixtureWriteServices();
+  const stopped: StoppedService[] = [];
+  for (const { dataDir, desc } of found) {
+    if (!descriptorPidAlive(desc)) continue; // 早已退净（只剩陈旧描述符，交给目录删除处理）
+    info(`  收尾：关闭自动拉起的写入服务 pid=${desc.pid}（${dataDir}）`);
+    stopped.push(await stopFixtureWriteService(dataDir, desc));
+  }
+  return stopped;
+}
+
+/** 等一个子进程**真退出**（有界；kill 只是发信号，exit 事件才是终态） */
+async function stopChildProcess(
+  proc: ChildProcess,
+  label: string,
+  deadlineMs = 15_000,
+): Promise<{ exited: boolean; code: number | null; wait_ms: number; detail: string }> {
+  const t0 = performance.now();
+  if (proc.exitCode !== null || proc.signalCode !== null) {
+    return { exited: true, code: proc.exitCode, wait_ms: 0, detail: "已退出" };
+  }
+  const exited = new Promise<boolean>((resolve) => {
+    proc.once("exit", () => resolve(true));
+  });
+  try {
+    proc.kill("SIGTERM");
+  } catch {
+    // 忽略
+  }
+  let done = await Promise.race([exited, sleep(deadlineMs).then(() => false)]);
+  if (!done) {
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      // 忽略
+    }
+    done = await Promise.race([exited, sleep(5_000).then(() => false)]);
+  }
+  const exitedNow = proc.exitCode !== null || proc.signalCode !== null;
+  return {
+    exited: exitedNow,
+    code: proc.exitCode,
+    wait_ms: round1(performance.now() - t0),
+    detail: exitedNow ? `${label} 已到终态` : `${label} 超时仍未退出（exit=${proc.exitCode}）`,
+  };
+}
+
+/** 有界重试删除夹具根；仍失败即如实报失败（绝不吞成「已清理」） */
+async function removeFixturesBounded(
+  dir: string,
+  attempts = 6,
+  delayMs = 500,
+): Promise<{ ok: boolean; left: boolean; attempts: number; last_error: string }> {
+  let lastError = "";
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (e) {
+      lastError = (e as Error).message;
+    }
+    if (!fs.existsSync(dir)) return { ok: true, left: false, attempts: i, last_error: lastError };
+    lastError = lastError || "目录仍在（删除未完成）";
+    if (i < attempts) await sleep(delayMs);
+  }
+  return { ok: false, left: fs.existsSync(dir), attempts, last_error: lastError };
+}
+
+/** 收尾的**唯一**入口（幂等）：关后台服务 → 有界清理 → 落原始数据；任一步真失败都把 exit 记成非 0 */
+let finalizeDone = false;
+let finalizeRunning = false;
+async function finalizeTmp(): Promise<void> {
+  if (finalizeDone || finalizeRunning) return;
+  finalizeRunning = true;
+  try {
+    // 先关掉可能残留的帧监听器（真删目录前，避免句柄拖住 Windows 上的删除）
+    for (const projectId of [...new Set(["tier-10000", ...TIERS.map((n) => `tier-${n}`)])]) {
+      await unwatchProject(projectId).catch(() => undefined);
+    }
+    const children = [];
+    for (const proc of ownedBackendChildren) children.push(await stopChildProcess(proc, "本脚本后端"));
+    if (children.some((c) => !c.exited)) process.exitCode = 1;
+    // ① 精确关闭本脚本按需拉起的独立写入服务并等真终态（不再让后台写与删除赛跑）
+    const stopped = await shutdownFixtureServices();
+    const cleanup: Record<string, unknown> = {
+      backend_children: children,
+      write_services_stopped: stopped,
+      write_services_all_exited: stopped.every((s) => s.exited),
+    };
+    raw.cleanup = cleanup;
+    if (!cleanup.write_services_all_exited) process.exitCode = 1;
+    for (const s of stopped) {
+      info(`  ${s.exited ? "已停" : "未停"} pid=${s.pid} ${s.url}（等待 ${s.wait_ms} ms；${s.detail}）`);
+    }
+    const before = dirBytes(TMP);
+    if (process.env.TATAI_KEEP_TMP === "1" || !cleanup.write_services_all_exited || children.some((c) => !c.exited)) {
+      info(`保留现场：${TMP}`);
+    } else {
+      // ② 有界重试整棵删除；仍失败即真实非 0（不冒充「已清理」）
+      const rm = await removeFixturesBounded(TMP);
+      cleanup.removed = rm;
+      console.log(
+        `[verify] 夹具清理：清理前 ${mb(before.bytes)} MB / ${before.files} 文件 → ` +
+          (rm.ok
+            ? `第 ${rm.attempts} 次尝试已整棵删除`
+            : `仍存在（${rm.attempts} 次尝试未删净：${rm.last_error}）`),
+      );
+      if (!rm.ok) process.exitCode = 1;
+    }
+    // ③ 原始测量数据落盘：失败**不能静默成功**——如实报错并把 exit 记成非 0
+    if (RAW_DIR !== "") {
+      const rawFile = path.join(RAW_DIR, "v06-14-raw.json");
+      try {
+        mkdirp(RAW_DIR);
+        fs.writeFileSync(rawFile, JSON.stringify(raw, null, 2) + "\n", "utf8");
+        console.log(`[verify] 原始测量数据已落 ${rawFile}`);
+      } catch (e) {
+        process.exitCode = 1;
+        cleanup.raw_write_error = (e as Error).message;
+        console.error(`[verify] 原始数据落盘失败：${(e as Error).message}`);
+      }
+    }
+    finalizeDone = true;
+  } finally {
+    finalizeRunning = false;
+  }
+}
+
 // ══════════════════════════ main ══════════════════════════
 
 async function main(): Promise<void> {
@@ -1894,11 +2117,11 @@ async function main(): Promise<void> {
   const backend = await runHttpAndStormOverHttp(tiers);
   await runBackup(backend);
   if (backend !== null) {
-    const t0 = performance.now();
-    backend.proc.kill();
-    await sleep(400);
-    info(`  后端进程已收（kill ${round1(performance.now() - t0)} ms，exit=${backend.proc.exitCode}）`);
-    (raw.http as Record<string, unknown>).backend_killed = backend.proc.exitCode !== null || backend.proc.killed;
+    const stop = await stopChildProcess(backend.proc, "后端进程");
+    info(`  后端进程已收（等真终态 ${stop.wait_ms} ms，exit=${stop.code}；${stop.detail}）`);
+    (raw.http as Record<string, unknown>).backend_exited = stop.exited;
+    (raw.http as Record<string, unknown>).backend_exit_code = stop.code;
+    if (!stop.exited) process.exitCode = 1;
   }
   buildVerdicts(tiers);
   runSelfProof(tiers);
@@ -1912,42 +2135,41 @@ async function main(): Promise<void> {
   };
   info(`清理账终点：临时目录已占 ${mb(diskAfter.bytes)} MB / ${diskAfter.files} 文件 / ${diskAfter.dirs} 目录`);
 
+  // 先收尾（关掉自动拉起的写服务、落原始数据、有界清理夹具）再打印汇总：
+  // 汇总里的 exit 必须是**终态**口径——不能先打印 exit 0、再被收尾异常推翻成 exit 1。
+  await finalizeTmp();
+
   console.log(`\n[verify] V06-14 结果：${passCount} PASS / ${failCount} FAIL（exit ${process.exitCode ?? 0}）`);
   console.log(`[verify] RAW-BEGIN`);
   console.log(JSON.stringify(raw, null, 2));
   console.log(`[verify] RAW-END`);
 }
 
-try {
-  await main();
-} catch (e) {
-  console.error(`[verify] 异常：${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
-  process.exitCode = 1;
-} finally {
-  if (RAW_DIR !== "") {
-    try {
-      // 原始测量数据落点由调用方指定（证据目录），本脚本只写这一个文件
-      mkdirp(RAW_DIR);
-      fs.writeFileSync(path.join(RAW_DIR, "v06-14-raw.json"), JSON.stringify(raw, null, 2) + "\n", "utf8");
-      console.log(`[verify] 原始测量数据已落 ${path.join(RAW_DIR, "v06-14-raw.json")}`);
-    } catch (e) {
-      console.error(`[verify] 原始数据落盘失败：${(e as Error).message}`);
-    }
-  }
-  const before = dirBytes(TMP);
+// 入口判定：只有当本文件是**被直接运行**的入口时才跑 main——
+// 被离线用例 `import` 时只提供收尾例程，不触发整段实测（供正负例/异常路径直接调用）。
+const IS_ENTRY =
+  process.argv[1] !== undefined &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+
+if (IS_ENTRY) {
   try {
-    // 先关掉可能残留的帧监听器（真删目录前，避免句柄拖住 Windows 上的删除）
-    await unwatchProject("tier-10000").catch(() => undefined);
-  } catch {
-    // 无监听则忽略
-  }
-  if (process.env.TATAI_KEEP_TMP === "1") {
-    info(`保留现场：${TMP}`);
-  } else {
-    fs.rmSync(TMP, { recursive: true, force: true });
-    const left = fs.existsSync(TMP);
-    console.log(
-      `[verify] 夹具清理：清理前 ${mb(before.bytes)} MB / ${before.files} 文件 → 清理后 ${left ? "仍存在（删除未完成）" : "已整棵删除"}`,
-    );
+    await main();
+  } catch (e) {
+    console.error(`[verify] 异常：${e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
+    process.exitCode = 1;
+  } finally {
+    // 兜底：main 正常收尾过就空转（幂等）；异常中断时在这里精确关闭后台服务并清理夹具。
+    await finalizeTmp();
   }
 }
+
+export {
+  finalizeTmp,
+  stopFixtureWriteService,
+  shutdownFixtureServices,
+  stopChildProcess,
+  removeFixturesBounded,
+  TMP,
+  RAW_DIR,
+  ownedBackendChildren,
+};
