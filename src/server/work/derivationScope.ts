@@ -14,6 +14,9 @@
 //     判据一分不改、返回对象与"各读各的"逐字段相同；
 //   · 派生函数都是**同步**的（无 `await`），作用域用 try/finally 严格成对进出，不存在异步交错串味；
 //     `withDerivationScope` 可嵌套（内层复用外层作用域，不新开、不清空）。
+//   · **前后对比要显式绕过记忆**（V09-37 返工 BLOCK-1）：靠"前后两次现读不同"发现"计算期间源被改动"的
+//     逻辑（如六图探针的 pre/post 键），必须用 `withoutDerivationScope` 包住那次现读——否则同一个作用域会把
+//     前后折成同一份、吞掉源变。它只让这一次调用现算，不清空、不重建外层记忆（可安全用于嵌套作用域内部）。
 //   · **没有活跃作用域时** `memoizedForDerivation` 直接现算——不引入本模块时的行为逐字不变，
 //     这也让写路径与单测路径完全不受影响。
 //
@@ -23,6 +26,11 @@
 /** 桶名 → 键 → 值。桶名用于隔离不同种类的复用（读文本 / 解析 / 哈希 / git 探针）。 */
 const buckets = new Map<string, Map<string, unknown>>();
 let depth = 0;
+/**
+ * 「临时绕过记忆」的深度（V09-37 返工 BLOCK-1）。> 0 时 `memoizedForDerivation` 一律现算，
+ * 但**不清空、不重建**任何已有记忆——只让**这一次调用**读到盘上真实内容，退出即恢复。
+ */
+let bypassDepth = 0;
 
 /**
  * 在**一次同步派生**内执行 `fn`：期间 `memoizedForDerivation` 的记忆有效，返回/抛错都整体丢弃。
@@ -45,11 +53,34 @@ export function inDerivationScope(): boolean {
 }
 
 /**
- * 同一次派生内、同一 `bucket`+`key` 只算一次。**没有活跃作用域时直接 `compute()`**（行为不变）。
+ * 在同一次派生作用域**内部**临时**绕过**记忆执行 `fn`（V09-37 返工 BLOCK-1）。
+ *
+ * 为什么需要它：作用域的记忆对**同一次派生里同一瞬间的重复现读**成立，但对「前后对比」是不安全的——
+ * 若一段逻辑要靠**前后两次现读**发现"计算期间源被改动"，而这两次现读落在同一个派生作用域里，记忆会把
+ * 它们折成同一份（吞掉源变）。典型现场：同步链的六图探针 `memoizeGraphProbe` 用 `graphProbeKeyOf` 的
+ * pre/post 键比对来判「构建期间 DESIGN/PLAN/图输入是否被改动」，而它依赖的 `loadDocument` 在此前被收进
+ * 派生作用域后就被记忆了 → pre/post 恒等 → 源变不再被检出。
+ *
+ * 语义（严格）：只在 `fn` 执行期间让 `memoizedForDerivation` 退化为现算；**不清空、不重建**外层已积累的
+ * 记忆（可安全用于嵌套作用域内的局部现读），不改变任何判据，不引入跨请求缓存；返回/抛错都恢复。作用域外
+ * 调用它等价于直接执行 `fn`（无活跃记忆时本就现算）。
+ */
+export function withoutDerivationScope<T>(fn: () => T): T {
+  bypassDepth += 1;
+  try {
+    return fn();
+  } finally {
+    bypassDepth -= 1;
+  }
+}
+
+/**
+ * 同一次派生内、同一 `bucket`+`key` 只算一次。**没有活跃作用域时直接 `compute()`**（行为不变）；
+ * 处在 `withoutDerivationScope` 的临时绕过窗口里时也**一律现算**（不读、不写记忆）。
  * 注意：`compute` 必须是对当前盘上内容的**纯只读**计算，且其输入在同一派生内不会再变。
  */
 export function memoizedForDerivation<T>(bucket: string, key: string, compute: () => T): T {
-  if (depth === 0) return compute();
+  if (depth === 0 || bypassDepth > 0) return compute();
   let m = buckets.get(bucket);
   if (m === undefined) {
     m = new Map<string, unknown>();
@@ -62,10 +93,10 @@ export function memoizedForDerivation<T>(bucket: string, key: string, compute: (
 }
 
 /** 只报数（自检/验证脚本读；不写任何东西、不改状态） */
-export function derivationScopeStats(): { active: boolean; buckets: number; entries: number } {
+export function derivationScopeStats(): { active: boolean; bypassing: boolean; buckets: number; entries: number } {
   let entries = 0;
   for (const m of buckets.values()) entries += m.size;
-  return { active: depth > 0, buckets: buckets.size, entries };
+  return { active: depth > 0, bypassing: bypassDepth > 0, buckets: buckets.size, entries };
 }
 
 /** 仅供验证脚本对照"复用确实发生/没发生"用（清空当前记忆，不进/不出作用域） */

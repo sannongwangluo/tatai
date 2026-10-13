@@ -105,6 +105,9 @@ function evidenceInputOf(raw: unknown): { project_id: string; input: EvidenceInp
       ...(typeof p.occurred_at === "string" ? { occurred_at: p.occurred_at } : {}),
       // 源文件清单（契约 F4）：原样交给 putEvidence 现读核实（越界/软链/超限/编造哈希都在那里拒）
       ...(p.source_manifest === undefined ? {} : { source_manifest: p.source_manifest }),
+      // V09-64（§6.14 第 6 段）：目标工作区**只传 id**——由宿主注册的 `setEvidenceWorkspaceResolver`
+      // 解析成规范绝对根；**不接受**调用方直接传绝对根（`workspace_root` 是宿主内部字段，这里不透传）。
+      ...(typeof p.workspace_id === "string" && p.workspace_id.trim() !== "" ? { workspace_id: p.workspace_id.trim() } : {}),
     },
   };
 }

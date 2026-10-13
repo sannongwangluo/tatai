@@ -33,13 +33,26 @@
 // （Vite cacheDir 走环境变量）。清理只杀本脚本自己拉起的进程。
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
 import { addProject } from "../src/server/registry";
 import { displayCopyOf } from "../src/ui/components/deliveryOverviewDisplay";
+// V09-67：真服务真绿夹具经**真实宿主唯一写入口**登记（不 mock 冒充真绿）
+import { WorkService } from "../src/server/work/service";
+import { projectWorkDir } from "../src/server/workstation";
+import { importTaskDefinitions } from "../src/server/work/plan";
+import { submitDefinitionImports } from "../src/server/work/tasks";
+import { activateBaseline, buildSectionIndex } from "../src/server/work/documents";
+import { registerRequirement } from "../src/server/work/requirements";
+import { installWorkspaceHostWiring } from "../src/server/work/hostWiring";
+import { handleReportingRequest } from "../src/server/work/reportingHost";
+import { submitSelfCheck, submitIndependentAudit, COVERAGE_AREAS, COVERAGE_AREA_LABELS } from "../src/server/work/audit";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.dirname(HERE);
@@ -140,6 +153,8 @@ const PROJECTS: FixtureProject[] = [
   { id: "p-broken-scope", name: "夹具·非法scope" },
   // 不注入：这条走**真实后端**返回（本仓后端尚未落地 delivery 字段），验「旧服务缺字段不假绿」的真服务面
   { id: "p-real", name: "夹具·真服务" },
+  // V09-67 新增：**不注入**，走真实后端 + 真实写口登记的合法完整声明与证据 ⇒ 真绿（真服务真读数）
+  { id: "p-real-green", name: "夹具·真服务真绿" },
 ];
 
 function buildFixtures(home: string, root: string): void {
@@ -151,6 +166,154 @@ function buildFixtures(home: string, root: string): void {
     fs.writeFileSync(path.join(dir, "PLAN.md"), `# ${p.name} 施工图\n\n## 夹具卡\n\n夹具施工定义。\n`, "utf8");
     addProject({ id: p.id, name: p.name, path: dir, kind: "backend" }, home);
   }
+}
+
+// ─────────────────── V09-67 真服务真绿夹具（真实写口；无注入） ───────────────────
+//
+// UI 层要有一条**真实后端派生**的「可以开始人工试用」读数可断言：合法完整功能声明（DESIGN 声明区 +
+// PLAN 卡/功能映射/交付核对声明/集成检查要求，章节 hash 现算回填）+ 需求登记 + 定义导入 + 基线激活 +
+// 源清单存证（reportingHost）+ 作者自检 + 非作者独立审查（audit 模块），全部经真实宿主唯一写入口。
+// **不用 mock 冒充真绿**；`p-real-green` 不在 FIXTURES 里，界面请求一律透传真实服务。
+const REAL_GREEN_ID = "p-real-green";
+
+const RG_DECL_HEAD = [
+  "| 功能 ID | 人话功能名 | 需求 ID | 设计章节 | 本期范围（scope_id） | 覆盖结论 | 依据/缺口（review） | 使用结果与场景 |",
+  "| --- | --- | --- | --- | --- | --- | --- | --- |",
+];
+const RG_DESIGN_DRAFT = [
+  "# 设计书",
+  "",
+  "### 3.16 交付总览（夹具）",
+  "",
+  "正文：交付总览按明确版本只读派生。",
+  "",
+  "## 功能清单声明（夹具）",
+  "",
+  RG_DECL_HEAD[0],
+  RG_DECL_HEAD[1],
+  "| cap-v0967 | 交付总览版本一致 | req-v0967 | §3.16 | cap-v0967 | 已核对 | reviewer=审1; ref=.工作台/design.md#3.16; section_sha256=SECT; gap= | 夹具场景：切版本后结论一致 |",
+  "",
+].join("\n");
+const RG_PLAN = [
+  "# 施工图",
+  "",
+  "| 卡号 | 状态 | 交付目标 | 依赖 | 完成证据 |",
+  "| --- | --- | --- | --- | --- |",
+  "| V09-67 | todo | 交付总览版本一致 |  | 证据齐 |",
+  "",
+  "### V09-67 交付总览版本一致",
+  "",
+  "**设计依据**：§3.16。**依赖**：无。**文件责任**：`src/app.ts`。",
+  "",
+  "- [ ] **chk-v0967-01 完整功能范围核查**",
+  "- [ ] **chk-v0967-02 交付总览版本一致达标**",
+  "- [ ] **chk-v0967-03 非作者审查与问题收口**",
+  "- [ ] **chk-v0967-04 运行交付版本核对**",
+  "",
+  "| 功能 ID | 人话功能名 | 承接卡 | 必需检查 | 集成检查 | 结果状态 |",
+  "| --- | --- | --- | --- | --- | --- |",
+  "| cap-v0967 | 交付总览版本一致 | V09-67 | chk-v0967-02 | int-v0967-01 | 未验 |",
+  "",
+  "## 交付核对声明",
+  "",
+  "| 核对项 | 承接卡 | 检查 ID |",
+  "| --- | --- | --- |",
+  "| coverage | V09-67 | chk-v0967-01 |",
+  "| review | V09-67 | chk-v0967-03 |",
+  "| runtime | V09-67 | chk-v0967-04 |",
+  "",
+  "## 集成检查要求",
+  "",
+  "| 对象 ID | 检查 ID | 说明 | 必需性 |",
+  "| --- | --- | --- | --- |",
+  "| cap-v0967 | int-v0967-01 | 端到端集成 | 必需 |",
+  "| project:delivery | int-project-delivery-01 | 交付集成 | 必需 |",
+  "",
+].join("\n");
+
+function rgReq(body: unknown): IncomingMessage {
+  const req = Readable.from([Buffer.from(JSON.stringify(body), "utf8")]) as unknown as IncomingMessage;
+  (req as unknown as { method: string }).method = "POST";
+  (req as unknown as { url: string }).url = "/api/work/reporting/evidence";
+  (req as unknown as { headers: Record<string, string> }).headers = {};
+  return req;
+}
+function rgRes(): { res: ServerResponse; read: () => { status: number; body: unknown } } {
+  const st = { status: 0, body: "" };
+  const res = {
+    setHeader: (): void => {},
+    writeHead: (s: number): unknown => { st.status = s; return res; },
+    end: (v?: unknown): void => { if (typeof v === "string") st.body = v; },
+  };
+  Object.defineProperty(res, "statusCode", { get: () => st.status, set: (s: number) => { st.status = s; } });
+  return { res: res as unknown as ServerResponse, read: () => ({ status: st.status, body: st.body === "" ? null : JSON.parse(st.body) }) };
+}
+
+async function buildRealGreenFixture(home: string, root: string): Promise<void> {
+  const dir = path.join(root, REAL_GREEN_ID);
+  const sectSha = buildSectionIndex(RG_DESIGN_DRAFT).find((s) => s.title.startsWith("3.16 "))?.sha256 ?? "";
+  fs.writeFileSync(path.join(dir, ".工作台", "design.md"), RG_DESIGN_DRAFT.replace("section_sha256=SECT", `section_sha256=${sectSha}`), "utf8");
+  fs.writeFileSync(path.join(dir, ".工作台", "plan.md"), RG_PLAN, "utf8");
+  fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "src", "app.ts"), "export const app = 1;\n", "utf8");
+  fs.writeFileSync(path.join(dir, "README.md"), "# fixture\n", "utf8");
+
+  const service = new WorkService({ dataDir: home });
+  installWorkspaceHostWiring();
+  const CHANGE = "change-v0967-ui";
+  const EXEC = "v0967-ui-exec";
+  const AUDITOR = "v0967-ui-auditor";
+  const sub = { submit: (c: unknown) => service.submit(c) };
+  registerRequirement(sub as never, {
+    project_id: REAL_GREEN_ID, requirement_id: "req-v0967", change_id: CHANGE, actor_id: "v0967-ui-setup", role: "designer",
+    source: { kind: "user", ref: "夹具用户 2026-10-09" }, problem: "夹具需求", users: [], success_scenarios: [], exclusions: [],
+    priority: "P1", status: "explicit",
+  });
+  submitDefinitionImports(service, {
+    project_id: REAL_GREEN_ID, change_id: CHANGE, actor_id: "v0967-ui-setup", role: "coordinator",
+    definitions: importTaskDefinitions(RG_PLAN, { plan_revision: cryptoHash(RG_PLAN) }).definitions,
+  });
+  activateBaseline(REAL_GREEN_ID, { approved_by: "user", approval_basis: "V09-67 UI 隔离夹具审定（不代表真实用户 Gate）", approval_kind: "user_confirmed" }, home);
+
+  const { res, read } = rgRes();
+  await handleReportingRequest(
+    rgReq({
+      project_id: REAL_GREEN_ID, content: "", kind: "source_manifest", summary: "夹具源清单",
+      created_by: EXEC, role: "executor", binding: { revision_kind: "code", revision: "rev-x" },
+      source_manifest: [{ path: "src/app.ts" }, { path: "README.md" }],
+    }),
+    res,
+    { pathname: "/api/work/reporting/evidence", dataDir: home },
+  );
+  const body = read().body as { ok?: boolean; evidence?: { evidence_id: string; source_manifest?: { fingerprint: string } } };
+  const evid = body?.evidence?.evidence_id ?? "";
+  const fp = body?.evidence?.source_manifest?.fingerprint ?? "";
+  if (evid === "" || fp === "") throw new Error(`真绿夹具：源清单存证失败 ${JSON.stringify(body).slice(0, 200)}`);
+
+  const objects: Record<string, string> = {
+    "chk-v0967-01": "V09-67", "chk-v0967-02": "V09-67", "chk-v0967-03": "V09-67", "chk-v0967-04": "V09-67",
+    "V09-67::evidence": "V09-67", "int-v0967-01": "cap-v0967", "int-project-delivery-01": "project:delivery",
+  };
+  for (const [check, objectId] of Object.entries(objects)) {
+    submitSelfCheck(sub as never, {
+      project_id: REAL_GREEN_ID, change_id: CHANGE, actor_id: EXEC, role: "executor", record_id: `sc-${check}`,
+      task_id: objectId, checked_by: EXEC, conclusion: "pass",
+      binding: { revision_kind: "code", revision: fp },
+      checks: [{ check_id: check, method: "夹具定向检查", command: null, exit_code: null, evidence_sha256: evid, scope: [], verifies: "code" }],
+    });
+    submitIndependentAudit(sub as never, {
+      project_id: REAL_GREEN_ID, change_id: CHANGE, actor_id: AUDITOR, role: "auditor", record_id: `ia-${check}`,
+      task_id: objectId, auditor: AUDITOR, author_id: EXEC, conclusion: "pass",
+      binding: { revision_kind: "code", revision: fp },
+      checks: [{ check_id: check, result: "passed", evidence_sha256: evid, scope: [] }],
+      coverage: COVERAGE_AREAS.map((a) => ({ area: a, status: "checked" as const, basis: `${COVERAGE_AREA_LABELS[a]}：夹具已独立复核` })),
+    });
+  }
+}
+
+/** 与 documents.ts 同一份 sha256（内容哈希口径） */
+function cryptoHash(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
 // ─────────────────────────── 注入脚本（可控 fixture） ───────────────────────────
@@ -191,7 +354,10 @@ const INJECT_TEMPLATE = String.raw`
     var cursor = "";
     var mm = /[?&]cursor=([^&]*)/.exec(q);
     if (mm) cursor = decodeURIComponent(mm[1]);
-    window.__DLV.calls.push({ pid: pid, cursor: cursor, t: Math.round(performance.now()) });
+    // V09-67：交付总览会显式带上解析出的工作区参数；这里只**记录**（夹具仍按 cursor 键取，行为不变）
+    var wsm = /[?&]workspace=([^&]*)/.exec(q);
+    var ws = wsm ? decodeURIComponent(wsm[1]) : null;
+    window.__DLV.calls.push({ pid: pid, cursor: cursor, ws: ws, t: Math.round(performance.now()) });
     var ctl = window.__DLV.ctl[pid] || {};
     var fx = (window.__DLV_FIXTURES || {})[pid];
     if (ctl.conflictNext) {
@@ -558,6 +724,8 @@ function mixedItem(over: Partial<ItemSpec> & Pick<ItemSpec, "id" | "name" | "sce
 }
 
 function mixedItems(): Array<Record<string, unknown>> {
+  const partial = mixedItem({ id: "cap-m-partial", name: "部分任务已提交的功能", scenario: "两张任务只有一张已提交", desc: "混合执行登记", impl: "not_started", vstate: "planned", vevidence: "missing", passed: 0, required: 1, missing: ["缺技术验证证据"] });
+  (partial.implementation as Record<string, unknown>).result_registration = { state: "partial", submitted_task_ids: ["TASK-A"], pending_task_ids: ["TASK-B"] };
   const failed = mixedItem({
     id: "cap-m-failed",
     name: "有检查明确失败的功能",
@@ -580,8 +748,11 @@ function mixedItems(): Array<Record<string, unknown>> {
     // 证据已失效 ⇒ 「需要复验」
     mixedItem({ id: "cap-m-invalid", name: "证据已失效的功能", scenario: "证据已失效", desc: "证据已失效", vevidence: "invalidated", review: { state: "passed", required: 1, passed: 1, missing: [], evidence: [] } }),
     failed,
-    // 图上无运行投影 ⇒ 「暂无实现记录」（不得读成「未开始」）
+    // 缺运行记录不等于没有实现；已有验证依据单独说明。
     mixedItem({ id: "cap-m-norun", name: "没有运行投影的功能", scenario: "没有运行投影", desc: "没有运行投影", impl: "no_run_record", vstate: "planned", vevidence: "missing", passed: 0, required: 1, missing: ["缺技术验证证据"] }),
+    mixedItem({ id: "cap-m-verified-norun", name: "有验证但无执行登记的功能", scenario: "导入已有实现", desc: "验证独立于执行登记", impl: "no_run_record" }),
+    partial,
+    mixedItem({ id: "cap-m-stale-norun", name: "旧证据失效且无执行登记", scenario: "相关源码已经改变", desc: "旧绿不冒充当前完成", impl: "no_run_record", vevidence: "invalidated" }),
     // 完全不认识的验证读数 ⇒ 显式未知
     mixedItem({ id: "cap-m-unknown", name: "读数未知的功能", scenario: "读数未知", desc: "读数未知", vstate: "unknown", vevidence: "unknown", passed: 0, required: 1 }),
     // 后端没给审查读数（旧服务）⇒ 「未知」，不是「未完成」
@@ -651,7 +822,7 @@ const FIXTURES: Record<string, { status: number; responses: Record<string, unkno
   // ⑭ 完成态与负例：每张卡一个读数（已实现/仅提交/失效/失败/无记录/未知/缺审查/超长原文）
   "p-mixed": {
     status: 200,
-    responses: { _: ledgerBody({ delivery: mixedDelivery(8), items: mixedItems() }) },
+    responses: { _: ledgerBody({ delivery: mixedDelivery(mixedItems().length), items: mixedItems() }) },
   },
   // ① 可试用：三类 Gate + 组合流程验证都通过、无阻断、功能与非作者审查齐备
   "p-ready": {
@@ -1024,6 +1195,7 @@ async function main(): Promise<void> {
   const home = path.join(tmp, "home");
   const root = path.join(tmp, "root");
   buildFixtures(home, root);
+  await buildRealGreenFixture(home, root);
 
   const backendPort = await freePort();
   const vitePort = await freePort();
@@ -1103,8 +1275,99 @@ async function main(): Promise<void> {
   console.log(`\n结论：${failed.length === 0 ? "全部通过" : `${failed.length} 项未通过`}`);
 }
 
-async function runScenarios(cdp: Cdp, base: string): Promise<void> {
-  const page = await Page.open(cdp, `${base}/#p/p-ready`);
+/**
+ * ⑲ V09-67（DESIGN §6.14 第 8 段）：交付总览的「读哪个版本」（工作区/交付候选）。
+ *
+ * 夹具项目**没有**工作区登记 ⇒ 走旧 current/active 语义：界面必须**如实标出来**、且**不臆造**工作区
+ * 参数；切「开发中」时必须带上解析出的开发根 id（旧项目＝派生 `<pid>:main`）。旧读口夹具没有
+ * `workspace` 字段 ⇒ 「实际读取的版本」显式未知，且**不得**声称版本一致或不一致（未知就是未知）。
+ * 既有断言一条不减；本场景只加断言。
+ */
+async function scenarioWorkspaceScope(page: Page, shots: (n: string) => string): Promise<void> {
+  note("── ⑲ V09-67：读哪个版本（工作区/交付候选）──");
+  await openDelivery(page, "p-ready");
+  await page.waitFor(`document.querySelector('[data-delivery-overview][data-delivery-state="ready_for_trial"]')`, 20000);
+
+  const optNames = await page.eval<string[]>(
+    `Array.from(document.querySelectorAll("[data-delivery-scope-option]")).map(function(b){return b.textContent.trim();})`,
+  );
+  check(optNames.length === 2, "版本选择器恰两项（试用版 / 开发中）", String(optNames.length));
+  check(optNames.join("/") === "试用版/开发中", "选择器两项就是「试用版」「开发中」", optNames.join("/"));
+  check((await page.attr("[data-delivery-version-picker]", "data-scope-active")) === "trial", "默认停在试用版");
+  check((await page.attr("[data-delivery-version-picker]", "data-scope-pending")) === "0", "工作区登记读回后才发清单请求（不是先按旧语义读一次）");
+  check((await page.attr("[data-delivery-version-picker]", "data-scope-legacy")) === "1", "没有登记固定试用版时明确标出旧 current/active 语义");
+  check((await page.attr("[data-delivery-version-picker]", "data-scope-param")) === "", "没有登记试用版时不带工作区参数（不臆造版本）");
+  const strayWs = await page.eval<number>(
+    `window.__DLV.calls.filter(function(c){return c.pid==="p-ready"&&c.ws!==null;}).length`,
+  );
+  check(strayWs === 0, "试用版读取没有夹带工作区参数", String(strayWs));
+
+  // 展开完整路径 + 复制：用户能自己核对"读的是哪个目录"
+  const toggled = await page.click("[data-delivery-scope-root-toggle]");
+  const fullShown = toggled && (await page.waitFor(`document.querySelector("[data-delivery-scope-root-full]") !== null`, 5000));
+  const fullText = fullShown ? (await page.text("[data-delivery-scope-root-full]")).trim() : "";
+  check(fullShown && /[\\/]p-ready$/.test(fullText), "「展开路径」显示当前工作区根目录全文", fullText.slice(-40));
+  check((await page.count("[data-delivery-scope-root-copy]")) === 1, "提供「复制」目录入口");
+  await page.click("[data-delivery-scope-root-copy]");
+  check(await page.waitFor(`document.querySelector("[data-delivery-scope-copied]") !== null`, 5000), "点「复制」后如实给出结果提示（可用/不可用都不谎称已复制）");
+  await page.click("[data-delivery-scope-root-toggle]");
+
+  const readLine = (await page.text("[data-delivery-read-workspace]")).trim();
+  check(/未知/.test(readLine), "缺 workspace 字段时「实际读取的版本」显式未知", readLine.slice(0, 60));
+  check((await page.count("[data-delivery-version-mismatch]")) === 0, "字段缺失时不断言版本一致或不一致（未知就是未知）");
+
+  // 切「开发中」：带上解析出的开发根 id（旧项目＝派生 <pid>:main），且**重新读**
+  const before = await page.eval<number>(`window.__DLV.calls.filter(function(c){return c.pid==="p-ready";}).length`);
+  await page.click('[data-delivery-scope-option="dev"]');
+  const devParam = await page.waitFor(
+    `document.querySelector("[data-delivery-version-picker]").getAttribute("data-scope-param") === "p-ready:main"`,
+    8000,
+  );
+  check(devParam, "开发视图明确当前开发根（派生 :main 的 id）", (await page.attr("[data-delivery-version-picker]", "data-scope-param")) ?? "");
+  check((await page.attr("[data-delivery-version-picker]", "data-scope-active")) === "dev", "选择器切到「开发中」");
+  check(
+    await page.waitFor(`window.__DLV.calls.filter(function(c){return c.pid==="p-ready"&&c.ws==="p-ready:main";}).length > 0`, 10000),
+    "开发视图的清单请求带上该工作区 id",
+  );
+  const after = await page.eval<number>(`window.__DLV.calls.filter(function(c){return c.pid==="p-ready";}).length`);
+  check(after > before, "切换版本确实重新读了清单（不是只改标签）", `${before} → ${after}`);
+  await page.shot(shots("19-scope-dev"));
+
+  // 切回试用版：参数回到空（旧语义），界面回到该版本的结论
+  await page.click('[data-delivery-scope-option="trial"]');
+  check(
+    await page.waitFor(`document.querySelector("[data-delivery-version-picker]").getAttribute("data-scope-param") === ""`, 8000),
+    "切回试用版后参数回到空（旧语义）",
+  );
+  await page.waitFor(`document.querySelector('[data-delivery-overview][data-delivery-state="ready_for_trial"]')`, 20000);
+  check((await page.attr("[data-delivery-version-picker]", "data-scope-active")) === "trial", "切回试用版后选择器状态正确");
+  await page.shot(shots("19-scope-trial"));
+}
+
+/**
+ * ⑳ V09-67 真服务真绿 + 真实版本核对（**无注入**，全部透传真实后端）。
+ *
+ * 与 ⑲ 的差别：⑲ 用浏览器内注入验界面契约；本场景给后端喂的是**真写口登记的合法完整声明与证据**，
+ * 所以界面拿到的 `ready_for_trial` 是**真实派生**的，不是被 mock 绿回包——「可试用绿色」的截图据此落档。
+ */
+async function scenarioRealGreen(page: Page, shots: (n: string) => string): Promise<void> {
+  note("── ⑳ V09-67：真服务真绿 + 真实版本核对（真实后端派生，无注入）──");
+  await openDelivery(page, REAL_GREEN_ID);
+  const green = await page.waitFor(`document.querySelector('[data-delivery-overview][data-delivery-state="ready_for_trial"]')`, 30000);
+  check(green, "真服务：真绿项目默认读数＝ready_for_trial（真实后端派生，未注入）", (await page.attr("[data-delivery-overview]", "data-delivery-state")) ?? "");
+  const conclusion = (await page.text("[data-delivery-conclusion]")).trim();
+  check(/可以开始人工试用/.test(conclusion), "真服务：首屏结论＝可以开始人工试用", conclusion.slice(0, 50));
+  check((await page.count("[data-delivery-version-mismatch]")) === 0, "真服务：无版本不一致告警");
+  const countsLine = (await page.text("[data-delivery-counts]")).trim();
+  check(/正式功能 [1-9]/.test(countsLine), "真服务：给出全范围正式功能计数（真实派生）", countsLine.slice(0, 60));
+  // 真实版本核对：界面实际带的 workspace 参数必须与「选择器/服务端实读」一致
+  const param = (await page.attr("[data-delivery-version-picker]", "data-scope-param")) ?? "";
+  const stray = await page.eval<number>(`window.__DLV.calls.filter(function(c){return c.pid==="${REAL_GREEN_ID}"&&c.ws!==null;}).length`);
+  check(param === "" && stray === 0, "真服务：没有登记试用版时不带 workspace 参数（与旧语义一致）", `param=${JSON.stringify(param)} stray=${stray}`);
+  await page.shot(shots("20-real-green"));
+}
+
+async function runScenarios(cdp: Cdp, base: string): Promise<void> {  const page = await Page.open(cdp, `${base}/#p/p-ready`);
   const shots = (name: string): string => path.join(OUT, `${name}.png`);
 
   try {
@@ -1128,6 +1391,8 @@ async function runScenarios(cdp: Cdp, base: string): Promise<void> {
     await scenarioFirstScreen(page, shots);
     await scenarioDetailScrollStability(page, shots);
     await scenarioRegisteredCandidateOldHost(page, shots);
+    await scenarioWorkspaceScope(page, shots);
+    await scenarioRealGreen(page, shots);
 
     check(page.exceptions.length === 0, "全程无未捕获页面异常（pageerror=0）", page.exceptions.slice(0, 3).join(" | "));
   } finally {
@@ -1897,13 +2162,13 @@ async function scenarioFirstScreen(page: Page, shots: (n: string) => string): Pr
 }
 
 /**
- * ⑭ 完成态与负例读数：提交≠已实现、失效要复验、失败要有问题、无运行投影是「暂无实现记录」、
+ * ⑭ 完成态与负例读数：提交≠已实现、失效要复验、失败要有问题、缺运行不等于无实现、
  * 后端没给审查读数是「未知」；缺口直接标在卡上；未审定原文原样完整且不横向溢出。
  */
 async function scenarioCardStatus(page: Page, shots: (n: string) => string): Promise<void> {
   note("── ⑭ 完成态与负例读数（每张卡一个状态） ──");
   await openDelivery(page, "p-mixed");
-  await page.waitFor(`document.querySelectorAll("[data-delivery-grid] [data-delivery-feature]").length === 8`, 20000);
+  await page.waitFor(`document.querySelectorAll("[data-delivery-grid] [data-delivery-feature]").length === ${mixedItems().length}`, 20000);
   await page.setViewport(1366, 900);
   await resetOverviewScroll(page);
 
@@ -1922,7 +2187,17 @@ async function scenarioCardStatus(page: Page, shots: (n: string) => string): Pro
   await differs("cap-m-submitted", "review", "未完成", "缺审查记录 ⇒ Agent审查「未完成」");
   await differs("cap-m-invalid", "verification", "需要复验", "证据已失效 ⇒ 「需要复验」");
   await differs("cap-m-failed", "verification", "有问题", "有明确失败检查 ⇒ 「有问题」");
-  await differs("cap-m-norun", "implementation", "暂无实现记录", "图上无运行投影 ⇒ 「暂无实现记录」（不是「未开始」）");
+  await differs("cap-m-norun", "implementation", "暂无执行记录", "没有执行或验证依据只说缺记录，不声称未实现");
+  await differs("cap-m-verified-norun", "implementation", "已有验证依据", "已验证但没有执行登记：不显示未开始或暂无实现");
+  await differs("cap-m-partial", "implementation", "部分结果已登记", "部分任务已提交：不显示整个功能未开始");
+  await differs("cap-m-stale-norun", "implementation", "验证依据待复核", "失效证据不能显示当前已实现");
+  await page.click('[data-delivery-feature="cap-m-verified-norun"]');
+  await page.waitFor(`document.querySelector('[data-implementation-explanation]') !== null`, 8000);
+  const implNote = await page.text('[data-implementation-explanation]');
+  check(implNote.includes("验证通过不代替执行结果提交"), "详情解释有效验证与执行结果提交的边界", implNote);
+  await page.click('[data-delivery-feature="cap-m-partial"]');
+  const partialNote = await page.text('[data-implementation-explanation]');
+  check(partialNote.includes("部分登记（1/2）"), "详情与方块共用部分登记读数", partialNote);
   await differs("cap-m-unknown", "verification", "未知", "不认识的验证读数 ⇒ 显式「未知」");
   await differs("cap-m-noreview", "review", "未知", "后端没给审查读数 ⇒ 「未知」（不是「未完成」）");
 
@@ -2009,7 +2284,7 @@ async function scenarioCardInteraction(page: Page, shots: (n: string) => string)
   await page.setViewport(1024, 820);
   await new Promise((r) => setTimeout(r, 250));
   await openDelivery(page, "p-mixed");
-  await page.waitFor(`document.querySelectorAll("[data-delivery-grid] [data-delivery-feature]").length === 8`, 20000);
+  await page.waitFor(`document.querySelectorAll("[data-delivery-grid] [data-delivery-feature]").length === ${mixedItems().length}`, 20000);
   await resetOverviewScroll(page);
   const narrowDefault = await page.count("[data-delivery-detail-pane]");
   check(narrowDefault === 0, "窄屏未选中时不占位（首屏直接是卡片）", String(narrowDefault));
@@ -2049,7 +2324,7 @@ async function scenarioCardInteraction(page: Page, shots: (n: string) => string)
   await page.click('[data-delivery-feature="cap-sync-evidence"]');
   await page.waitFor(`(function(){var n=document.querySelector('[data-delivery-detail-pane] [data-detail-name]');return !!n&&n.textContent.indexOf("同步证据发现")>=0;})()`, 8000);
   await openDelivery(page, "p-mixed");
-  await page.waitFor(`document.querySelectorAll("[data-delivery-grid] [data-delivery-feature]").length === 8`, 20000);
+  await page.waitFor(`document.querySelectorAll("[data-delivery-grid] [data-delivery-feature]").length === ${mixedItems().length}`, 20000);
   const afterSwitch = (await page.text("[data-delivery-detail-pane] [data-detail-name]")).trim();
   check(!/同步证据发现/.test(afterSwitch) && afterSwitch.length > 0, "切项目后不残留上一个项目的详情", afterSwitch);
 
@@ -2099,7 +2374,7 @@ async function scenarioDetailScrollStability(page: Page, shots: (n: string) => s
   await page.setViewport(1024, 820);
   await new Promise((r) => setTimeout(r, 250));
   await openDelivery(page, "p-mixed");
-  await page.waitFor(`document.querySelectorAll("[data-delivery-grid] [data-delivery-feature]").length === 8`, 20000);
+  await page.waitFor(`document.querySelectorAll("[data-delivery-grid] [data-delivery-feature]").length === ${mixedItems().length}`, 20000);
   await resetOverviewScroll(page);
 
   // ① 用户选卡：详情到达可视区（先证明「用户意图到达」这条路径本身可用）

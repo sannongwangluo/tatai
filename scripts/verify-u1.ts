@@ -6,7 +6,8 @@
 //   ③ 本地服务生命周期：按 backend.rs 的**等价命令**真起后端 → /health 200 → 按 backend.rs 的
 //      kill 策略 taskkill /T /F 回收 → tasklist 断言零残留（DoD② 的证据）
 //   ④ 壳内 origin 的 CORS：白名单内带 ACAO、陌生 origin 不带（DoD① 的前提：壳里前端要真能拿到数据）
-//   ⑤ 权限最小：capabilities = core:default + 一条只放 http/https 的 opener:allow-open-url
+//   ⑤ 权限最小：capabilities 普通权限 = 精确三项集合 core:default + dialog:allow-open（原生目录选择）
+//      + core:window:allow-set-theme（主题切换），外加一条只放 http/https 的 opener:allow-open-url
 //      （Q224：站外链接交系统浏览器），无 shell:*（U1 不授予进程调起能力）
 //   ⑥ 端口口径四方一致：backend.rs / 后端缺省 / 前端壳内基址 / vite 代理
 //   ⑦ 工具链：本机是否具备 Rust + linker（不具备就如实报 blocked 的原因，不假装跑过）
@@ -311,20 +312,27 @@ const allPerms = caps.flatMap((c) => c.permissions ?? []);
 const plainPerms = allPerms.filter((p): p is string => typeof p === "string");
 const scopedPerms = allPerms.filter((p): p is ScopedPerm => typeof p !== "string");
 // Q224（2026-09-19 二轮审计）：壳内点站外链接此前整窗被 WebView2 导航走，处置是交系统浏览器打开
-// （opener 插件）。这里随之由"只有 core:default"改为"core:default + **一条窄到 http/https 的**
-// opener 授权"：不放行 opener:default（会连 open-path / reveal-item-in-dir / mailto: / tel: 一起给），
-// 也不放行任何 shell:* / 进程调起能力——壳仍然不从前端调进程，那两条红线一条没松。
+// （opener 插件）。这些红线一条没松：不放行 opener:default（会连 open-path / reveal-item-in-dir /
+// mailto: / tel: 一起给），也不放行任何 shell:* / 进程调起能力——壳仍然不从前端调进程。
+// 2026-10-13（V09-71 机械维护，判据不放宽）：普通权限是**精确三项允许集合**
+//   `core:default`、`dialog:allow-open`（Q224 后加：原生目录选择，只选目录不开文件）、
+//   `core:window:allow-set-theme`（主题切换，前一轮加入）——由"只比长度"改为**集合逐一相等**，
+//   任何**多出的**权限（含任何 shell:* / 越权项）都会让判据变红，不是放宽成 `>=`。第三项的独立
+//   复核见 .工作台/diagnose-agent-entry-20261013/frontend-audit/REPORT.md（双方同 HEAD）。
+const EXPECTED_PLAIN_PERMS = ["core:default", "core:window:allow-set-theme", "dialog:allow-open"];
 const openerUrls = scopedPerms.flatMap((p) => (p.allow ?? []).map((a) => a.url ?? ""));
+const plainPermSet = [...plainPerms].sort();
+const scopedIds = scopedPerms.map((p) => p.identifier);
+const noShell = allPerms.every((p) => !String(typeof p === "string" ? p : p.identifier).startsWith("shell:"));
 ok(
   capFiles.length === 1 &&
-    plainPerms.length === 2 &&
-    plainPerms.includes("core:default") &&
-    plainPerms.includes("dialog:allow-open") &&
-    scopedPerms.length === 1 &&
-    scopedPerms[0].identifier === "opener:allow-open-url" &&
+    JSON.stringify(plainPermSet) === JSON.stringify(EXPECTED_PLAIN_PERMS) &&
+    scopedIds.length === 1 &&
+    scopedIds[0] === "opener:allow-open-url" &&
     openerUrls.length === 2 &&
-    openerUrls.every((u) => u === "https://*" || u === "http://*"),
-  `⑤ capabilities/${capFiles.join("/")} 的权限 = ${plainPerms.join(",")} + ${scopedPerms.map((p) => `${p.identifier}(${openerUrls.join("|")})`).join(",")}（核心权限 + dialog 只放原生目录选择 + 只放 http/https 的站外打开；零 shell:* ——壳不从前端调进程）`,
+    openerUrls.every((u) => u === "https://*" || u === "http://*") &&
+    noShell,
+  `⑤ capabilities/${capFiles.join("/")} 的权限 = ${plainPermSet.join(",")} + ${scopedPerms.map((p) => `${p.identifier}(${openerUrls.join("|")})`).join(",")}（普通权限集合**逐一相等**：核心 + dialog 只放原生目录选择 + core:window:allow-set-theme 主题切换；零 shell:* ——壳不从前端调进程；任何多出的权限都算越权 ⇒ 红）`,
 );
 const winLabels = conf ? ((conf.app as Record<string, unknown>)?.windows as { label: string }[]) ?? [] : [];
 ok(

@@ -29,6 +29,7 @@ import {
 } from "./budget";
 import { activeBaseline } from "./documents";
 import { loadEvents } from "./eventStore";
+import { checkWorkspaceForClaim } from "./workspaces";
 import { evidenceBlobPath } from "./evidence";
 import { taskDefinitionHash, type TaskDefinition } from "./plan";
 import { computeSyncBlock } from "./sync";
@@ -100,6 +101,11 @@ export interface TaskClaim {
   lease_expires_at: string;
   /** 隔离工作目录（项目根内相对路径或调用方给的实际路径；**隔离由执行器落实**） */
   workspace: string;
+  /**
+   * V09-63（DESIGN §6.14 第 7 段）：目标**工作区 id**（`manage_workspace` 登记的工作区；`:main` 派生或 null）。
+   * 与上面的 `workspace`（隔离运行目录）不是一回事：这是"这次执行按哪个工作区读/写"的绑定。
+   */
+  workspace_id: string | null;
   change_id: string;
   acquired_at: string;
   /** 重派/接手时如实记下的核实依据（首次认领为 null） */
@@ -136,6 +142,8 @@ export interface ClaimRecord {
   claim_token: string | null;
   lease_expires_at: string | null;
   workspace: string | null;
+  /** V09-63：目标工作区 id（payload.workspace_id；未绑定为 null） */
+  workspace_id: string | null;
   takeover_basis: string | null;
   change_id: string;
   /** 事件 role（角色名不是安全凭证，这里只作协作记录，§6.5） */
@@ -165,6 +173,7 @@ export function claimRecordOfEvent(e: WorkEvent): ClaimRecord | null {
       claim_token: strOrNull(p.claim_token),
       lease_expires_at: strOrNull(p.lease_expires_at),
       workspace: strOrNull(p.workspace),
+      workspace_id: strOrNull(p.workspace_id),
       takeover_basis: strOrNull(p.takeover_basis),
       change_id: e.change_id,
       role: e.role,
@@ -185,6 +194,7 @@ export function claimRecordOfEvent(e: WorkEvent): ClaimRecord | null {
       claim_token: null,
       lease_expires_at: null,
       workspace: strOrNull(p.workspace),
+      workspace_id: strOrNull(p.workspace_id),
       takeover_basis: null,
       change_id: e.change_id,
       role: e.role,
@@ -205,6 +215,7 @@ export function claimRecordOfEvent(e: WorkEvent): ClaimRecord | null {
       claim_token: strOrNull(p.claim_token),
       lease_expires_at: null,
       workspace: null,
+      workspace_id: null,
       takeover_basis: null,
       change_id: e.change_id,
       role: e.role,
@@ -319,7 +330,10 @@ export type ClaimFailureCode =
   | "EVIDENCE_MISSING"
   | "NOT_CLAIMABLE"
   /** 项目预算约束到顶：领取下一任务被拒（§5.7；已落 `budget.blocked` 留证） */
-  | "BUDGET_EXHAUSTED";
+  | "BUDGET_EXHAUSTED"
+  /** V09-63：目标工作区未知/不属本项目/已回收（§6.14 第 6 段） */
+  | "WORKSPACE_UNKNOWN"
+  | "WORKSPACE_MISMATCH";
 
 export interface ClaimFailure {
   ok: false;
@@ -364,6 +378,8 @@ function claimPayloadOf(claim: TaskClaim, action: "claim" | "renew"): Record<str
     lease_expires_at: claim.lease_expires_at,
     workspace: claim.workspace,
     takeover_basis: claim.takeover_basis,
+    // V09-63：目标工作区 id **只在绑定时**进 payload——未绑定的认领 payload 与旧路径逐字节一致（向后兼容）
+    ...(claim.workspace_id === null ? {} : { workspace_id: claim.workspace_id }),
   };
 }
 
@@ -462,6 +478,11 @@ export interface ClaimTaskInput {
   expected_revision?: number | null;
   /** 隔离工作目录（缺省给 `.工作台/runs/<task>/<attempt_id>`） */
   workspace?: string;
+  /**
+   * V09-63：目标**工作区 id**（`manage_workspace` 登记的工作区；`:main` 派生或省略＝不绑定）。绑定时认领事件
+   * 带 `workspace_id`，入口读回同一 id；未知/不属本项目/已回收一律拒绝认领。
+   */
+  workspace_id?: string | null;
   lease_ms?: number;
   run_id?: string;
   attempt?: number;
@@ -544,6 +565,23 @@ export async function claimTask(
       workDir,
       { current_revision: state.revision, failures: [`任务 ${taskId} 处于阻塞态：${reason}`] },
     );
+  }
+
+  // V09-63（DESIGN §6.14 第 6/10 段）：目标工作区 id 必须存在、属本项目、未回收；未知/跨项目一律拒领。
+  // 放在状态/认领检查之后、外部依赖之前——目标工作区不符是**本卡自身**的错，先于"谁持有/预算/同步"报出。
+  const boundWorkspaceId = input.workspace_id === undefined || input.workspace_id === "" ? null : input.workspace_id;
+  if (boundWorkspaceId !== null) {
+    const wsCheck = checkWorkspaceForClaim(projectId, dataDir, boundWorkspaceId);
+    if (!wsCheck.ok) {
+      return failure(
+        wsCheck.code === "WORKSPACE_MISMATCH" ? "WORKSPACE_MISMATCH" : "WORKSPACE_UNKNOWN",
+        `领取被拒：${wsCheck.message ?? `目标工作区不可用：${boundWorkspaceId}`}（DESIGN.md §6.14 第 6 段）`,
+        projectId,
+        taskId,
+        workDir,
+        { current_revision: state.revision, failures: [wsCheck.message ?? "目标工作区不可用"] },
+      );
+    }
   }
 
   // ── 同步批次阻断（V09-23／DESIGN §2.10）──
@@ -680,6 +718,7 @@ export async function claimTask(
     claim_token: newClaimToken(),
     lease_expires_at: new Date(Date.parse(now) + (input.lease_ms ?? DEFAULT_LEASE_MS)).toISOString(),
     workspace: input.workspace ?? defaultWorkspace(taskId, attemptId),
+    workspace_id: boundWorkspaceId,
     change_id: input.change_id,
     acquired_at: acquiredAt,
     takeover_basis: takeover === "" ? null : takeover,
@@ -749,6 +788,8 @@ export interface RenewClaimInput {
   claim_token: string;
   expected_revision: number;
   workspace?: string;
+  /** V09-63：续约携带目标工作区 id（缺省沿用既有认领的绑定） */
+  workspace_id?: string | null;
   lease_ms?: number;
   now?: string;
 }
@@ -799,6 +840,7 @@ export async function renewClaim(
     claim_token: input.claim_token,
     lease_expires_at: new Date(Date.parse(now) + (input.lease_ms ?? DEFAULT_LEASE_MS)).toISOString(),
     workspace: input.workspace ?? held?.workspace ?? defaultWorkspace(input.task_id, held?.attempt_id ?? `att-${input.task_id}`),
+    workspace_id: input.workspace_id === undefined ? held?.workspace_id ?? null : input.workspace_id === "" ? null : input.workspace_id,
     change_id: input.change_id,
     acquired_at: renewStamp,
     takeover_basis: null,

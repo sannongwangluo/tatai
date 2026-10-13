@@ -23,6 +23,7 @@
 import { sha256Hex } from "./plan";
 import { requiredChecksOf, scopeVersionOf, type ObligationSet, type StableCheckDefinition } from "./obligations";
 import { packageRevisionOf } from "./featureLedger";
+import { readWorkspacesForProject, workspaceContinuation, type WorkspaceContinuation } from "./workspaceGuard";
 import type { ProjectFacts, StatusProjection } from "./statusProjection";
 import type {
   CheckEffective,
@@ -51,6 +52,7 @@ export const TOOL_PARAM_KEYS: Readonly<Record<string, readonly string[]>> = {
     "change_id",
     "expected_revision",
     "workspace",
+    "workspace_id",
     "lease_ms",
     "attempt",
     "takeover_basis",
@@ -287,6 +289,18 @@ export interface WorkPackageExtras {
   lock_in_not_checked: { kind: string; reason: string }[];
   /** 旧客户端提示：不识别 `work_package` 的调用方**不具备完整接续能力**（§2.7） */
   legacy_client_note: string;
+  /**
+   * V09-63 续修（DESIGN §6.14 第 7 段）：本包的目标工作区/实际 cwd/可改范围/候选状态与
+   * **机器可执行下一步的实际参数**——**默认可见**（不再藏在 `opts.workspaces` 之后）。
+   * 坏指针时 `workspace.source="blocked"`、`workspace.root=null`（不静默回落 :main）。
+   */
+  workspace: WorkPackageWorkspace;
+}
+
+/** 工作包里的目标工作区上下文（与入口 `context_manifest.workspace` 同源；`manage_workspace(op=read)` 同判据） */
+export interface WorkPackageWorkspace extends WorkspaceContinuation {
+  /** 项目与唯一账本/工作台的定位锚点（`ProjectRecord.path`；不被工作区指针改写） */
+  anchor_root: string;
 }
 
 export type WorkPackageFull = WorkPackage & WorkPackageExtras;
@@ -936,6 +950,34 @@ export function buildWorkPackage(
     markUnsupported("claim_task", "reopen", `${coordinateBasis}——受控重开是协调者专用动作（附录 F）`);
   }
 
+  // ── V09-66（§6.14 第 7 段）：技术完成且有有效授权时，给 finalize_local_commit 的**机器可执行下一步** ──
+  // 判据同源：`satisfied`＝canonical 技术完成（必需项全过 + 独审义务满足 + 无阻断缺陷）；授权＝存在当前认领
+  // （`snapshot.ownership`）。目标工作区＝当前试用候选（优先）＞认领所记 workspace＞当前开发工作区。
+  const wsView = readWorkspacesForProject(snapshot.project_id, snapshot.data_dir);
+  const trialId = wsView.pointer.current_trial_workspace_id ?? "";
+  const ownershipWs = (snapshot.ownership?.workspace ?? "").trim();
+  const devId = wsView.current_dev.source === "blocked" ? "" : wsView.current_dev.workspace_id;
+  const finalizeWorkspaceId = trialId !== "" ? trialId : ownershipWs !== "" ? ownershipWs : devId;
+  const hasAuthorization = snapshot.ownership !== null && (snapshot.ownership.owner_id ?? "") !== "";
+  const finalizeApplicable = taskId !== null && satisfied && finalizeWorkspaceId !== "" && hasAuthorization;
+  const finalizeOperation: NextOperation | null = finalizeApplicable
+    ? {
+        tool: "finalize_local_commit",
+        operation: "finalize",
+        known_args: {
+          project_id: snapshot.project_id,
+          task_id: taskId,
+          workspace_id: finalizeWorkspaceId,
+          subject: `feat(${taskId}): 技术验证与独立审查通过，本地收尾`,
+        },
+        missing_args: [],
+        guidance: [
+          "技术验证与独立审查当前通过且持有有效授权：由已获授权 Agent 触发本地收尾（DESIGN §6.14 第 9 段）。" +
+            "宿主在执行时自行重核授权/技术/独审/冻结候选并核提交内容===受验输入；**请求不得自带** grant/通过布尔/root；不 push、不改远端/配置。",
+        ],
+      }
+    : null;
+
   const workPackage: WorkPackageFull = {
     scope_id: scope.scope_id,
     scope_revision: scopeRevision,
@@ -957,7 +999,7 @@ export function buildWorkPackage(
     source_mode: snapshot.source_mode,
     status: proj?.display_status ?? null,
     checks: page,
-    completion: { satisfied, remaining_checks: remaining, blocking_findings: blockingFindings },
+    completion: { satisfied, remaining_checks: remaining, blocking_findings: blockingFindings, finalize: finalizeOperation },
     continuation: { action_id: actionId, role: nextRole, operation: snapshot.next_action, reason, prerequisite },
     paging,
     schema: "work-package/1",
@@ -965,6 +1007,8 @@ export function buildWorkPackage(
     unsupported,
     lock_in_not_checked: LOCK_IN_NOT_CHECKED.map((r) => ({ ...r })),
     legacy_client_note: LEGACY_CLIENT_NOTE,
+    // V09-63 续修：目标工作区/实际 cwd/可改范围/候选状态**默认可见**（DESIGN §6.14 第 7 段）。
+    workspace: { ...workspaceContinuation(snapshot.project_id, snapshot.data_dir), anchor_root: wsView.anchor_root },
   };
   return { ok: true, work_package: workPackage };
 }

@@ -80,7 +80,8 @@ function isolatedHome(projects: { id: string; name?: string; path: string; kind:
   return dir;
 }
 
-/** 诊断快照已知反例（来自 `COORDINATOR-CHECKS.json`：**旧版**同一 scope 跨图状态不同） */
+/** 诊断快照已知反例（来自 `COORDINATOR-CHECKS.json`：**旧版**同一 scope 跨图状态不同）——`old` 只作历史记录，
+ *  本段不再据它断言状态值；真正的对账判据是下面 `canonicalKeyOf`（与 UI 同一上屏键换算）＋ `DIAGNOSED_EXPECTED_KEY`。 */
 const DIAGNOSED_DIVERGENCE: Record<string, Record<string, string>> = {
   tatai: {
     "plan:cap:08": "functional=verified|architecture=pending_verification|module_map=verified",
@@ -92,6 +93,40 @@ const DIAGNOSED_DIVERGENCE: Record<string, Record<string, string>> = {
   },
   "示例项目": { "plan:cap:11": "functional=blocked|architecture=unmapped|module_map=blocked" },
 };
+
+/**
+ * 2026-10-09 对齐现行 canonical `scope_readouts`（**非放水、不硬钉数据面**）：上屏键由 `canonicalKeyOf` 从
+ * **当前** canonical 读数换算，判据随 mapping 形态自适应——
+ *   · `mapping==="mapped"`（真实映射）⇒ 该范围须在 **≥2 张图**出现、跨图同状态、且＝canonical 上屏键；
+ *   · `mapping==="unmapped"`（未映射）⇒ 允许只在架构图落单节点，但键必须**如实** `unmapped`（不假绿）。
+ * 不再登记逐 cap 的固定预期键：那样会把「换成另一份**合法**映射的数据面」误判成必须 fail，既不是回归负例、
+ * 也不通用。真正的负边界见 A′ 段（同一判据喂入与 canonical 不符/缺失的图状态 ⇒ 必拒）。
+ * 归因证据（差异由**数据**驱动、与本批源码无关）：`impl-regression-final/` 的 `C-cross-*.log`。
+ * `示例项目` 由 `DIAGNOSED_DIVERGENCE` 登记，走同一判据。
+ */
+
+/** canonical 投影 → 上屏键（与 `projectGraph.canonicalScopeStatusOf`→`directStatusOf`→`moduleStatusKeysOf` **同判据**）：
+ *  `mapping==="unmapped"` ⇒ 不空集判绿、如实「unmapped」（读数侧 display 仍保留 canonical 文案 `planned`，但不作完成色）；
+ *  `mapping==="mapped"` ⇒ 取 canonical `display_status`（真绿/橙/红/待验证照旧上去，判据不放宽）。 */
+const canonicalKeyOf = (
+  ro: { available: boolean; mapping: string | null; display: string | null } | undefined,
+): string | null =>
+  ro === undefined || !ro.available ? null : ro.mapping === "unmapped" ? "unmapped" : (ro.display ?? "unmapped");
+
+/** 诊断对象的通用判据（跨数据面一致）：节点存在、跨图同状态、且＝canonical 上屏键；
+ *  真实映射必须跨 ≥2 图，未映射允许架构图单图但键须如实 `unmapped`。任一条不符即拒。 */
+function diagnosedCapOk(
+  per: string[],
+  ro: { available: boolean; mapping: string | null; display: string | null } | undefined,
+): boolean {
+  if (ro === undefined || !ro.available) return false;
+  const canonicalKey = canonicalKeyOf(ro);
+  if (canonicalKey === null || per.length < 1) return false;
+  const uniq = [...new Set(per)];
+  if (uniq.length !== 1 || uniq[0] !== canonicalKey) return false;
+  if (ro.mapping !== "unmapped" && per.length < 2) return false;
+  return true;
+}
 
 /** 图节点的主状态键（`GraphObjectState.status_key`：六态 / `no_status_record` / `unmapped`） */
 function nodeStatusOf(graph: unknown, id: string): string | null {
@@ -136,16 +171,18 @@ if (wanted.length === 0) {
       `${pid}：${checked} 个跨图出现的范围逐 id 同状态（0 差异${diverged.length === 0 ? "" : `；差异 ${diverged.slice(0, 3).join("；")}`}）`,
     );
 
-    // 对照诊断快照：旧的差异对象现在应一致，且**状态由 canonical 投影给**（不是被折叠/隐藏）
+    // 对照诊断快照：旧的差异对象现在应一致，且**状态由 canonical 投影给**（不是被折叠/隐藏）。
+    // 上屏键换算与 UI 同判据（`canonicalKeyOf`＝`canonicalScopeStatusOf`→`directStatusOf`→`moduleStatusKeysOf`）；
+    // 判据随 mapping 形态自适应（`diagnosedCapOk`）：真实映射要求 ≥2 图一致，未映射允许架构图单图但键须如实。
     const diag = DIAGNOSED_DIVERGENCE[pid] ?? {};
     for (const [cap, oldDiff] of Object.entries(diag)) {
       const per = VIEWS.map((v) => nodeStatusOf(snapshot.graphs[v], cap)).filter((s): s is string => s !== null);
-      const uniq = [...new Set(per)];
       const ro = snapshot.scope_readouts[cap];
-      const canonicalKey = ro === undefined ? null : ro.available ? (ro.display ?? "unmapped") : null;
+      const canonicalKey = canonicalKeyOf(ro);
+      const mapped = ro !== undefined && ro.available && ro.mapping !== "unmapped";
       ok(
-        per.length >= 2 && uniq.length === 1 && ro !== undefined && ro.available && canonicalKey === uniq[0],
-        `${pid} ${cap}：诊断差异已消失（旧 ${oldDiff} ⇒ 现全部 ${uniq.join("/")}，且＝canonical ${canonicalKey}）`,
+        diagnosedCapOk(per, ro),
+        `${pid} ${cap}：诊断差异已消失（旧 ${oldDiff} ⇒ 现图上 ${[...new Set(per)].join("/") || "（无节点）"}，且＝canonical 上屏键 ${canonicalKey}；readout mapping=${ro?.mapping} display=${ro?.display}；判据：${mapped ? "真实映射要求 ≥2 图同状态" : "未映射允许架构图单图、键须如实 unmapped"}）`,
       );
     }
     if (pid === "示例项目") {
@@ -164,6 +201,31 @@ if (wanted.length === 0) {
     }
     fs.rmSync(home, { recursive: true, force: true });
   }
+}
+
+// ══════════════ A′. 诊断判据负边界（同一判据喂入与 canonical 不符/缺失的图状态 ⇒ 必拒） ══════════════
+
+section("A′. 诊断判据负边界：不靠「合法数据面应 fail」，用与 canonical 不符/缺失的图状态证明判据有区分力");
+
+{
+  const unmappedRo = { available: true, mapping: "unmapped", display: "planned" };
+  const mappedRo = { available: true, mapping: "mapped", display: "verified" };
+  const mappedPendingRo = { available: true, mapping: "mapped", display: "pending_verification" };
+  ok(diagnosedCapOk(["unmapped"], unmappedRo), "A′ 正例：未映射、架构图单节点＝unmapped ⇒ 通过（如实，不假绿）");
+  ok(diagnosedCapOk(["verified", "verified"], mappedRo), "A′ 正例：真实映射、两图同 canonical（verified）⇒ 通过");
+  ok(
+    diagnosedCapOk(["pending_verification", "pending_verification", "pending_verification"], mappedPendingRo),
+    "A′ 正例：真实映射、多图同 canonical（pending_verification）⇒ 通过",
+  );
+  ok(!diagnosedCapOk(["verified"], unmappedRo), "A′ 反例：未映射却上屏 verified（假绿）⇒ 必拒");
+  ok(!diagnosedCapOk(["verified"], mappedRo), "A′ 反例：真实映射只在单图出现（跨图缺失）⇒ 必拒");
+  ok(!diagnosedCapOk(["verified", "pending_verification"], mappedRo), "A′ 反例：两图状态不一致 ⇒ 必拒");
+  ok(!diagnosedCapOk(["pending_verification"], mappedRo), "A′ 反例：图上状态与 canonical（verified）不符 ⇒ 必拒");
+  ok(!diagnosedCapOk([], unmappedRo), "A′ 反例：应出现的节点缺失（六图皆无）⇒ 必拒");
+  ok(
+    !diagnosedCapOk(["unmapped"], { available: false, mapping: null, display: null }),
+    "A′ 反例：canonical 不可用 ⇒ 必拒（不与图对账，不造绿）",
+  );
 }
 
 // ══════════════════════ 夹具：canonical 判据正/反例 ══════════════════════

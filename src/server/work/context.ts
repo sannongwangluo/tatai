@@ -53,7 +53,77 @@ import { readLedger } from "./ledgerRead";
 import { importTaskDefinitions, taskDefinitionHash, type TaskDefinition } from "./plan";
 import { PROJECT_NOTES_REL, projectNotesFileInfo } from "./projectIndex";
 import { readTaskStates, type TaskState } from "./tasks";
+import {
+  mainWorkspaceId,
+  readWorkspaces,
+  resolveCurrentDevRoot,
+  resolveDevFromProjection,
+} from "./workspaces";
+import type { WorkspaceDevResolution } from "../../shared/workspaceTypes";
+import { memoizedForDerivation } from "./derivationScope";
 import type { LedgerContentFingerprint, WorkEvent } from "./types";
+
+/**
+ * 当前开发根解析（V09-63 源根贯通；§6.14 第 2/6/10 段）：上下文包的**源码**读口按工作区指针解析。
+ *
+ * 工作区记录与当前指针都在**同一份** v2 事件账本里，所以给了 `events`（本次请求已现读的同一份快照）
+ * 就只**折叠这份快照**（`readWorkspaces(workDir, events)`，纯内存、**不再读盘**）；没有快照的公共入口
+ * （`readContextSource`／`packageStaleness`／`resolveCheckpoint` 等未带 snapshot 时）仍按既有
+ * `resolveCurrentDevRoot` 现读——行为逐字不变。
+ *
+ * **只共享本次现读**：`memoizedForDerivation` 在一次同步派生的生命期内按 (项目, dataDir, 是否快照) 去重，
+ * `finally` 一到即清，**不做任何跨请求缓存**——下一次调用立刻能看见新指针/新事件，绝不拿旧指针当现态。
+ *
+ * 坏指针（有显式指针却指向不存在/已回收的工作区）或目录不在盘上 → **明确拒绝**，绝不静默回退注册表锚点根
+ * （有显式指针就不"未读取就默认 main"）。**中央**账本/修订/证据仍走锚点（见 projectWorkDir）。
+ */
+function devResolutionOf(
+  projectId: string,
+  dataDir: string | undefined,
+  events: readonly WorkEvent[] | undefined,
+): WorkspaceDevResolution {
+  return memoizedForDerivation(
+    "context:current-dev-root",
+    `${projectId}\u0000${dataDir ?? ""}\u0000${events === undefined ? "live" : "snapshot"}`,
+    () => {
+      if (events === undefined) return resolveCurrentDevRoot(projectId, dataDir);
+      const project = getProject(projectId, dataDir);
+      if (!project) {
+        throw new ContextError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`, { project_id: projectId });
+      }
+      const projection = readWorkspaces(projectWorkDir(projectId, dataDir), events);
+      const pointer = projection.pointer;
+      if (pointer === null) {
+        return { workspace_id: mainWorkspaceId(projectId), root: path.resolve(project.path), source: "main" };
+      }
+      return resolveDevFromProjection(projectId, project.path, projection, pointer);
+    },
+  );
+}
+
+function sourceRootOf(projectId: string, dataDir?: string, events?: readonly WorkEvent[]): string {
+  const dev = devResolutionOf(projectId, dataDir, events);
+  if (dev.root === null) {
+    throw new ContextError("INVALID_INPUT", `当前开发指针不可用（source=${dev.source}）：${dev.blocked_reason ?? "目标工作区不可用"}——拒绝读源，不静默回退项目根（DESIGN.md §6.14 第 2/10 段）`, { project_id: projectId, workspace_id: dev.workspace_id });
+  }
+  if (!fs.existsSync(dev.root) || !fs.statSync(dev.root).isDirectory()) {
+    throw new ContextError("INVALID_INPUT", `当前开发工作区目录不在盘上：${dev.root}（工作区 ${dev.workspace_id}）——拒绝读源`, { project_id: projectId, root: dev.root });
+  }
+  return dev.root;
+}
+
+/**
+ * `docs/project-notes.json` 在**当前开发根**下的绝对路径；开发根解析不出（坏指针/账本读不出）返回 null。
+ * 用途：上下文包先判说明文件在不在，不存在就直接跳过——不为"不存在"再解析一次开发根（那会多读一遍账本）。
+ * 解析不出与 `projectNotesFileInfo` 内部同判（`exists:false`，不入清单、不进 omitted）。
+ */
+function notesPathUnderDevRoot(projectId: string, dataDir: string | undefined, events: readonly WorkEvent[] | undefined): string | null {
+  try {
+    return path.join(sourceRootOf(projectId, dataDir, events), ...PROJECT_NOTES_REL.split("/"));
+  } catch {
+    return null;
+  }
+}
 
 /** 上下文包格式版本（与 v2 事件格式分开：包是派生物，不进事实源） */
 export const CONTEXT_PACKAGE_SCHEMA = 1 as const;
@@ -552,17 +622,19 @@ export interface ContextSourceRead {
  *
  * 路径只接受**项目根内相对路径**；`cursor` 绑定内容哈希，源变了抛 `SOURCE_CHANGED`
  * （不是静默返回旧内容，也不是悄悄从头读）。
+ *
+ * `events`：本次请求已现读的**同一份**账本快照（调用方已有就传，解析"当前开发根"不再为工作区指针另读一遍盘）；
+ * 不传仍按既有 `resolveCurrentDevRoot` 现读（行为不变）。
  */
 export function readContextSource(
   projectId: string,
   rel: string,
-  opts: { dataDir?: string; cursor?: string; maxChars?: number } = {},
+  opts: { dataDir?: string; cursor?: string; maxChars?: number; events?: readonly WorkEvent[] } = {},
 ): ContextSourceRead {
-  const project = getProject(projectId, opts.dataDir);
-  if (!project) {
+  if (!getProject(projectId, opts.dataDir)) {
     throw new ContextError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`, { project_id: projectId });
   }
-  const root = path.resolve(project.path);
+  const root = sourceRootOf(projectId, opts.dataDir, opts.events);
   const abs = resolveInRoot(root, rel);
   if (abs === null) {
     throw new ContextError("INVALID_INPUT", `只接受项目根内的相对路径：${JSON.stringify(rel)}`, {
@@ -939,6 +1011,23 @@ export function buildContextPackage(projectId: string, opts: BuildContextOptions
     });
   }
 
+  // ⓪ 本**次请求**的账本事件快照（V09-39 上游接线）：调用方（唯一宿主只读入口 / `entry.ts`）已为本次请求
+  //    现读的**同一份** `WorkEvent[]`。本包内的"当前开发根解析"与"任务状态投影"都折叠这份快照，**不再另读盘**；
+  //    空数组是**合法快照**（"这个 workDir 现在没有事件"），不得当作"没传"再读一遍。
+  //    现读失败：留 `undefined`，交给下游各自的既有失败路径如实表达（失败语义逐字不变，不伪装成空账本）。
+  let ledgerEvents: readonly WorkEvent[] | undefined = opts.events;
+  let ledgerContent: LedgerContentFingerprint | null = opts.eventsContent ?? null;
+  if (ledgerEvents === undefined) {
+    try {
+      const read = readLedger(projectWorkDir(projectId, opts.dataDir));
+      ledgerEvents = read.events;
+      ledgerContent = read.content;
+    } catch {
+      // 现读失败：留给下游（工作区指针解析 / readTaskStates）走原路径抛错并如实登记
+      ledgerContent = null;
+    }
+  }
+
   // ① 图纸：设计书 + 施工图（唯一当前源；修订号进包）
   //    上一版包在时，来源内容没变的会带 "沿用上一版包（内容未变）" 的登记（增量口径）
   const design = loadDocumentEntry(projectId, "design", opts.dataDir, manifest, omitted, stale, previous);
@@ -988,26 +1077,32 @@ export function buildContextPackage(projectId: string, opts: BuildContextOptions
 
   // ②b 可选：项目说明索引（docs/project-notes.json，V09-39）——存在就纳入来源清单（真实内容哈希）；
   //     不存在是**正常空态**（不强制首建全仓说明才接续、也不进 omitted）；异 schema/读不出如实标。
-  try {
-    const notes = projectNotesFileInfo(projectId, opts.dataDir);
-    if (notes.exists) {
-      manifest.push({
-        path: PROJECT_NOTES_REL,
-        kind: "project_notes",
-        content_sha256: notes.version_sha256,
-        size: null,
-        taken: null,
-        taken_bytes: null,
-        covered: { chars: 0, total_chars: null, complete: true },
-        status: notes.schema_ok ? "ok" : "failed",
-        note: notes.schema_ok
-          ? `Agent 编写的项目说明索引（待审说明层，${notes.entry_count} 条）：不是设计/事件/验收事实，不改六图颜色/状态/Gate`
-          : `说明索引存在但不是本 schema（${notes.conflict?.code ?? "conflict"}）：不按本 schema 采信、不可覆盖`,
-      });
-      if (!notes.schema_ok) stale.push(`说明索引不可按本 schema 采信：${notes.conflict?.message ?? ""}`);
+  //     说明文件是**当前开发根内的源文件**：先按本次已解析的开发根判在不在（给了快照就纯折叠、不读盘）；
+  //     不在就直接跳过——不为"不存在"再解析一次开发根（那会在同一次上下文派生里多读一遍账本）。
+  //     开发根解析不出的情形与 `projectNotesFileInfo` 内部同判（`exists:false`，不入清单、不进 omitted）。
+  const notesAbs = notesPathUnderDevRoot(projectId, opts.dataDir, ledgerEvents);
+  if (notesAbs !== null && fs.existsSync(notesAbs)) {
+    try {
+      const notes = projectNotesFileInfo(projectId, opts.dataDir);
+      if (notes.exists) {
+        manifest.push({
+          path: PROJECT_NOTES_REL,
+          kind: "project_notes",
+          content_sha256: notes.version_sha256,
+          size: null,
+          taken: null,
+          taken_bytes: null,
+          covered: { chars: 0, total_chars: null, complete: true },
+          status: notes.schema_ok ? "ok" : "failed",
+          note: notes.schema_ok
+            ? `Agent 编写的项目说明索引（待审说明层，${notes.entry_count} 条）：不是设计/事件/验收事实，不改六图颜色/状态/Gate`
+            : `说明索引存在但不是本 schema（${notes.conflict?.code ?? "conflict"}）：不按本 schema 采信、不可覆盖`,
+        });
+        if (!notes.schema_ok) stale.push(`说明索引不可按本 schema 采信：${notes.conflict?.message ?? ""}`);
+      }
+    } catch (e) {
+      stale.push(`说明索引读取失败：${sanitizeErrorMessage((e as Error).message)}`);
     }
-  } catch (e) {
-    stale.push(`说明索引读取失败：${sanitizeErrorMessage((e as Error).message)}`);
   }
 
   // 增量重建的沿用判据：图纸修订与提问都没变 → 上次派生的任务/章节直接沿用（不重解析）
@@ -1112,21 +1207,8 @@ export function buildContextPackage(projectId: string, opts: BuildContextOptions
   );
   const taskCounts: Record<string, number> = {};
   const states: Record<string, TaskState> = {};
-  // V09-39 上游接线：优先复用调用方（唯一宿主只读入口 / entry.ts）已现读的**同一份**账本事件，不再另读盘；
-  // 未提供时现读一次 `readLedger`（顺带拿到**真实内容身份**）。`eventsContent` 是真实字节 sha256，
-  // **绝不拿 `last_seq:N` 冒充内容哈希**（契约 U1/U2；复审材料项）。
-  let ledgerEvents: readonly WorkEvent[] | undefined = opts.events;
-  let ledgerContent: LedgerContentFingerprint | null = opts.eventsContent ?? null;
-  if (ledgerEvents === undefined) {
-    try {
-      const read = readLedger(projectWorkDir(projectId, opts.dataDir));
-      ledgerEvents = read.events;
-      ledgerContent = read.content;
-    } catch {
-      // 现读失败：留给下面的 readTaskStates 走原路径抛错并如实登记（失败语义逐字不变）
-      ledgerContent = null;
-    }
-  }
+  // 复用**本次请求**已现读的同一份账本快照（见 ⓪ 处；调用方未给时已在 ⓪ 处现读并取到**真实内容身份**）。
+  // `eventsContent` 是真实字节 sha256，**绝不拿 `last_seq:N` 冒充内容哈希**（契约 U1/U2；复审材料项）。
   try {
     const projection = readTaskStates(
       projectWorkDir(projectId, opts.dataDir),
@@ -1203,6 +1285,8 @@ export function buildContextPackage(projectId: string, opts: BuildContextOptions
     const read = readContextSource(projectId, pageDoc.source.rel_path, {
       ...(opts.dataDir === undefined ? {} : { dataDir: opts.dataDir }),
       maxChars: pageBudget,
+      // 解析"当前开发根"复用 ⓪ 处本次请求已现读的**同一份**账本快照（有则不再为工作区指针读盘）
+      ...(ledgerEvents === undefined ? {} : { events: ledgerEvents }),
     });
     // U3 上游接线：设计/施工页给**新格式** `tcur1` 完整版本游标（完整 64 位 sha ＋ 项目/文档绑定），
     // 才能被 read_design/read_plan 直接消费；旧的 `tctx1` 短前缀只定位、会被新 MCP 拒（复审材料项）。
@@ -1330,9 +1414,8 @@ export function packageStaleness(
   projectId: string,
   dataDir?: string,
 ): { stale: boolean; stale_reasons: string[]; changed: { path: string; detail: string }[] } {
-  const project = getProject(projectId, dataDir);
-  if (!project) throw new ContextError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`, { project_id: projectId });
-  const root = path.resolve(project.path);
+  if (!getProject(projectId, dataDir)) throw new ContextError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`, { project_id: projectId });
+  const root = sourceRootOf(projectId, dataDir);
   const changed: { path: string; detail: string }[] = [];
   for (const entry of pkg.source_manifest) {
     if (entry.kind === "baseline" || entry.kind === "task_state") continue; // 这两类按 id/seq 记，另有判据
@@ -1588,9 +1671,8 @@ export function resolveCheckpoint(
   projectId: string,
   dataDir?: string,
 ): ResumeResolution {
-  const project = getProject(projectId, dataDir);
-  if (!project) throw new ContextError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`, { project_id: projectId });
-  const root = path.resolve(project.path);
+  if (!getProject(projectId, dataDir)) throw new ContextError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`, { project_id: projectId });
+  const root = sourceRootOf(projectId, dataDir);
   const confirmed: LedgerSeed[] = [];
   const source_changed: { path: string; was: string; now: string }[] = [];
   for (const s of checkpoint.confirmed_sources) {

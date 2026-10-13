@@ -152,6 +152,14 @@ export const REGISTERED_EVENT_TYPES: readonly EventTypeRegistration[] = [
   // 写口在唯一写入服务文件锁内按**当前实际目标**复核（伪造 passed 与计算后变化一律拒、零字节）。
   { type: "sync.contract_registered", owner: "V09-23", entity_prefix: "sync:", payload: "schema_version/batch_id/project_id/title/sources[{path,sha256}]/items[{id,label,required,check}]/blocks_entry/supersedes?（闭键；冻结内容地址 SHA256；同批次改内容拒）" },
   { type: "sync.evidence_checked", owner: "V09-23", entity_prefix: "sync:", payload: "batch_id/contract_sha256/evidence_sha256/evidence_path/overall/target_fingerprint/items[{id,required,verdict}]（稳定幂等键；写口按当前实际目标重算并逐项比对）" },
+  // V09-63（DESIGN §6.13/§6.14）：项目工作目录与交付候选——按需登记的工作区（`workspace:<id>`）、
+  // 项目级指针（`workspace-pointer:<project>`）与冻结/回收事实。候选**不复制第二套可写 .工作台/**（§6.14 第 1 段）。
+  // payload 闭键 + 锁内 CAS/角色/路径边界/冻结源重核见 `workspaces.assertWorkspaceWriteCommand`。
+  { type: "workspace.registered", owner: "V09-63", entity_prefix: "workspace:", payload: "kind/purpose/root/source_kind/source_commit?/source_ref?/content_fingerprint?/owner_role?/task_ids?（闭键；root 须规范绝对路径且非私有 .工作台）" },
+  { type: "workspace.updated", owner: "V09-63", entity_prefix: "workspace:", payload: "purpose/source_kind/source_commit/source_ref/content_fingerprint/task_ids/owner_role 的子集（至少一个；对 frozen 改来源拒 CANDIDATE_FROZEN）" },
+  { type: "workspace.frozen", owner: "V09-63", entity_prefix: "workspace:", payload: "content_fingerprint/included_uncommitted/declared_paths/candidate_index_revision?/source_commit?/version_binding（锁内宿主实测重核源指纹；以 HEAD 顶替拒）" },
+  { type: "workspace.retired", owner: "V09-63", entity_prefix: "workspace:", payload: "reason/reachability（只记状态，不声称物理目录已清理）" },
+  { type: "workspace.pointed", owner: "V09-63", entity_prefix: "workspace-pointer:", payload: "current_dev_workspace_id?/current_trial_workspace_id?/basis?（改项目级指针，不改 ProjectRecord.path）" },
 ];
 
 /** 未挂变更批次的实体（需求注册、批次自身）在事件信封里用的批次占位值（信封的 change_id 必须非空） */

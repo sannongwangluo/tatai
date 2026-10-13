@@ -27,6 +27,7 @@ import {
   validateSyncContract,
 } from "./syncContract";
 import { resolveProjectRelative } from "./documents";
+import { resolveCurrentDevRoot } from "./workspaces";
 import {
   batchIdOfEvidenceFile,
   businessEventsFingerprint,
@@ -38,6 +39,7 @@ import {
 } from "./syncChecks";
 import { buildRepairPlan, type RepairBatchInput, type TargetShaReader } from "./syncRepair";
 import { syncGraphProbe, syncGraphSourceProbe, type SyncGraphProbe, type SyncGraphProbeResult } from "./syncProbe";
+import { withoutDerivationScope } from "./derivationScope";
 import {
   SYNC_BATCH_ID_RE,
   SYNC_EVIDENCE_FILE_SUFFIX,
@@ -120,15 +122,64 @@ export type { SyncGraphProbe, SyncGraphProbeResult } from "./syncProbe";
 
 interface ProjectCtx {
   projectId: string;
-  projectRoot: string;
+  /** **中央事实域根**（注册表锚点）：`.工作台/`（账本、收件箱、证据包）都从它派生（§6.14 第 1 段） */
+  anchorRoot: string;
+  /** **当前开发工作区根**（受验目标/图纸源所在）；坏指针/目录不在 → null（fail-closed，不回退 anchorRoot） */
+  sourceRoot: string | null;
+  sourceBlockedReason: string | null;
   workDir: string;
   dataDir: string;
 }
 
+/**
+ * 源码根不可用时的**毒占位路径**（只用于让"读受验目标"必然取不到，从而 fail-closed）。
+ * 刻意放在中央锚点下、一个永不创建的目录名里：既不会误读真实源，也不会悄悄改读项目根。
+ */
+const SOURCE_ROOT_UNAVAILABLE_DIR = "source-root-unavailable";
+
 function projectCtx(projectId: string, dataDir: string): ProjectCtx {
   const project = getProject(projectId, dataDir);
   if (project === undefined) throw new WorkError("INVALID_COMMAND", `项目不存在: ${projectId}`, { project_id: projectId });
-  return { projectId, projectRoot: path.resolve(project.path), workDir: projectWorkDir(projectId, dataDir), dataDir };
+  const anchorRoot = path.resolve(project.path);
+  let sourceRoot: string | null = null;
+  let sourceBlockedReason: string | null = null;
+  try {
+    const dev = resolveCurrentDevRoot(projectId, dataDir);
+    if (dev.root === null) {
+      sourceBlockedReason = `当前开发指针不可用（source=${dev.source}）：${dev.blocked_reason ?? "目标工作区不可用"}`;
+    } else if (!fs.existsSync(dev.root) || !fs.statSync(dev.root).isDirectory()) {
+      sourceBlockedReason = `当前开发工作区目录不在盘上：${dev.root}（工作区 ${dev.workspace_id}）`;
+    } else {
+      sourceRoot = dev.root;
+    }
+  } catch (e) {
+    sourceBlockedReason = `当前开发根解析失败：${e instanceof Error ? e.message : String(e)}`;
+  }
+  return { projectId, anchorRoot, sourceRoot, sourceBlockedReason, workDir: projectWorkDir(projectId, dataDir), dataDir };
+}
+
+/** 评估上下文用的源码根：坏指针时给**毒占位路径**（读必然失败 → fail-closed），绝不回退 anchorRoot */
+function evalSourceRootOf(c: ProjectCtx): string {
+  return c.sourceRoot ?? path.join(c.anchorRoot, ".工作台", "work", SOURCE_ROOT_UNAVAILABLE_DIR);
+}
+
+/**
+ * 写口锁内用的 ProjectCtx：项目读不到时按调用方给的 `workDir` 兜底定位中央域（与拆分前同口径），
+ * 源码根未知 → fail-closed（不回退项目根）。
+ */
+function ctxForWrite(projectId: string, dataDir: string, workDir: string): ProjectCtx {
+  try {
+    return projectCtx(projectId, dataDir);
+  } catch {
+    return {
+      projectId,
+      anchorRoot: path.resolve(getProject(projectId, dataDir)?.path ?? workDir),
+      sourceRoot: null,
+      sourceBlockedReason: "项目读不到：当前开发根未知",
+      workDir,
+      dataDir,
+    };
+  }
 }
 
 // ── 后台发现错误（唯一写服务宿主内的只读消费点）──
@@ -176,10 +227,14 @@ function isInside(root: string, p: string): boolean {
  * 超界 → null（**不冒充一致**）。一次装配内按路径**去重缓存**（同一目标只读一遍）。
  */
 function readTargetShaOf(projectId: string, dataDir: string): TargetShaReader {
+  // 目标文件是**源码**：根按当前开发工作区解析（§6.14 第 6 段）；坏指针 → root=null（读不出＝不冒充一致）
   let root: string | null = null;
   try {
     const project = getProject(projectId, dataDir);
-    if (project !== undefined) root = path.resolve(project.path);
+    if (project !== undefined) {
+      const dev = resolveCurrentDevRoot(projectId, dataDir);
+      if (dev.root !== null && fs.existsSync(dev.root)) root = dev.root;
+    }
   } catch {
     root = null;
   }
@@ -217,7 +272,14 @@ function graphProbeKeyOf(c: ProjectCtx, eventsFp: string): string | null {
   if (sourceProbe === null) return null;
   let source: ReturnType<typeof sourceProbe>;
   try {
-    source = sourceProbe(c.projectId, c.dataDir);
+    // V09-37 返工 BLOCK-1：`graphProbeKeyOf` 是 `memoizeGraphProbe` 判「构建期间图输入是否被改动」的
+    // **前后键**来源，必须在**不受同一次派生记忆影响**的现读下取源身份。此前 `computeSyncStatusView` 把
+    // 整条同步判据链收进一层派生作用域后，这里经 `syncGraphSourceProbe → sourceIdentityOf → loadDocument`
+    // 拿到了被记忆的 design/plan 修订 → pre 与 post 被折成同一份 → 构建期间改 DESIGN/PLAN 不再被检出，
+    // 甚至可能基于已变更（旧）设计发出 graph_full passed（违反"来源一变即失效、不带旧绿放行"的红线）。
+    // 这里显式**临时绕过**派生记忆（`withoutDerivationScope`：只让这一次探针现算，不清空/不重建外层记忆，
+    // 不影响嵌套作用域）——恢复「旧路径无作用域时前后能发现源变」的等价语义；键字段一字不改。
+    source = withoutDerivationScope(() => sourceProbe(c.projectId, c.dataDir));
   } catch {
     return null;
   }
@@ -303,7 +365,8 @@ function evalContext(c: ProjectCtx, events: readonly WorkEvent[], opts: { source
   const rawGraphProbe = syncGraphProbe();
   const ctx: EvalContext = {
     projectId: c.projectId,
-    projectRoot: c.projectRoot,
+    // 受验目标/图纸源按**当前开发工作区**解析（§6.14 第 6 段）；坏指针给毒占位路径（fail-closed，不回退）
+    projectRoot: evalSourceRootOf(c),
     workDir: c.workDir,
     dataDir: c.dataDir,
     events,
@@ -591,11 +654,12 @@ export function historicalBatchIds(projectId: string, dataDir: string): Set<stri
  * 这样损坏契约无法把文件排除出预算（与「不拿坏事实当通过」同一方向）。
  */
 function listInboxEvidence(c: ProjectCtx, historical: ReadonlySet<string>): { files: InboxFile[]; complete: boolean; reasons: string[] } {
-  const dir = path.join(c.projectRoot, SYNC_INBOX_REL);
+  // 收件箱在**中央事实域**（`<anchorRoot>/.工作台/work/sync-inbox`）：与源码根不是同一个目录（§6.14 第 1 段）
+  const dir = path.join(c.anchorRoot, SYNC_INBOX_REL);
   const reasons: string[] = [];
   if (!fs.existsSync(dir)) return { files: [], complete: true, reasons };
   // 收件目录本身 realpath 守卫：联接/软链逃到项目根外一律不处理（不跟随），明确失败。
-  const realRoot = realpathOrNull(c.projectRoot) ?? path.resolve(c.projectRoot);
+  const realRoot = realpathOrNull(c.anchorRoot) ?? path.resolve(c.anchorRoot);
   const realDir = realpathOrNull(dir);
   if (realDir === null) return { files: [], complete: false, reasons: [`收件目录 realpath 解析失败（不可读）：${SYNC_INBOX_REL}`] };
   if (!isInside(realRoot, realDir)) return { files: [], complete: false, reasons: [`收件目录 realpath 落在项目根外（联接/软链逃逸，不跟随）：${realDir}`] };
@@ -943,6 +1007,11 @@ function evaluateSyncBlockCore(projectId: string, dataDir: string, opts: SyncBlo
   const configured = fold.batches.size > 0;
   const hasBlockingContract = [...fold.batches.values()].some((b) => b.active && b.contract.blocks_entry);
   const healthIssues = opts.discoveryIssues ?? discoveryIssuesFor(dataDir, projectId);
+  // V09-63：当前开发工作区不可用（坏指针/目录不在）时，受验源根本读不出——已登记契约一律 fail-closed，
+  // 点名原因，**不回退项目根**、不把"读不到"算通过（read 与 claim 同一判据）。
+  if (configured && c.sourceBlockedReason !== null) {
+    blocking.push({ batch_id: "<source-root>", title: "当前开发工作区不可用", verdict: "invalid", reasons: [c.sourceBlockedReason] });
+  }
   // collection 未取齐 / 后台发现错误：有现行阻断契约时 fail-closed（read 与 claim 同一判据）。
   if (hasBlockingContract && blocking.length === 0 && !inbox.complete) {
     blocking.push({ batch_id: "<collection>", title: "收件目录未全部处理", verdict: "incomplete", reasons: inbox.reasons });
@@ -1049,7 +1118,7 @@ function contractOfPayload(payload: Record<string, unknown>): SyncContract {
  */
 export function assertSyncContractWriteCommand(args: { events: readonly WorkEvent[]; cmd: WorkCommand; dataDir: string; workDir: string }): void {
   const { cmd } = args;
-  const c: ProjectCtx = { projectId: cmd.project_id, projectRoot: path.resolve(getProject(cmd.project_id, args.dataDir)?.path ?? args.workDir), workDir: args.workDir, dataDir: args.dataDir };
+  const c = ctxForWrite(cmd.project_id, args.dataDir, args.workDir);
 
   // 职责边界**锁内核**：登记工具层已限 designer/coordinator，但直连通用写口必须同样拒（角色名不是密码学授权，
   // 但职责边界不能在直连路径被绕过）。
@@ -1064,7 +1133,8 @@ export function assertSyncContractWriteCommand(args: { events: readonly WorkEven
   }
   if (contract.project_id !== cmd.project_id) throw new WorkError("INVALID_COMMAND", `契约 project_id=${contract.project_id} 与命令 ${cmd.project_id} 不符`, { entity_id: cmd.entity_id });
   if (`sync:${contract.batch_id}` !== cmd.entity_id) throw new WorkError("INVALID_COMMAND", `契约 batch_id=${contract.batch_id} 必须对应实体 sync:${contract.batch_id}（本次 ${cmd.entity_id}）`, { entity_id: cmd.entity_id });
-  const sourceProblems = contractSourceProblems(contract, c.projectRoot);
+  // 契约来源是**源码**：按当前开发工作区根实核（§6.14 第 6 段）；坏指针给毒占位路径（取不到＝不通过，不回退）
+  const sourceProblems = contractSourceProblems(contract, evalSourceRootOf(c));
   if (sourceProblems.length > 0) throw new WorkError("INVALID_COMMAND", `契约来源实核不通过：${sourceProblems.join("；")}`, { entity_id: cmd.entity_id, problems: sourceProblems });
 
   const fold = foldSync(args.events);
@@ -1106,9 +1176,10 @@ function evidenceIdentity(c: ProjectCtx, cmd: WorkCommand, fold: SyncFold): Evid
   const evidencePath = typeof cmd.payload?.evidence_path === "string" ? cmd.payload.evidence_path : "";
   const expectedRel = `${SYNC_INBOX_REL}/${batchId}${SYNC_EVIDENCE_FILE_SUFFIX}`;
   if (evidencePath !== expectedRel) throw new WorkError("INVALID_COMMAND", `sync.evidence_checked 的 evidence_path 必须是 ${expectedRel}（收到 ${JSON.stringify(evidencePath)}）`, { entity_id: cmd.entity_id });
-  const abs = path.join(c.projectRoot, evidencePath);
+  // 证据包是**中央事实**：按注册表锚点解析（§6.14 第 1 段），与源码根分开
+  const abs = path.join(c.anchorRoot, evidencePath);
   if (!fs.existsSync(abs)) throw new WorkError("INVALID_COMMAND", `sync.evidence_checked 引用的证据包不存在：${evidencePath}`, { entity_id: cmd.entity_id });
-  const realRoot = realpathOrNull(c.projectRoot) ?? path.resolve(c.projectRoot);
+  const realRoot = realpathOrNull(c.anchorRoot) ?? path.resolve(c.anchorRoot);
   const realFile = realpathOrNull(abs);
   if (realFile === null || !isInside(realRoot, realFile)) throw new WorkError("INVALID_COMMAND", `证据包 realpath 落在项目根外（联接/软链逃逸）：${evidencePath}`, { entity_id: cmd.entity_id });
   let st: fs.Stats;
@@ -1179,7 +1250,7 @@ function supersededEvidenceError(cmd: WorkCommand, batchId: string): WorkError {
  */
 export function assertSyncEvidenceWriteCommand(args: { events: readonly WorkEvent[]; cmd: WorkCommand; dataDir: string; workDir: string; prep: SyncEvidencePreparation }): void {
   const { cmd, prep } = args;
-  const c: ProjectCtx = { projectId: cmd.project_id, projectRoot: path.resolve(getProject(cmd.project_id, args.dataDir)?.path ?? args.workDir), workDir: args.workDir, dataDir: args.dataDir };
+  const c = ctxForWrite(cmd.project_id, args.dataDir, args.workDir);
   const fold = foldSync(args.events);
   if (fold.problems.length > 0) throw new WorkError("INVALID_COMMAND", `同步域事实损坏（fail-closed）：${fold.problems.join("；")}`, { entity_id: cmd.entity_id });
   const id = evidenceIdentity(c, cmd, fold);

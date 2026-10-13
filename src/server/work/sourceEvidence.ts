@@ -168,11 +168,60 @@ export interface GitIgnoreProbe {
  *   · 探针成功 → `ignored` 给命中集合（exit 0 = 有命中；exit 1 = 一个都没命中）。
  */
 export function gitIgnoredPaths(projectRoot: string, rels: readonly string[]): GitIgnoreProbe {
-  // git check-ignore 是**同步子进程**（阻塞事件循环）：一次派生里同样的（根 + 路径集）只跑一次。
-  // 键按排序后的路径集算，与入参顺序无关（同一集合复用同一结论）。
-  const key = `${path.resolve(projectRoot)}\u0000${[...rels].sort().join("\u0000")}`;
-  const probe = memoizedForDerivation("source:git-ignored", key, () => computeGitIgnoredPaths(projectRoot, rels));
-  return { is_repo: probe.is_repo, ignored: new Set(probe.ignored), failure: probe.failure };
+  // 空路径集：不起子进程（与旧实现同口径），只如实报"是不是仓库"。
+  if (rels.length === 0) {
+    const p = computeGitIgnoredPaths(projectRoot, rels);
+    return { is_repo: p.is_repo, ignored: new Set(), failure: p.failure };
+  }
+  const acc = gitIgnoreAccumulator(projectRoot);
+  mergeGitIgnoreProbe(acc, projectRoot, rels);
+  return { is_repo: acc.is_repo, ignored: new Set(rels.filter((r) => acc.ignored.has(r))), failure: acc.failure };
+}
+
+/**
+ * 同一次派生内按 root 的 **git 忽略累积器**（V09-37 性能返工）。此前 `gitIgnoredPaths` 按「root + 路径集」
+ * 记忆：一次只读请求里 N 份**不同**源清单各自一个路径集 ⇒ N 次 `git check-ignore` 子进程（现场实测 82 次/请求、
+ * 约 2.6s）。这里把同一 root 的已探路径**去重累积**：未知路径才起一次子进程批量探测后并入，已知路径直接命中。
+ *   · 作用域 `finally` 一到即整批丢弃、**跨请求不缓存**；无活跃作用域时 `memoizedForDerivation` 每次现算，
+ *     与旧实现逐字同行为（老路径/写路径不受影响）；
+ *   · **失败闭合方向不变**：该 root 任一探针失败 ⇒ 本派生内该 root 一律 `failure` 非 null（未知不当未忽略，
+ *     粒度比旧实现更保守——某子集失败会收紧该 root 全体的结论）。
+ */
+interface GitIgnoreAccumulator {
+  is_repo: boolean;
+  /** 本派生内已被 `git check-ignore` 探过的路径（去重后不再重探） */
+  probed: Set<string>;
+  /** 探到的真实命中（按 root 累积） */
+  ignored: Set<string>;
+  /** 该 root 的探针失败原因（非 null ⇒ 本派生内该 root 一律按未知处理） */
+  failure: string | null;
+}
+function gitIgnoreAccumulator(projectRoot: string): GitIgnoreAccumulator {
+  return memoizedForDerivation("source:git-ignored-union", path.resolve(projectRoot), () => ({
+    is_repo: false,
+    probed: new Set<string>(),
+    ignored: new Set<string>(),
+    failure: null,
+  }));
+}
+function mergeGitIgnoreProbe(acc: GitIgnoreAccumulator, projectRoot: string, rels: readonly string[]): void {
+  const fresh = rels.filter((r) => !acc.probed.has(r));
+  if (fresh.length === 0) return;
+  const probe = computeGitIgnoredPaths(projectRoot, fresh);
+  for (const r of fresh) acc.probed.add(r);
+  acc.is_repo = probe.is_repo;
+  if (probe.failure !== null) acc.failure = probe.failure;
+  for (const p of probe.ignored) acc.ignored.add(p);
+}
+
+/**
+ * **预热**（V09-37）：把同一 root 下**整批**清单引用的路径并集一次 `git check-ignore`——在
+ * `checksWithSourceManifests` 进循环**前**调用一次，使随后的逐清单 `gitIgnoredPaths` 全部命中累积器、0 额外子进程。
+ * 与逐清单探测**同判据**（`git check-ignore` 对每路径独立判定，并集结论可按子集切片复用）；失败仍 fail-closed。
+ */
+export function prewarmGitIgnored(projectRoot: string, rels: readonly string[]): void {
+  if (rels.length === 0) return;
+  mergeGitIgnoreProbe(gitIgnoreAccumulator(projectRoot), projectRoot, rels);
 }
 
 function computeGitIgnoredPaths(projectRoot: string, rels: readonly string[]): GitIgnoreProbe {
@@ -442,6 +491,103 @@ export function verifySourceManifest(projectRoot: string, manifest: SourceManife
   };
 }
 
+/**
+ * 一次派生内共享的**文件观测**（V09-37 剩余热路径根因修复；2026-10-13 预算边界返工）。
+ *
+ * 事由（有界计数实测，证据见 `performance-file-reuse/`）：读侧 `computeSourceManifestVerdict` 每份清单**逐文件**
+ * `lstat`/`realpath`/祖先软链检查/读字节/算 sha256；不同清单之间**大量重叠**同一批源文件——夹具 12 份清单各 30
+ * 文件（共享 24 个）在**一次派生内**实测 `readFileSync` 360 次取 96 个不同文件（3.75× 重复）、`lstatSync` 1080 次、
+ * `realpathSync` 720 次；真机示例项目同热身路径 `verifySourceManifest` 逐清单读盘 14868 次 / 去重 1194 文件。这里把
+ * 「同一项目根 + 规范相对路径」的**盘上实际观测**在一次同步派生内共享。
+ *
+ * **两段式（2026-10-13 预算边界返工）**：观测拆成两段，各按「项目根 + 规范相对路径」共享——
+ *   · **安全元数据/路径检查**（`observeSourceFileAvailability`）：`lstat` 存在性、realpath/祖先软链、是否普通文件、
+ *     单文件上限；**只判路径与元数据，不读一个字节**，可安全共享、不耗预算；
+ *   · **bytes/hash**（`observeSourceFileContent`）：真正 `readFileSync` + sha256，**只有在该清单自己的剩余预算
+ *     允许该文件时（先按 stat 体积判）才被触发**；一旦触发就在本派生内共享给其它清单复用。
+ *   关键：**总预算检查回到"任何新读之前"**——恢复旧逐清单实现（在 `readFileSync` 之前检查）的顺序，超限明确拒读
+ *   而非"先读满再看结论"；**预算拒绝不进共享**，某清单预算撑爆只影响它自己、其它清单仍可读该文件。
+ *
+ * 口径（严格，判据一分不改）：
+ *   · 只共享**实际观测到的文件事实**（缺失 / 不可读 / 真实 bytes+sha256）——**不**共享任何"每清单预期比较"
+ *     （清单指纹、总预算、`expected sha` 比对、忽略规则仍由**各清单自己**做）；
+ *   · 键含**项目根规范绝对路径** + **规范相对路径**——跨项目根不串味；相对路径先经 `normalizeManifestPath`
+ *     归一化（`.`/`\\`/空段收敛），同一文件的不同写法不各观测一遍；
+ *   · **没有活跃派生作用域时逐次现算**（写路径 `buildSourceManifest`/`readManifestFile` 与之无关，单测路径逐字不变）；
+ *     作用域 `finally` 一到整批丢弃、**跨请求一律重读**——无 TTL、不看 mtime、无跨请求陈旧窗口；
+ *   · **软链（本体或祖先）/越界/超单文件/读失败**一律观测为 `unreadable`（不放行），缺失观测为 `missing`；
+ *   · **不让任何"预算拒绝"进共享**：观测里只有文件事实；每份清单按**自己的**实际字节量独立扣总预算——某清单
+ *     预算被撑爆只影响它自己，不污染其它清单（也不写回观测）；
+ *   · **已读去重收益保留**：一个文件在本派生内至多真正读+哈希一次（同 root + 规范相对路径），后续清单命中共享内容；
+ *     但**每份清单仍按自己的剩余预算独立决定是否采用**——超限清单即使内容已缓存也不采用（记 `unreadable`）。
+ *
+ * 同请求快照口径（如实标注，非新增隐蔽窗口）：本作用域只活在**一次同步派生**里；同一派生内同一文件只观测一次，
+ * 之后该派生内其它清单沿用这份观测 = "本次派生对该文件取统一次现读快照"。这与派生作用域既有的「同一次派生内
+ * 同一输入只读一次」口径一致（设计/施工图纸源、证据正文、清单载体此前已是如此）；此前"每份清单各自现读"只会在
+ * **同一次派生内不同清单之间**可能读到不同瞬间的内容，本卡按统一快照口径收敛。**跨请求**仍逐次重读，源一变
+ * 下一个请求立刻可见（`verifySourceManifest` 的记忆只活一次派生，观测同）。它**不**参与任何"计算期间源变"的
+ * 前后复核判据（那些复核的对象是 DESIGN/PLAN/账本等，不在此路径）。
+ */
+type SourceFileAvailability =
+  | { kind: "missing" }
+  | { kind: "unreadable" }
+  | { kind: "readable"; size: number };
+
+/**
+ * 第一段：**安全元数据/路径检查**——只回"存在性/软链/越界/是否普通文件/单文件上限"，**不读一个字节**。
+ * 与旧逐清单逻辑逐条等价：被删/移走 → `missing`；软链/越界/非普通文件/超单文件 → `unreadable`；
+ * 否则 `readable{size(stat)}`（供调用方在**新读之前**核总预算）。
+ */
+function observeSourceFileAvailability(projectRoot: string, rel: string): SourceFileAvailability {
+  // 先按**纯路径**判存在性：被删/被移走是 `missing`（覆盖源变了 → invalidated），**不是** unreadable——
+  // realpath 对不存在的路径必然失败，若先解析就会把「删了」误判成「读不动/未知」。
+  const rawAbs = path.resolve(path.resolve(projectRoot), rel);
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(rawAbs);
+  } catch {
+    return { kind: "missing" };
+  }
+  // 存在：再挡软链/越界（realpath 逃出项目根、本体或中间目录是软链）——这类是 unreadable（未知待复核）
+  try {
+    resolveInsideProject(projectRoot, rel);
+    assertNoSymlink(projectRoot, rel);
+  } catch {
+    return { kind: "unreadable" };
+  }
+  if (!st.isFile()) return { kind: "unreadable" };
+  if (st.size > MAX_SOURCE_MANIFEST_FILE_BYTES) return { kind: "unreadable" };
+  return { kind: "readable", size: st.size };
+}
+
+type SourceFileContent = { kind: "unreadable" } | { kind: "observed"; bytes: number; sha256: string };
+
+/** 第二段：真正读字节 + 哈希（只在预算允许后调用；读失败 → `unreadable`） */
+function observeSourceFileContent(projectRoot: string, rel: string): SourceFileContent {
+  const abs = path.resolve(path.resolve(projectRoot), rel);
+  let buf: Buffer;
+  try {
+    buf = fs.readFileSync(abs);
+  } catch {
+    return { kind: "unreadable" };
+  }
+  return { kind: "observed", bytes: buf.length, sha256: crypto.createHash("sha256").update(buf).digest("hex") };
+}
+
+/** 一次派生内按「项目根 + 规范相对路径」共享安全元数据；无活跃作用域时逐次现算（行为不变） */
+function observeSourceFileAvailabilityShared(projectRoot: string, rel: string): SourceFileAvailability {
+  return memoizedForDerivation("source:file-availability", `${path.resolve(projectRoot)}\u0000${rel}`, () =>
+    observeSourceFileAvailability(projectRoot, rel),
+  );
+}
+
+/** 一次派生内按「项目根 + 规范相对路径」共享 bytes/hash；无活跃作用域时逐次现算（行为不变） */
+function observeSourceFileContentShared(projectRoot: string, rel: string): SourceFileContent {
+  return memoizedForDerivation("source:file-content", `${path.resolve(projectRoot)}\u0000${rel}`, () =>
+    observeSourceFileContent(projectRoot, rel),
+  );
+}
+
 function computeSourceManifestVerdict(projectRoot: string, manifest: SourceManifest): SourceManifestVerdict {
   const declaredCount = manifest.files.length;
   const changed: string[] = [];
@@ -484,44 +630,40 @@ function computeSourceManifestVerdict(projectRoot: string, manifest: SourceManif
       unreadable.push(f.path);
       continue;
     }
-    // 先按**纯路径**判存在性：被删/被移走的路径是 `missing`（覆盖源变了 → invalidated），
-    // **不是** unreadable——realpath 对不存在的路径必然失败，若先解析就会把「删了」误判成「读不动/未知」。
-    const rawAbs = path.resolve(path.resolve(projectRoot), rel);
-    let st: fs.Stats;
-    try {
-      st = fs.lstatSync(rawAbs);
-    } catch {
+    // 盘上实际观测，两段式（一次派生内按 root + 规范相对路径共享；口径见上方文档）。
+    // ① 安全元数据/路径检查（**不读字节**）：被删/移走 → `missing`（覆盖源变了 → invalidated）；
+    //    软链/越界/超单文件/非普通文件 → `unreadable`（未知待复核）。
+    const avail = observeSourceFileAvailabilityShared(projectRoot, rel);
+    if (avail.kind === "missing") {
       missing.push(f.path);
       continue;
     }
-    // 存在：再挡软链/越界（realpath 逃出项目根、本体或中间目录是软链）——这类是 unreadable（未知待复核）
-    let abs: string;
-    try {
-      abs = resolveInsideProject(projectRoot, rel);
-      assertNoSymlink(projectRoot, rel);
-    } catch {
+    if (avail.kind === "unreadable") {
       unreadable.push(f.path);
       continue;
     }
-    if (!st.isFile()) {
+    // ② 总预算检查**在任何新读之前**（恢复旧逐清单实现在 `readFileSync` 之前检查的顺序）：每份清单先按共享到的
+    //    stat 体积核自己的剩余预算，超限即记 `unreadable` 并**不触发读**（拒绝不进共享，其它清单仍可读它）。
+    if (budget.used + avail.size > MAX_SOURCE_MANIFEST_TOTAL_BYTES) {
       unreadable.push(f.path);
       continue;
     }
-    if (st.size > MAX_SOURCE_MANIFEST_FILE_BYTES || budget.used + st.size > MAX_SOURCE_MANIFEST_TOTAL_BYTES) {
+    // ③ 真正读字节 + 哈希（一次派生内按 root + 规范相对路径共享；已缓存则命中、不重复读）。
+    const content = observeSourceFileContentShared(projectRoot, rel);
+    if (content.kind === "unreadable") {
       unreadable.push(f.path);
       continue;
     }
-    let buf: Buffer;
-    try {
-      buf = fs.readFileSync(abs);
-    } catch {
+    // 读后按**实际字节**复核边界：postread actualbytes > stat 的竞态**不放宽旧约束**——绝不突破单文件实际字节
+    // 或每清单总预算（正常情况 stat == actual，此复核与旧的前置检查等价，仅在竞态时更保守）。
+    if (content.bytes > MAX_SOURCE_MANIFEST_FILE_BYTES || budget.used + content.bytes > MAX_SOURCE_MANIFEST_TOTAL_BYTES) {
       unreadable.push(f.path);
       continue;
     }
-    budget.used += buf.length;
-    const now = crypto.createHash("sha256").update(buf).digest("hex");
-    current.push({ path: f.path, sha256: now, bytes: buf.length });
-    if (now !== f.sha256) changed.push(f.path);
+    // 每份清单**自己**按真实字节独立扣总预算：某份清单预算被撑爆只影响它自己（共享观测里没有预算结论）。
+    budget.used += content.bytes;
+    current.push({ path: f.path, sha256: content.sha256, bytes: content.bytes });
+    if (content.sha256 !== f.sha256) changed.push(f.path);
   }
   if (unreadable.length > 0) {
     return {

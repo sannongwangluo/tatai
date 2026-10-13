@@ -795,17 +795,20 @@ ok(
       // 负例（判据不放宽，2026-10-08 V09-61 测试维护）：精确数量在"重复卡/缺卡"时仍必红——
       const dupTasks = [...tataiPlan.tasks, { ...tataiPlan.tasks.find((t) => t.id === "V09-61")! }];
       ok(
-        dupTasks.length !== 90 && validatePlanTasks(dupTasks).some((i) => i.problem === "duplicate_id"),
-        "② 负例：V09-61 重复一行 ⇒ 数量 91≠90 且解析器点名 duplicate_id（不放宽成 >=）",
+        dupTasks.length !== 99 && validatePlanTasks(dupTasks).some((i) => i.problem === "duplicate_id"),
+        "② 负例：V09-61 重复一行 ⇒ 数量 100≠99 且解析器点名 duplicate_id（不放宽成 >=）",
       );
       const missingTasks = tataiPlan.tasks.filter((t) => t.id !== "V09-61");
       ok(
-        missingTasks.length !== 90 && !missingTasks.some((t) => t.id === "V09-61"),
-        "② 负例：缺 V09-61 ⇒ 数量 89≠90（缺卡仍红）",
+        missingTasks.length !== 99 && !missingTasks.some((t) => t.id === "V09-61"),
+        "② 负例：缺 V09-61 ⇒ 数量 98≠99（缺卡仍红）",
       );
-      // 新期望 90（2026-10-09 定向更新）：V09-62 一张**真实新增卡**已入首表，按原基准精确维护
-      //   （86→87 已含 V09-59）——判据未放宽，仍是"数量恰好等于当前施工图卡数"；两卡解析正确（目标/完成证据非空，
-      //   且依赖列没被解析成悬空卡——"无"是备注不是卡号依赖）。重复卡/缺卡都必红（见上面的负例）。
+      // 新期望 95（2026-10-09 定向更新）：V09-63…V09-67 五张**真实新增卡**（项目工作目录与交付候选批次）
+      //   已入首表（PLAN「本批机械影响」预告 90→95），按原基准精确维护——判据未放宽，仍是"数量恰好等于
+      //   当前施工图卡数"；重复卡/缺卡都必红（见上面的负例）。
+      // 新期望 99（2026-10-13 定向更新）：上一批 V09-68（实现读数关联修正）已入首表（95→96）；本轮按用户
+      //   2026-10-13 授权诊断维护在 V09-68 行之后**纯插入 V09-69/V09-70/V09-71 三行**（96→99，PLAN
+      //   「本批机械影响」第 1 条预告；既有卡行/勾选位零改动）。判据未放宽，仍是"数量恰好等于当前施工图卡数"。
       const v60 = tataiPlan.tasks.find((t) => t.id === "V09-60");
       const v61 = tataiPlan.tasks.find((t) => t.id === "V09-61");
       const danglingOnNew = tataiIssues.some(
@@ -816,10 +819,10 @@ ok(
         v60.goal.trim() !== "" && v60.evidence.trim() !== "" &&
         v61.goal.trim() !== "" && v61.evidence.trim() !== "" &&
         !danglingOnNew &&
-        tataiPlan.tasks.length === 90
+        tataiPlan.tasks.length === 99
       );
     })(),
-  `② 塔台 PLAN 解析出 ${tataiPlan.tasks.length} 行施工卡（16 历史＋V07-01~04＋V08-01~06＋三期 1 的 U1/U2/U3＋v0.9 的 V09-01~14 与 V09-16/V09-17/V09-18/V09-19/V09-20/V09-21/V09-22/V09-23/V09-24/V09-25＋正向闭环的 V09-26/V09-27/V09-28/V09-29＋统一优化的 V09-30~V09-39＋界面与品牌统一的 V09-40＋本批 V09-45~V09-50 六张卡＋协作闭环 V09-51~V09-58 八张卡＋V09-59/V09-60/V09-61 三张卡＋交付总览 V09-62 一张卡），V06-02 行依赖 = V06-01`,
+  `② 塔台 PLAN 解析出 ${tataiPlan.tasks.length} 行施工卡（16 历史＋V07-01~04＋V08-01~06＋三期 1 的 U1/U2/U3＋v0.9 的 V09-01~14 与 V09-16/V09-17/V09-18/V09-19/V09-20/V09-21/V09-22/V09-23/V09-24/V09-25＋正向闭环的 V09-26/V09-27/V09-28/V09-29＋统一优化的 V09-30~V09-39＋界面与品牌统一的 V09-40＋本批 V09-45~V09-50 六张卡＋协作闭环 V09-51~V09-58 八张卡＋V09-59/V09-60/V09-61 三张卡＋交付总览 V09-62 一张卡＋项目工作目录与交付候选 V09-63~V09-67 五张卡＋运行诊断批 V09-68/V09-69/V09-70/V09-71 四张卡），V06-02 行依赖 = V06-01`,
 );
 ok(
   tataiIssues.every((i) => i.problem !== "dependency_cycle" && i.problem !== "missing_acceptance"),

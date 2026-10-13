@@ -1,7 +1,7 @@
 {
   "name": "tatai",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "塔台（Tatai）：个人级 agent 编程工作台",
   "scripts": {
@@ -80,6 +80,8 @@
     "verify:v09-22-ui": "python scripts/verify-v09-22-ui.py",
     "verify:v09-22-mcp": "tsx scripts/verify-v09-22-mcp.ts",
     "verify:v09-50": "tsx scripts/verify-v09-50.ts",
+    "verify:v09-63": "tsx scripts/verify-v09-63.ts",
+    "verify:v09-65": "tsx scripts/verify-v09-65.ts",
     "verify:stage-entry": "tsx scripts/verify-stage-entry.ts",
     "verify:sync-evidence": "tsx scripts/verify-sync-evidence.ts",
     "verify:sync-incremental": "tsx scripts/verify-sync-incremental.ts",
@@ -143,6 +145,7 @@
     "verify:arch-guard": "tsx scripts/verify-arch-guard.ts",
     "verify:scan-cancel": "tsx scripts/verify-scan-cancel.ts",
     "verify:t19-parse-run": "tsx scripts/verify-t19-parse-run.ts",
+    "verify:workspace-package": "tsx scripts/verify-workspace-package.ts",
     "verify:walk-budget": "tsx scripts/verify-walk-budget.ts",
     "verify:f2": "tsx scripts/verify-f2.ts",
     "verify:f3": "tsx scripts/verify-f3.ts",

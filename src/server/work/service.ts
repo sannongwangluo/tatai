@@ -91,6 +91,10 @@ import { eventsSnapshotOf } from "./statusProjection";
 import { BLOCKED_NOT_CLAIMABLE_DETAIL_REASON, TASK_STATUS_LABELS, readTaskStates, taskStatusOfEvents } from "./tasks";
 // V09-10（附录 F）：task.reopened 的写边界核实与 reopenTask 同一份判据（防直连写口旁路，C017 同类防线）
 import { verifyReopenCommand } from "./claims";
+// V09-63（DESIGN §6.13/§6.14）：工作区命令的写边界核实（锁内按当前事件现场核形状/闭键/角色/路径边界/
+// 状态迁移/冻结源重核/指针目标）。与对象命令层 `workspaces.*` 用**同一份**判据，直连通用写口不能旁路。
+import { assertWorkspaceWriteCommand, checkWorkspaceForClaim } from "./workspaces";
+import type { FinalizeResult } from "./gitFinalize";
 // P2/V09-47（DESIGN §6.11）：结果提交的**锁内共享结果判据**——直连通用写口手写 task.result_submitted 也不能旁路；
 // 与 claims.submitTaskResult 及只读预检共用同一份判据（submitChecks.evaluateSubmitResultChecks）。
 import {
@@ -119,6 +123,9 @@ import "./syncGraph";
 import { runSyncScanForRequest } from "./syncDiscovery"; import { runReadJob, readWorkerPoolStatus, describeReadJobError, ReadJobFailed } from "./readWorkerPool";
 import type { SyncPrepArgs } from "./readJobs";
 import { runWithHostHealth, HealthUnstable } from "./syncRuntimeHealth";
+import { readOwnership } from "./serviceOwnership";
+import { buildRuntimeDiagnosticsReport, runtimeDiagnosticsRouteResult, type RuntimeServiceProbe } from "./runtimeDiagnostics";
+import { sanitizeRuntimeDiagnosticsReport, type RuntimeDiagnosticsDetail, type RuntimeDiagnosticsReport } from "../../shared/runtimeDiagnostics";
 // V09-27（DESIGN.md §2.6/§5.4；契约 F3）：上报域宿主操作（不可变证据正文的存/读）与
 // `task.blocked`/`task.status_changed` 上报命令的写边界核实——与 MCP 工具层同一份判据。
 import { handleReportingRequest, isReportingRoute } from "./reportingHost";
@@ -1041,6 +1048,28 @@ export class WorkService {
       // 直连通用写口手写这些命令不能绕过认领/持有者/协调器角色/解阻依据校验。核实不通过一律拒绝且零字节；
       // 已有写者（迁移的历史状态回放、`claims.releaseClaim` 的带 `claim_released` 释放）不受影响
       // （判据只对"带认领绑定的上报"与"非释放的解阻"生效，见 verifyTaskPhaseCommand 顶部注释）。
+      // ②ⅹ′ 工作区命令的写边界核实（V09-63／DESIGN §6.14 第 2/6/10 段）：直连通用写口手写 workspace.*
+      // 也不能旁路——锁内按当前事件现场核形状/闭键/角色/路径边界/状态迁移/冻结源重核/指针目标。
+      // 判据单一来源 = `workspaces.assertWorkspaceWriteCommand`（与对象命令层同一函数）。
+      let workspacePayloadOverride: Record<string, unknown> | undefined;
+      if (cmd.type.startsWith("workspace.")) {
+        const guardOut = assertWorkspaceWriteCommand({ events, cmd, workDir, dataDir: this.dataDir });
+        // 冻结命令的 payload 是深冻结的：定型值经返回值交回（不在原对象上就地改），写入服务据此落盘。
+        if (guardOut !== undefined && guardOut.payload !== undefined) workspacePayloadOverride = guardOut.payload;
+      }
+      // ②ⅹ″ 认领命令的目标工作区校验（V09-63／DESIGN §6.14 第 6/7 段）：直连通用写口手写
+      // `task.claimed` 带 workspace_id 也不能绕过「未知/跨项目/已回收拒领」判据——与
+      // `claims.claimTask` 走**同一份** `checkWorkspaceForClaim`（对象层之外再加一道锁内防线）。
+      if (cmd.type === "task.claimed") {
+        const wsId = typeof cmd.payload?.workspace_id === "string" ? cmd.payload.workspace_id : null;
+        if (wsId !== null && wsId !== "") {
+          const wsCheck = checkWorkspaceForClaim(cmd.project_id, this.dataDir, wsId);
+          if (!wsCheck.ok) {
+            throw new WorkError("INVALID_COMMAND", `认领目标工作区不可用，拒绝提交 ${cmd.type}（${cmd.entity_id}），本次命令没有写入任何字节：${wsCheck.message ?? wsId}`, { reason: wsCheck.code ?? "WORKSPACE_UNKNOWN", workspace_id: wsId });
+          }
+        }
+      }
+
       if (cmd.type === "task.blocked" || cmd.type === "task.status_changed") {
         const proj = getProject(cmd.project_id, this.dataDir);
         const phaseVerify = verifyTaskPhaseCommand(
@@ -1085,7 +1114,7 @@ export class WorkService {
         occurred_at: cmd.occurred_at ?? receivedAt,
         received_at: receivedAt,
         idempotency_key: cmd.idempotency_key,
-        payload: cmd.payload ?? {},
+        payload: workspacePayloadOverride ?? cmd.payload ?? {},
       };
       appendEventDurable(workDir, event);
 
@@ -1195,6 +1224,29 @@ export class WorkService {
       registered_event_types: registeredEventTypes(),
       build_identity: resolveBuildIdentity("server"),
     };
+  }
+
+  /**
+   * V09-69（DESIGN §3.18/§6.15）：运行诊断统一报告（**只读**）。
+   * 读有界内存遥测 + 只读 worker 池状态 + 描述符现场；**不**重推导（不调图/ledger/基线/完整 doctor）。
+   * 两读口（本地 `/api/runtime/diagnostics` 与 tokened `/api/work/diagnostics`）调用**同一个**
+   * `buildRuntimeDiagnosticsReport`——判据只有一份（§6.15「宿主装配一次、两读口共用一个 builder」）。
+   */
+  runtimeDiagnostics(opts: { projectId: string | null; detail: RuntimeDiagnosticsDetail }): RuntimeDiagnosticsReport {
+    const own = readOwnership(this.dataDir);
+    const probe: RuntimeServiceProbe = {
+      present: own.state === "valid",
+      state: own.state,
+      pid_alive: own.pidAlive,
+      is_self: own.isSelf,
+      reason: own.reason,
+    };
+    return buildRuntimeDiagnosticsReport({
+      dataDir: this.dataDir,
+      projectId: opts.projectId,
+      detail: opts.detail,
+      service: probe,
+    });
   }
 }
 
@@ -1341,6 +1393,27 @@ function readBody(req: IncomingMessage, limitBytes = 1024 * 1024): Promise<strin
   });
 }
 
+/** V09-37 BLOCK-2：同步逻辑读的默认总预算（ms）。用户 2026-10-13 明确批准 5s→10s（覆盖旧审查保留 5s 的建议）。 */
+export const SYNC_READ_TIMEOUT_MS = 10_000;
+
+/** V09-37 BLOCK-2：入口只读逻辑读的默认总预算（ms）——原 8s 按本批对齐到 10s。 */
+export const ENTRY_READ_TIMEOUT_MS = 10_000;
+
+/**
+ * V09-37 BLOCK-2：把一条 HTTP **只读**读口的连接提前断开接成 `AbortSignal`——客户端预算用尽/主动断开即 `abort()`，
+ * 据此取消**本请求**的只读作业（`runReadJob` 只 terminate 该作业的 worker，不动并行其它请求）。
+ * **成功应答后的正常 close 不触发取消**（`res.writableEnded` 已置位）；`dispose()` 在 finally 摘监听（不泄漏）。
+ */
+function abortOnClientClose(res: ServerResponse, what: string): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const onClose = (): void => {
+    if (res.writableEnded) return;
+    if (!controller.signal.aborted) controller.abort(new Error(`客户端提前断开：${what}`));
+  };
+  res.on("close", onClose);
+  return { signal: controller.signal, dispose: () => res.removeListener("close", onClose) };
+}
+
 /**
  * 处理一条 work 路由；**返回 false 表示不是本模块的路由**（调用方继续走自己的路由表），
  * true 表示已经应答（成功或错误）。挂载方式见 `src/server/index.ts`。
@@ -1379,6 +1452,21 @@ export async function handleWorkRequest(
       sendJson(res, 200, { ok: true, ...ctx.service.info(), read_workers: readWorkerPoolStatus() });
       return true;
     }
+    // V09-69（DESIGN §3.18／§6.15）：tokened 只读运行诊断读口——与本地 `/api/runtime/diagnostics`
+    // **同一 builder**（`ctx.service.runtimeDiagnostics` ⇒ 同一份 `buildRuntimeDiagnosticsReport`）。
+    // 只读：不写事件/证据/租约、不自愈、不触发扫描、不拉起写服务、不进 CPU 重派生队列；
+    // 无/错令牌 401（上面的令牌门）。错误：400 INVALID_INPUT；读失败 503 SOURCE_UNAVAILABLE（不返回空成功）。
+    if (method === "GET" && ctx.pathname === "/api/work/diagnostics") {
+      // 与本地 `/api/runtime/diagnostics` **同一 builder + 同一响应语义**（共享 `runtimeDiagnosticsRouteResult`）。
+      const dataDir = ctx.service.info().data_dir;
+      const outcome = runtimeDiagnosticsRouteResult({
+        rawUrl: req.url ?? "/",
+        projectExists: (id) => getProject(id, dataDir) !== undefined,
+        build: (q) => ctx.service.runtimeDiagnostics({ projectId: q.projectId, detail: q.detail }),
+      });
+      sendJson(res, outcome.status, outcome.body);
+      return true;
+    }
     if (method === "GET" && ctx.pathname === "/api/work/snapshot") {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
       const projectId = url.searchParams.get("project_id") ?? "";
@@ -1396,21 +1484,27 @@ export async function handleWorkRequest(
         return true;
       }
       const dataDir = ctx.service.info().data_dir;
-      // V09-37：CPU 重的只读同步判据挪进有界 worker（主线程不被占住）；返回同一份 report 契约。
+      // V09-37 BLOCK-2：客户端提前断开 → 取消**本请求**的只读作业（成功应答后的正常 close 不触发；仅该请求）。
+      const cancel = abortOnClientClose(res, "sync/status");
       try {
         // 复审 A：worker 有独立模块内存——宿主主线程读出真实错误随参数带入，回包后再读一次做**有界**健康对账；
         // 作业期间健康持续变化 → HealthUnstable（503 明确不可用），绝不把新错误拼到旧 passed 报告上。
         const reconciled = await runWithHostHealth(
           () => readProjectDiscoveryIssues(projectId, dataDir),
-          (issues) => runReadJob("sync_status", { projectId, dataDir, discoveryIssues: issues }),
+          (issues) => runReadJob("sync_status", { projectId, dataDir, discoveryIssues: issues }, { signal: cancel.signal }),
+          { signal: cancel.signal },
         );
-        sendJson(res, 200, { ok: true, sync: reconciled.value, discovery_issues: reconciled.issues });
+        if (!cancel.signal.aborted) sendJson(res, 200, { ok: true, sync: reconciled.value, discovery_issues: reconciled.issues });
       } catch (e) {
-        // 结构化作业错误（code/detail）原样沿 HTTP 带出；健康持续抖动 = HEALTH_UNSTABLE(503)。不压成通用码。
-        const d = e instanceof HealthUnstable
-          ? { code: "HEALTH_UNSTABLE", message: e.message, detail: { issues: e.issues }, httpStatus: 503 }
-          : describeReadJobError(e);
-        sendJson(res, d.httpStatus, { code: d.code, message: d.message, detail: d.detail });
+        if (!cancel.signal.aborted) {
+          // 结构化作业错误（code/detail）原样沿 HTTP 带出；健康持续抖动 = HEALTH_UNSTABLE(503)。不压成通用码。
+          const d = e instanceof HealthUnstable
+            ? { code: "HEALTH_UNSTABLE", message: e.message, detail: { issues: e.issues }, httpStatus: 503 }
+            : describeReadJobError(e);
+          sendJson(res, d.httpStatus, { code: d.code, message: d.message, detail: d.detail });
+        }
+      } finally {
+        cancel.dispose();
       }
       return true;
     }
@@ -1474,6 +1568,8 @@ export async function handleWorkRequest(
         ...(resumeHint === "" ? {} : { resume_hint: resumeHint }),
         ...(capabilities === undefined ? {} : { client_capabilities: capabilities }),
       };
+      // V09-37 BLOCK-2：客户端提前断开 → 取消**本请求**的入口只读作业（成功应答后的正常 close 不触发；仅该请求）。
+      const cancel = abortOnClientClose(res, "entry");
       try {
         // 同 sync/status：worker 有独立模块内存——宿主主线程读出真实错误随参数带入，回包后有界健康对账；
         // 作业期间健康持续变化 → HealthUnstable（503 明确不可用），不把新错误拼到旧结论上（复审 A）。
@@ -1489,16 +1585,21 @@ export async function handleWorkRequest(
               ...(workPackage ? { workPackage: true } : {}),
               ...(workPackagePaging === undefined ? {} : { workPackagePaging }),
               ...(workPackage && wpExpected !== "" ? { workPackageExpectedRevision: wpExpected } : {}),
-            }),
+            }, { signal: cancel.signal }),
+          { signal: cancel.signal },
         );
-        sendJson(res, 200, reconciled.value);
+        if (!cancel.signal.aborted) sendJson(res, 200, reconciled.value);
       } catch (e) {
-        // 入口必要输入持续变化 → worker 侧抛 SOURCE_CHANGED / 账本读不稳 → LEDGER_UNSTABLE，
-        // 经结构化 code/detail 原样带出（503 可重试），**不**回退本地绕过后再假装成功。
-        const d = e instanceof HealthUnstable
-          ? { code: "HEALTH_UNSTABLE", message: e.message, detail: { issues: e.issues }, httpStatus: 503 }
-          : describeReadJobError(e);
-        sendJson(res, d.httpStatus, { code: d.code, message: d.message, detail: d.detail });
+        if (!cancel.signal.aborted) {
+          // 入口必要输入持续变化 → worker 侧抛 SOURCE_CHANGED / 账本读不稳 → LEDGER_UNSTABLE，
+          // 经结构化 code/detail 原样带出（503 可重试），**不**回退本地绕过后再假装成功。
+          const d = e instanceof HealthUnstable
+            ? { code: "HEALTH_UNSTABLE", message: e.message, detail: { issues: e.issues }, httpStatus: 503 }
+            : describeReadJobError(e);
+          sendJson(res, d.httpStatus, { code: d.code, message: d.message, detail: d.detail });
+        }
+      } finally {
+        cancel.dispose();
       }
       return true;
     }
@@ -1646,8 +1747,13 @@ export function spawnWriteService(dataDir: string): boolean {
 
 export interface WorkClientOptions {
   dataDir: string;
-  /** 单次调用超时（ms）；超时按服务不可用处理，不无限等待 */
+  /** 单次调用超时（ms）；超时按服务不可用处理，不无限等待（探活/写入/预检用；缺省 5s，**不**随同步预算统一拉长） */
   timeoutMs?: number;
+  /**
+   * V09-37 BLOCK-2：**同步只读**逻辑读的总预算（ms）。缺省取显式 `timeoutMs`（给了就尊重），否则 `SYNC_READ_TIMEOUT_MS`（10s）。
+   * 只影响 `readSyncStatusRemote` 一次逻辑读的共享 deadline——探活/写入仍用 `timeoutMs`，不统一拉长。
+   */
+  syncTimeoutMs?: number;
   /** 自愈拉起独立写入服务（V07-01 默认开；TATAI_NO_AUTOSTART=1 或此处 false 关闸——验证"不本地代写"不变量用） */
   autostart?: boolean;
 }
@@ -1689,14 +1795,56 @@ function staleDescriptorHint(desc: WorkServiceDescriptor): string {
     : "";
 }
 
+/**
+ * V09-71 T37-01：同步只读非 2xx 的错误体有**两种既有信封**，按同一口径提取原始结构化码/明细：
+ *   新 work 读口（`/api/work/sync/status`）＝**顶层** `{code,message,detail}`；
+ *   旧 project 读口（`/api/projects/:id/sync-status`，syncHttp.ts）＝**嵌套** `{ok:false,error:{code,message,detail}}`。
+ * 两者都保留宿主原始码（不丢成 `HTTP_xxx`），调用方**不重复回退**。
+ */
+function pickSyncErrorEnvelope(body: unknown): { code?: unknown; message?: unknown; detail?: unknown } {
+  if (body === null || typeof body !== "object") return {};
+  const b = body as Record<string, unknown>;
+  const nested = b.error;
+  if (nested !== null && typeof nested === "object") {
+    const e = nested as Record<string, unknown>;
+    if (e.code !== undefined || e.message !== undefined || e.detail !== undefined) {
+      return { code: e.code, message: e.message, detail: e.detail };
+    }
+  }
+  return { code: b.code, message: b.message, detail: b.detail };
+}
+
+/**
+ * V09-37 BLOCK-2：宿主同步只读**结构化错误**（超时/5xx/无效响应）→ 抛 `WorkError`，**不回退本地重算**。
+ * 宿主持有的错误码若属于 v2 错误码集就原样保留，否则放进 `detail.host_code`、以 `SERVICE_UNAVAILABLE` 上报。
+ */
+function hostSyncReadError(a: { code: string; message: string; detail: Record<string, unknown>; httpStatus: number }): WorkError {
+  const known = (WORK_ERROR_CODES as readonly string[]).includes(a.code);
+  return new WorkError(
+    known ? (a.code as WorkErrorCode) : "SERVICE_UNAVAILABLE",
+    a.message,
+    known ? a.detail : { ...a.detail, host_code: a.code, host_http_status: a.httpStatus },
+  );
+}
+
+/** V09-37 BLOCK-2：同步只读一次逻辑读的取回结果（含"回退信号/结构化错误"的分类）。 */
+type SyncStatusAttempt =
+  | { kind: "ok"; report: SyncStatusReport; discovery_issues: string[] }
+  | { kind: "unsupported" }
+  | { kind: "error"; code: string; message: string; detail: Record<string, unknown>; httpStatus: number }
+  | { kind: "unreachable" };
+
 export class WorkServiceClient {
   private readonly dataDir: string;
   private readonly timeoutMs: number;
+  private readonly syncTimeoutMs: number;
   private readonly autostart: boolean;
 
   constructor(opts: WorkClientOptions) {
     this.dataDir = opts.dataDir;
     this.timeoutMs = opts.timeoutMs ?? 5_000;
+    // 同步只读预算：显式 timeoutMs 可覆盖（尊重调用方），否则 10s 默认——探活/写入不受此影响。
+    this.syncTimeoutMs = opts.syncTimeoutMs ?? opts.timeoutMs ?? SYNC_READ_TIMEOUT_MS;
     this.autostart = opts.autostart ?? process.env.TATAI_NO_AUTOSTART !== "1";
   }
 
@@ -1730,26 +1878,82 @@ export class WorkServiceClient {
    * `/api/projects/:id/sync-status` 直挂 8787（未转发 work 面），故先试 work 读口再退回该只读项目读口。
    * 描述符不存在/不可达/读口不完整 → `null`（调用方按「无法核对宿主后台健康」fail-closed，绝不静默当通过）。
    */
-  async readSyncStatusRemote(projectId: string): Promise<{ report: SyncStatusReport; discovery_issues: string[] } | null> {
+  async readSyncStatusRemote(projectId: string, opts: { timeoutMs?: number } = {}): Promise<{ report: SyncStatusReport; discovery_issues: string[] } | null> {
     const desc = readServiceDescriptor(this.dataDir);
     if (!desc) return null;
-    const tryGet = async (p: string, withToken: boolean): Promise<{ report: SyncStatusReport; discovery_issues: string[] } | null> => {
+    // V09-37 BLOCK-2：**一次逻辑读一个共享 deadline**（覆盖「请求 + body 读取 + 兼容 endpoint 回退」整段），
+    // 而不是每个 tryGet 各一份预算（旧实现两次各 5s，且慢的第一个端点超时后还会再打第二个端点重复派生）。
+    const budgetMs = opts.timeoutMs ?? this.syncTimeoutMs;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(new Error(`同步只读超过 ${budgetMs}ms 预算`)), budgetMs);
+    if (typeof timer.unref === "function") timer.unref();
+    const timeoutError = (): { kind: "error"; code: string; message: string; detail: Record<string, unknown>; httpStatus: number } => ({
+      kind: "error",
+      code: "HOST_READ_TIMEOUT",
+      message: `宿主同步只读读口在 ${budgetMs}ms 预算内未返回（超时）：不重试兼容 endpoint、不本地重算`,
+      detail: { timeout_ms: budgetMs },
+      httpStatus: 503,
+    });
+    const tryGet = async (p: string, withToken: boolean): Promise<SyncStatusAttempt> => {
+      const headers: Record<string, string> = {};
+      if (withToken) headers[WORK_TOKEN_HEADER] = desc.token;
+      let res: Response;
       try {
-        const headers: Record<string, string> = {};
-        if (withToken) headers[WORK_TOKEN_HEADER] = desc.token;
-        const res = await fetch(`http://${desc.host}:${desc.port}${p}`, { headers, signal: AbortSignal.timeout(this.timeoutMs) });
-        if (!res.ok) return null;
-        const body = (await res.json().catch(() => null)) as { ok?: boolean; sync?: SyncStatusReport; discovery_issues?: unknown } | null;
-        if (body?.ok !== true || body.sync === undefined || body.sync === null) return null;
-        return { report: body.sync, discovery_issues: Array.isArray(body.discovery_issues) ? (body.discovery_issues as string[]).filter((s) => typeof s === "string") : [] };
+        res = await fetch(`http://${desc.host}:${desc.port}${p}`, { headers, signal: ac.signal });
       } catch {
-        return null;
+        return ac.signal.aborted ? timeoutError() : { kind: "unreachable" };
       }
+      // **只有明确 404/405（不支持该端点）才是回退信号**；超时/5xx/无效响应不重复派生。
+      if (res.status === 404 || res.status === 405) return { kind: "unsupported" };
+      if (!res.ok) {
+        // V09-71 T37-01：兼容两种既有错误信封（顶层 {code,message,detail} / 嵌套 {ok:false,error:{…}}）：
+        // 统一提取并保留宿主原始结构化码与明细（不丢成 HTTP_xxx）。body 读取若被本次 deadline 掐断
+        // （提前 abort）→ 统一按 HOST_READ_TIMEOUT 分类，不退化成 HTTP 错误码、不重复回退。
+        let body: unknown = null;
+        try {
+          body = await res.json();
+        } catch {
+          if (ac.signal.aborted) return timeoutError();
+          body = null;
+        }
+        const picked = pickSyncErrorEnvelope(body);
+        return {
+          kind: "error",
+          code: typeof picked.code === "string" && picked.code !== "" ? picked.code : `HTTP_${res.status}`,
+          message: typeof picked.message === "string" && picked.message !== "" ? picked.message : `宿主同步只读读口返回 ${res.status}`,
+          detail: typeof picked.detail === "object" && picked.detail !== null ? (picked.detail as Record<string, unknown>) : {},
+          httpStatus: res.status,
+        };
+      }
+      let body: { ok?: boolean; sync?: SyncStatusReport; discovery_issues?: unknown } | null;
+      try {
+        body = (await res.json()) as typeof body;
+      } catch {
+        if (ac.signal.aborted) return timeoutError();
+        return { kind: "error", code: "HOST_READ_INVALID", message: "宿主同步只读读口响应不是合法 JSON（不重复派生）", detail: {}, httpStatus: 502 };
+      }
+      if (body?.ok !== true || body.sync === undefined || body.sync === null) {
+        return { kind: "error", code: "HOST_READ_INVALID", message: "宿主同步只读读口响应不完整（不重复派生）", detail: {}, httpStatus: 502 };
+      }
+      return {
+        kind: "ok",
+        report: body.sync,
+        discovery_issues: Array.isArray(body.discovery_issues) ? (body.discovery_issues as string[]).filter((s) => typeof s === "string") : [],
+      };
     };
-    return (
-      (await tryGet(`/api/work/sync/status?project_id=${encodeURIComponent(projectId)}`, true)) ??
-      (await tryGet(`/api/projects/${encodeURIComponent(projectId)}/sync-status`, false))
-    );
+    try {
+      const first = await tryGet(`/api/work/sync/status?project_id=${encodeURIComponent(projectId)}`, true);
+      if (first.kind === "ok") return { report: first.report, discovery_issues: first.discovery_issues };
+      if (first.kind === "error") throw hostSyncReadError(first);
+      if (first.kind === "unreachable") return null;
+      // unsupported（明确 404/405）→ 回退只读项目读口；两次共用上面那一个 deadline（同一 AbortController）。
+      const second = await tryGet(`/api/projects/${encodeURIComponent(projectId)}/sync-status`, false);
+      if (second.kind === "ok") return { report: second.report, discovery_issues: second.discovery_issues };
+      if (second.kind === "error") throw hostSyncReadError(second);
+      return null; // unsupported/unreachable → 既有 fail-closed 兼容（调用方本地兜底）
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
@@ -1796,6 +2000,83 @@ export class WorkServiceClient {
       return { kind: "unsupported", reason: "宿主只读预检路由响应不完整或契约不符" };
     }
     return { kind: "ok", result: payload as PreflightTaskResultResponse };
+  }
+
+  /**
+   * V09-69（DESIGN §3.18/§6.15）：向**唯一宿主**只读运行诊断读口取一次报告。
+   * **纯只读**：只用已有描述符，**绝不** ensure/拉起写者（不自愈）、不触发扫描/重推导；
+   * 宿主不支持（404/405/契约不符）⇒ `unsupported`（调用方报 unsupported，**不回退**）；
+   * 不可达/503 ⇒ `unavailable`；其它结构化错误 ⇒ `error`。返回报告再过一次 shared typed allowlist sanitize。
+   */
+  async runtimeDiagnosticsRemote(): Promise<RuntimeDiagnosticsFetch> {
+    const desc = readServiceDescriptor(this.dataDir);
+    if (!desc) return { kind: "unavailable", reason: "唯一写服务描述符缺失（运行诊断读口未发布）" };
+    let res: Response;
+    try {
+      res = await fetch(`http://${desc.host}:${desc.port}/api/work/diagnostics`, {
+        headers: { [WORK_TOKEN_HEADER]: desc.token },
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (e) {
+      return { kind: "unavailable", reason: `唯一宿主运行诊断读口不可达：${e instanceof Error ? e.message : String(e)}` };
+    }
+    if (res.status === 404 || res.status === 405) return { kind: "unsupported", reason: `宿主不支持运行诊断读口（HTTP ${res.status}）` };
+    const payload = (await res.json().catch(() => null)) as unknown;
+    if (!res.ok) {
+      const code = (payload as { code?: unknown } | null)?.code;
+      return {
+        kind: "error",
+        code: typeof code === "string" && code !== "" ? code : `HTTP_${res.status}`,
+        message: `宿主运行诊断读口返回 HTTP ${res.status}`,
+        detail: {},
+        httpStatus: res.status,
+      };
+    }
+    const report = sanitizeRuntimeDiagnosticsReport(payload);
+    if (report === null) return { kind: "unsupported", reason: "宿主运行诊断响应契约不符（schema 不匹配）" };
+    return { kind: "ok", report };
+  }
+
+  /**
+   * V09-66：向**唯一宿主**的本地 Git 收尾写面 `POST /api/work/git/finalize` 转发一次收尾请求。
+   * 只用已有描述符（不自愈、不本地执行 git——写者身份与落盘在宿主）；请求体**不含** grant/布尔/root。
+   * 宿主不支持（404/405）⇒ `unsupported`；不可达/503 ⇒ `unavailable`；结构化错误原样上抛。
+   */
+  async finalizeLocalCommitRemote(input: unknown): Promise<
+    | { kind: "ok"; result: FinalizeResult; association_evidence_id: string | null }
+    | { kind: "unsupported"; reason: string }
+    | { kind: "unavailable"; reason: string }
+    | { kind: "error"; code: string; message: string; detail: Record<string, unknown>; httpStatus: number }
+  > {
+    const desc = readServiceDescriptor(this.dataDir);
+    if (!desc) return { kind: "unavailable", reason: "唯一写服务描述符缺失（收尾写面未发布）" };
+    let res: Response;
+    try {
+      res = await fetch(`http://${desc.host}:${desc.port}/api/work/git/finalize`, {
+        method: "POST",
+        headers: { "content-type": "application/json", [WORK_TOKEN_HEADER]: desc.token },
+        body: JSON.stringify(input),
+        signal: AbortSignal.timeout(Math.max(this.timeoutMs, 30_000)),
+      });
+    } catch (e) {
+      return { kind: "unavailable", reason: `唯一宿主收尾写面不可达：${e instanceof Error ? e.message : String(e)}` };
+    }
+    if (res.status === 404 || res.status === 405) return { kind: "unsupported", reason: `宿主不支持收尾写面（HTTP ${res.status}）` };
+    const payload = (await res.json().catch(() => null)) as
+      | { ok?: boolean; result?: FinalizeResult; association_evidence_id?: string | null; code?: string; message?: string; detail?: Record<string, unknown> }
+      | null;
+    if (!res.ok) {
+      if (res.status === 503 || payload?.code === "SERVICE_UNAVAILABLE") return { kind: "unavailable", reason: payload?.message ?? `宿主收尾写面不可用（HTTP ${res.status}）` };
+      return {
+        kind: "error",
+        code: typeof payload?.code === "string" && payload.code !== "" ? payload.code : `HTTP_${res.status}`,
+        message: typeof payload?.message === "string" && payload.message !== "" ? payload.message : `宿主收尾写面返回 ${res.status}`,
+        detail: typeof payload?.detail === "object" && payload.detail !== null ? payload.detail : {},
+        httpStatus: res.status,
+      };
+    }
+    if (payload === null || payload.ok !== true || payload.result === undefined) return { kind: "unsupported", reason: "宿主收尾写面响应不完整或契约不符" };
+    return { kind: "ok", result: payload.result, association_evidence_id: payload.association_evidence_id ?? null };
   }
 
   /**
@@ -2030,12 +2311,37 @@ export type HostEntryFetch =
   | { kind: "error"; code: string; message: string; detail: Record<string, unknown>; httpStatus: number };
 
 /**
+ * V09-37 BLOCK-2：入口只读超预算 → **结构化**错误（调用方原样上报 Agent，**不**回退本地重算）；
+ * 连接失败仍走 `unreachable`（保留缺描述符/真正不可达时的既有 fail-closed 兼容）。
+ */
+function hostEntryTimeout(budgetMs: number): Extract<HostEntryFetch, { kind: "error" }> {
+  return {
+    kind: "error",
+    code: "HOST_READ_TIMEOUT",
+    message: `宿主只读入口在 ${budgetMs}ms 预算内未返回（超时）：不回退本地路径重算`,
+    detail: { timeout_ms: budgetMs },
+    httpStatus: 503,
+  };
+}
+
+/**
  * P2/V09-47 只读预检取回结果：**四态分明**——`ok`（宿主支持且契约相符）/ `unsupported`（旧宿主：404/405/契约不符，
  * 调用方报 `UNSUPPORTED_BY_HOST`、**不回退提交**）/ `unavailable`（描述符缺失/不可达/503，**不当地**通过）/
  * `error`（宿主明确结构化错误，原样上抛）。
  */
 export type PreflightFetch =
   | { kind: "ok"; result: PreflightTaskResultResponse }
+  | { kind: "unsupported"; reason: string }
+  | { kind: "unavailable"; reason: string }
+  | { kind: "error"; code: string; message: string; detail: Record<string, unknown>; httpStatus: number };
+
+/**
+ * V09-69 运行诊断只读取回：**四态分明**——`ok`（宿主支持且契约相符）/ `unsupported`（旧宿主：404/405/契约不符，
+ * 调用方报 unsupported、**不回退写路由**）/ `unavailable`（描述符缺失/不可达，**不冒充成功**）/
+ * `error`（宿主明确结构化错误，原样上抛）。
+ */
+export type RuntimeDiagnosticsFetch =
+  | { kind: "ok"; report: RuntimeDiagnosticsReport }
   | { kind: "unsupported"; reason: string }
   | { kind: "unavailable"; reason: string }
   | { kind: "error"; code: string; message: string; detail: Record<string, unknown>; httpStatus: number };
@@ -2070,13 +2376,26 @@ export async function fetchHostEntryResult(
     if (typeof opts.work_package_expected_revision === "string" && opts.work_package_expected_revision !== "")
       qs.set("work_package_expected_revision", opts.work_package_expected_revision);
   }
+  // V09-37 BLOCK-2：入口只读同样按本批对齐到 10s 默认预算（原 8s）；显式 opts.timeoutMs 仍可覆盖。
+  const budgetMs = opts.timeoutMs ?? ENTRY_READ_TIMEOUT_MS;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new Error(`入口只读超过 ${budgetMs}ms 预算`)), budgetMs);
+  if (typeof timer.unref === "function") timer.unref();
   try {
     const res = await fetch(`http://${desc.host}:${desc.port}/api/work/entry?${qs.toString()}`, {
       headers: { [WORK_TOKEN_HEADER]: desc.token },
-      signal: AbortSignal.timeout(opts.timeoutMs ?? 8000),
+      signal: ac.signal,
     });
     if (!res.ok) {
-      const body = (await res.json().catch(() => null)) as { code?: unknown; message?: unknown; detail?: unknown } | null;
+      let body: { code?: unknown; message?: unknown; detail?: unknown } | null = null;
+      try {
+        body = (await res.json()) as { code?: unknown; message?: unknown; detail?: unknown };
+      } catch {
+        // V09-71 T37-01 收尾：非 2xx 的 **body 读取**被本次 deadline 掐断 → 统一按 HOST_READ_TIMEOUT 分类
+        // （不退化成 HTTP 错误码、不重复回退），与同步端 T37-01 同口径。
+        if (ac.signal.aborted) return hostEntryTimeout(budgetMs);
+        body = null;
+      }
       const code = typeof body?.code === "string" && body.code !== "" ? body.code : `HTTP_${res.status}`;
       return {
         kind: "error",
@@ -2086,13 +2405,34 @@ export async function fetchHostEntryResult(
         httpStatus: res.status,
       };
     }
-    const body = (await res.json().catch(() => null)) as import("./readJobs").EntryView | null;
+    let body: import("./readJobs").EntryView | null = null;
+    try {
+      body = (await res.json()) as import("./readJobs").EntryView;
+    } catch {
+      // V09-71 T37-01 收尾：200 但 body 读取被本次 deadline 掐断 → 统一 HOST_READ_TIMEOUT。
+      if (ac.signal.aborted) return hostEntryTimeout(budgetMs);
+      body = null;
+    }
     if (body === null || body.ok !== true || body.entry === undefined || body.entry === null) {
-      return { kind: "unreachable", reason: "宿主只读入口响应不完整" };
+      if (ac.signal.aborted) return hostEntryTimeout(budgetMs);
+      // V09-71 T37-01 收尾：200 但非法/不完整 body 是**明确**的读失败（不是「不可达」）——报 HOST_READ_INVALID，
+      // 调用方**不**回退本地重算（与同步端 HOST_READ_INVALID 同口径）。只有缺描述符 / 真正网络不可达才保留
+      // `unreachable` 的既有 fail-closed 兼容。
+      return {
+        kind: "error",
+        code: "HOST_READ_INVALID",
+        message: "宿主只读入口响应非法/不完整（不重复派生、不回退本地重算）",
+        detail: {},
+        httpStatus: 502,
+      };
     }
     return { kind: "ok", view: body };
   } catch (e) {
+    // V09-37 BLOCK-2：超预算是**结构化**错误（不回退本地重算）；连接失败才是"不可达"（保留既有 fail-closed 兼容）。
+    if (ac.signal.aborted) return hostEntryTimeout(budgetMs);
     return { kind: "unreachable", reason: `宿主只读入口不可达：${e instanceof Error ? e.message : String(e)}` };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

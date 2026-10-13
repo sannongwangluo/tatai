@@ -17,8 +17,10 @@ export interface ArtifactEntry {
   bytes: number;
 }
 
-/** 构建输出清单：dist/、src-tauri/resources/server/、release exe、NSIS、MSI 各自的 sha256+体积（定序） */
-export function buildOutputManifest(root: string): { entries: ArtifactEntry[]; manifest_sha256: string } {
+/** 构建输出清单：dist/、src-tauri/resources/server/、release exe、NSIS、MSI 各自的 sha256+体积（定序）
+ *  `appVersion` 用于拼两个安装器文件名；缺省用本模块所属树的产品版本（构建尾调用即同一棵树）。
+ *  运行时试用提升改为传**候选根自己的版本**（候选可能是另一版的包），因此它是显式参数。 */
+export function buildOutputManifest(root: string, appVersion: string = APP_VERSION): { entries: ArtifactEntry[]; manifest_sha256: string } {
   const entries: ArtifactEntry[] = [];
   const pushFile = (abs: string, rel: string): void => {
     if (!fs.existsSync(abs)) return;
@@ -48,8 +50,8 @@ export function buildOutputManifest(root: string): { entries: ArtifactEntry[]; m
   pushDir(path.join(root, "src-tauri", "resources", "server"), "src-tauri/resources/server");
   pushFile(path.join(root, "src-tauri", "target", "release", "tatai.exe"), "src-tauri/target/release/tatai.exe");
   // 两个安装器文件名由产品版本号拼出（此前写死版本号，bump 时漏改就会悄悄漏收产物）
-  const nsisName = `Tatai_${APP_VERSION}_x64-setup.exe`;
-  const msiName = `Tatai_${APP_VERSION}_x64_en-US.msi`;
+  const nsisName = `Tatai_${appVersion}_x64-setup.exe`;
+  const msiName = `Tatai_${appVersion}_x64_en-US.msi`;
   pushFile(
     path.join(root, "src-tauri", "target", "release", "bundle", "nsis", nsisName),
     `src-tauri/target/release/bundle/nsis/${nsisName}`,
@@ -84,8 +86,9 @@ export interface OutputManifestFingerprint {
 export function outputManifestFingerprint(
   root: string,
   exclude: readonly string[] = STAMP_SELF_PATHS,
+  appVersion: string = APP_VERSION,
 ): OutputManifestFingerprint {
-  const manifest = buildOutputManifest(root);
+  const manifest = buildOutputManifest(root, appVersion);
   const excludedSet = new Set(exclude);
   const entries = manifest.entries.filter((e) => !excludedSet.has(e.path));
   const h = crypto.createHash("sha256");

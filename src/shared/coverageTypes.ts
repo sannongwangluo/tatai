@@ -66,6 +66,14 @@ export interface DesignCoverage {
 export interface ImplementationReadout {
   state: ImplementationState;
   basis: string | null;
+  /** 当前成员的真实结果登记；与验证、独审和用户接受分开。旧宿主可能不提供。 */
+  result_registration?: {
+    state: "complete" | "partial" | "none";
+    submitted_task_ids: string[];
+    pending_task_ids: string[];
+  };
+  /** 同源事实的人话解释，不改 state 或执行门禁；旧宿主由共享展示函数兼容。 */
+  interpretation?: { label: string; note: string };
 }
 
 /** 维度③ 验证：**复用** canonical（statusProjection.ts / provenance.ts 的取值），不另算一套 */
@@ -274,6 +282,15 @@ export interface DeliveryOverview {
     baseline_id: string | null;
     ledger_last_seq: number;
     drift: string | null;
+    /**
+     * V09-64（DESIGN §6.14 第 8 段）：本次交付读数**实际读的版本**所指的工作区。
+     * 缺字段/为 null ⇒ 未知（**不拿其它绿状态代替**，也不造绿）。旧宿主缺这三项 ⇒ 未知。
+     */
+    workspace_id?: string | null;
+    /** 实际读的源根（规范绝对路径）；未知 = null */
+    workspace_root?: string | null;
+    /** 该工作区冻结内容指纹（candidate-index-v1）；未冻结/未知 = null */
+    content_fingerprint?: string | null;
   };
   user_acceptance: {
     pending: number;
@@ -389,8 +406,11 @@ export interface ArtifactBinding {
 export interface FeatureLedgerDocumentSelection {
   /** 请求里的 `document` 原值（缺省 = `active`） */
   requested: string;
-  /** 实际读到的来源：`current`（现行编辑源）/ `active`（已批准基线快照）/ `revision`（不可变历史快照） */
-  mode: "current" | "active" | "revision";
+  /**
+   * 实际读到的来源：`current`（现行编辑源）/ `active`（已批准基线快照）/ `revision`（不可变历史快照）/
+   * `frozen_candidate`（**冻结候选绑定的 DESIGN/PLAN 快照**，不读当前开发目录最新文档；V09-64 §6.14 第 3 段）。
+   */
+  mode: "current" | "active" | "revision" | "frozen_candidate";
   /** 实际读到的设计修订（内容哈希）；读不到 = null */
   design_revision: string | null;
   /** 实际读到的施工图修订（内容哈希）；读不到 = null */
@@ -406,6 +426,24 @@ export interface FeatureLedgerDocumentSelection {
   drift: string | null;
 }
 
+/**
+ * 本次功能清单读口**实际读的版本**指向的工作区（V09-64；DESIGN §6.14 第 8 段）。
+ * `requested` = 请求参数原值（未指定 = null）；`resolved` = 是否解析到明确工作区/根。
+ * 未解析到 ⇒ `resolved:false` + `reason`，**不假绿**（交付图按未知呈现）。
+ * 缺本字段的旧服务 ⇒ 未知（界面不得当作"读了主目录"）。
+ */
+export interface FeatureLedgerWorkspace {
+  requested: string | null;
+  workspace_id: string | null;
+  kind: string | null;
+  root: string | null;
+  source_commit: string | null;
+  content_fingerprint: string | null;
+  status: string | null;
+  resolved: boolean;
+  reason: string | null;
+}
+
 export interface FeatureLedger {
   state: "ok" | "not_derived";
   scope_id: string | null;
@@ -419,6 +457,11 @@ export interface FeatureLedger {
   package_revision_basis: string[];
   /** 本次实际读到的文档版本（不许混版；见 `FeatureLedgerDocumentSelection`） */
   document_selection: FeatureLedgerDocumentSelection;
+  /**
+   * 本次实际读到的**工作区版本**（V09-64；缺字段 = 旧宿主，未知）。
+   * 交付总览默认读「当前试用候选」，开发视图读当前开发工作区；界面据此标出所读版本。
+   */
+  workspace?: FeatureLedgerWorkspace;
   /** 本次请求选定的「已登记产物引用」（可选；DESIGN.md §6.12／§2.9「同一份产物选择」）——进包版本身份，不改判据 */
   artifact_ref: string | null;
   /**
@@ -491,7 +534,16 @@ export interface WorkPackage {
   source_mode: "direct_tatai" | "coordinator_managed";
   status: DisplayStatus | null;
   checks: WorkPackageCheck[];
-  completion: { satisfied: boolean; remaining_checks: string[]; blocking_findings: string[] };
+  completion: {
+    satisfied: boolean;
+    remaining_checks: string[];
+    blocking_findings: string[];
+    /**
+     * V09-66（§6.14 第 7 段）：技术验证与独立审查当前通过且持有有效授权时，给出 `finalize_local_commit`
+     * 的**机器可执行下一步**及其实际参数（不是孤立工具）。不适用 = null（缺字段按未知，不回退写路由）。
+     */
+    finalize: NextOperation | null;
+  };
   continuation: { action_id: string; role: string; operation: string; reason: string; prerequisite: string };
   paging: LedgerPaging;
 }

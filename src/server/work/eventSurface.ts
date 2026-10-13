@@ -86,6 +86,12 @@ export const EVENT_SURFACE: Readonly<Record<string, string>> = {
   // ── 同步证据域（V09-23；DESIGN §2.10）──
   "sync.contract_registered": "mcp:register_sync_contract",
   "sync.evidence_checked": "mcp:scan_sync_evidence",
+  // ── 工作区域（V09-63；DESIGN §6.13/§6.14）──
+  "workspace.registered": "mcp:manage_workspace",
+  "workspace.updated": "mcp:manage_workspace",
+  "workspace.frozen": "mcp:manage_workspace",
+  "workspace.retired": "mcp:manage_workspace",
+  "workspace.pointed": "mcp:manage_workspace",
 };
 
 export interface SurfaceCheckResult {

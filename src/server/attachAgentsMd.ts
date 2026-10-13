@@ -3,6 +3,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getProject } from "./registry";
 import { readTextForAppend, WsError } from "./workstation";
+// V09-63 源根贯通：AGENTS.md 是**源文件**（在项目工作树里），按"当前开发工作区"解析根（§6.14 第 6 段），
+// 写前过托管写守卫（拒冻结候选源码写）。坏指针/目录不在 → 拒绝，不回退项目根。
+import { resolveCurrentDevRoot } from "./work/workspaces";
+import { assertHostedWriteAllowed } from "./work/workspaceGuard";
 
 // AGENTS.md 约定段接入（M3；V06-10 改为**标记区收敛**）：把 DESIGN.md §6.2 的约定句 + 接续指引
 // 插进被纳管项目的 AGENTS.md——那是客户端实际会载入的位置。
@@ -131,7 +135,19 @@ export function attachAgentsMd(projectId: string, dataDir?: string): AttachAgent
     throw new WsError("INVALID_INPUT", `约定段模板缺失: ${SNIPPET_FILE}`);
   }
   const snippet = fs.readFileSync(SNIPPET_FILE, "utf8");
-  const file = path.join(project.path, AGENTS_MD_FILE);
+  // 当前开发根（§6.14 第 2 段）：坏指针/目录不在 → 明确拒绝，不静默回退注册表锚点根
+  const dev = resolveCurrentDevRoot(projectId, dataDir);
+  if (dev.root === null) {
+    throw new WsError(
+      "INVALID_INPUT",
+      `当前开发指针不可用（source=${dev.source}）：${dev.blocked_reason ?? "目标工作区不可用"}——拒绝写 ${AGENTS_MD_FILE}，不静默回退项目根（DESIGN.md §6.14 第 2/10 段）`,
+    );
+  }
+  if (!fs.existsSync(dev.root) || !fs.statSync(dev.root).isDirectory()) {
+    throw new WsError("INVALID_INPUT", `当前开发工作区目录不在盘上：${dev.root}（工作区 ${dev.workspace_id}）——拒绝写 ${AGENTS_MD_FILE}`);
+  }
+  const file = path.join(dev.root, AGENTS_MD_FILE);
+  assertHostedWriteAllowed({ projectId, dataDir, workspaceId: dev.workspace_id, targetRoot: dev.root, kind: "source" });
   const created = !fs.existsSync(file);
   // Q64：用户手写的 AGENTS.md 可能是 UTF-16（记事本"Unicode" / PS 5.1 `Out-File` 默认）——
   // 按 UTF-8 硬读再整份写回会把文件毁掉且不可逆，故交给统一的编码闸门，不合格就拒绝写

@@ -25,6 +25,8 @@ import {
 } from "../../server/work/service";
 import { projectWorkDir } from "../../server/workstation";
 import { compareBuildIdentities, resolveBuildIdentity, type BuildIdentity } from "../../shared/buildIdentity";
+import { runtimeDiagnosticsFallback } from "../../server/work/runtimeDiagnostics";
+import type { RuntimeDiagnosticsReport } from "../../shared/runtimeDiagnostics";
 import { errorResult, textResult, type McpTool } from "./types";
 
 /** 探活超时：体检要快，等 5s 才报"服务不可达"对"接手即摸底"没有意义 */
@@ -200,12 +202,14 @@ export function createDoctorTool(deps: DoctorDeps = {}): McpTool {
     description:
       "接续入口体检（DESIGN 附录 C.5-4）：一次调用报写服务探活／描述符新鲜度／基线有效性／迁移状态／事件面缺口，各自给报因。" +
       "默认只读（只探活，不杀进程、不撤描述符、不拉起服务、不写事实）；heal=true 才按 V07-01 自愈逻辑清理死描述符并拉起写入服务再复探。" +
-      "给 project_id 才有基线与迁移两项（它们是项目自己的事实）",
+      "给 project_id 才有基线与迁移两项（它们是项目自己的事实）。V09-69：默认附 runtime 段（读宿主只读读口、不本地重算）；runtime_only=true 为轻量模式（只取运行诊断，不启动服务、不触发自愈）。",
     inputSchema: {
       type: "object",
       properties: {
-        project_id: { type: "string", description: "注册表里的项目 id（省略则跳过基线与迁移两项）" },
+        project_id: { type: "string", description: "注册表里的项目 id（省略则跳过基线与迁移两项；运行诊断也按它过滤）" },
         heal: { type: "boolean", description: "true = 探活不可用时执行 V07-01 自愈（清死描述符/按需拉起）再复探；默认 false 只读" },
+        runtime: { type: "boolean", description: "是否附运行诊断 runtime 段（默认 true；false 则与既有五段输出一致）。runtime 段读宿主只读读口，不本地重算" },
+        runtime_only: { type: "boolean", description: "true = 只取运行诊断的轻量模式：不跑探活/基线/迁移/事件面、不启动任何服务、不触发自愈；默认 false" },
       },
       required: [],
       additionalProperties: false,
@@ -214,6 +218,17 @@ export function createDoctorTool(deps: DoctorDeps = {}): McpTool {
       const dataDir = resolveDataDir();
       const projectId = typeof args.project_id === "string" ? args.project_id.trim() : "";
       const heal = args.heal === true;
+      const runtimeOnly = args.runtime_only === true;
+      const wantRuntime = args.runtime !== false;
+      if (runtimeOnly && args.runtime === false) {
+        return errorResult(
+          JSON.stringify(
+            { ok: false, code: "INVALID_INPUT", message: "runtime_only 与 runtime:false 互相矛盾：runtime_only 必含 runtime", detail: {} },
+            null,
+            2,
+          ),
+        );
+      }
       if (projectId !== "" && getProject(projectId, dataDir) === undefined) {
         const known = listProjects(dataDir).map((p) => p.id);
         return errorResult(
@@ -226,6 +241,37 @@ export function createDoctorTool(deps: DoctorDeps = {}): McpTool {
       }
 
       const client = new WorkServiceClient({ dataDir, timeoutMs: PROBE_TIMEOUT_MS });
+      // V09-69（DESIGN §3.18/§6.15）：runtime 段**读宿主只读读口**（同一 builder），不本地重算、不回退写路由。
+      const runtimeFetched = wantRuntime || runtimeOnly ? await client.runtimeDiagnosticsRemote() : null;
+      const runtimeReport: RuntimeDiagnosticsReport | null =
+        runtimeFetched === null
+          ? null
+          : runtimeFetched.kind === "ok"
+            ? runtimeFetched.report
+            : runtimeDiagnosticsFallback(
+                runtimeFetched.kind,
+                runtimeFetched.kind === "error" ? runtimeFetched.message : runtimeFetched.reason,
+              );
+
+      if (runtimeOnly) {
+        // 轻量模式：只取运行诊断——不探活/不 heal/不基线/不迁移/不事件面，不启动任一服务、不自愈。
+        const report = runtimeReport ?? runtimeDiagnosticsFallback("unsupported", "runtime_only 未能取到宿主读口");
+        return textResult(
+          JSON.stringify(
+            {
+              ok: report.status === "healthy",
+              runtime_only: true,
+              data_dir: dataDir,
+              generated_at: nowIso(),
+              project_id: projectId === "" ? null : projectId,
+              heal: { requested: heal, attempted: false, note: "runtime_only 轻量模式不触发自愈（只读）；既有显式 heal:true 行为在默认五段模式保持" },
+              runtime: report,
+            },
+            null,
+            2,
+          ),
+        );
+      }
       const probed = await client.probe();
       let availability = probed;
       let healReport: Record<string, unknown> = {
@@ -291,7 +337,16 @@ export function createDoctorTool(deps: DoctorDeps = {}): McpTool {
         ["migration", migration],
         ["event_surface", eventSurface],
       ];
-      const problems = sections.flatMap(([name, s]) => s.problems.map((p) => `${name}: ${p}`));
+      const runtimeProblems =
+        runtimeReport === null
+          ? []
+          : runtimeReport.reasons
+              .filter((r) => r.code !== "OK" && r.code !== "STALE_OBSERVATION")
+              .map((r) => `runtime: ${r.code}: ${r.detail}`);
+      const problems = [
+        ...sections.flatMap(([name, s]) => s.problems.map((p) => `${name}: ${p}`)),
+        ...runtimeProblems,
+      ];
       const checked = sections.filter(([, s]) => s.ok !== null);
       const ok = checked.every(([, s]) => s.ok === true);
       return textResult(
@@ -305,6 +360,7 @@ export function createDoctorTool(deps: DoctorDeps = {}): McpTool {
             baseline,
             migration,
             event_surface: eventSurface,
+            runtime: runtimeReport,
             problems,
           },
           null,

@@ -14,11 +14,12 @@
 //
 // 分寸（DESIGN §4.2／附录 E.9，REQUEST「状态落字约束」）：
 //   · `result_submitted` 单凭提交**不叫已实现**——只有「提交 + 技术验证当前有效通过」才读作「已实现」，
-//     否则「已提交实现」；图上无运行投影的 `no_run_record` 是「暂无实现记录」，**不读成**「未开始」；
+//     否则「已提交实现」；缺执行登记与已有验证依据并列说明，不读成「未实现」；
 //   · 证据失效 / 有明确失败检查 ⇒ 显式「需要复验」/「有问题」，不留在难懂的枚举上；
 //   · 刷新失败（stale）时一律注明「（上次）」并把绿档降为中性——旧读数不冒充当前通过。
 
-import type { EvidenceState } from "../../shared/coverageTypes";
+import type { EvidenceState, ImplementationReadout, VerificationReadout } from "../../shared/coverageTypes";
+import { implementationInterpretation } from "../../shared/implementationReadout";
 
 export type ChipTone = "ok" | "warn" | "info" | "neutral";
 
@@ -67,28 +68,13 @@ export function displayCopyOf(displayName: string): DisplayCopy | null {
 
 // ── 读数 → 人话（只做标签与色档，不改判据） ──
 
-const IMPL_LABEL: Readonly<Record<string, string>> = {
-  not_started: "未开始",
-  in_progress: "实现中",
-  blocked: "受阻",
-  cancelled: "已取消",
-  no_run_record: "暂无实现记录",
-};
-
-/**
- * 实现维度的人话。`result_submitted` 拆两读：
- *   · 技术验证**读数有效通过** ⇒ 「已实现」；
- *   · 只是提交过（未验证/失效/检查失败） ⇒ 「已提交实现」。
- * 其余取值沿用既有枚举语义（`no_run_record` **不**读成 `not_started`）；`stale` 时注明「（上次）」。
- */
-export function implementationChip(state: string, readoutVerified: boolean, stale: boolean): ChipDisplay {
-  if (state === "result_submitted") {
-    return withStaleMark(readoutVerified ? { label: "已实现", tone: "info" } : { label: "已提交实现", tone: "info" }, stale);
-  }
-  return withStaleMark(
-    { label: IMPL_LABEL[state] ?? "未知", tone: state === "in_progress" ? "info" : state === "blocked" ? "warn" : "neutral" },
-    stale,
-  );
+/** 同源解释；旧宿主缺解释字段时也用同一共享函数，不自行改执行状态。 */
+export function implementationChip(implementation: ImplementationReadout, verification: VerificationReadout, stale: boolean): ChipDisplay & { note: string } {
+  const interpretation = implementation.interpretation ?? implementationInterpretation(implementation, verification);
+  return {
+    ...withStaleMark({ label: interpretation.label, tone: implementation.state === "blocked" ? "warn" : "neutral" }, stale),
+    note: stale ? `上次读取：${interpretation.note}` : interpretation.note,
+  };
 }
 
 /** 技术验证读数里是否存在明确失败 / 失效的检查（`evidence_entry.effective`） */
@@ -97,20 +83,6 @@ export function hasFailedEvidence(entries: ReadonlyArray<{ effective: string }>)
 }
 function hasStaleEvidence(entries: ReadonlyArray<{ effective: string }>): boolean {
   return entries.some((e) => e.effective === "stale");
-}
-
-/** 该功能的技术验证**当前**是否有效通过（`verified` + 证据有效 + 无失败/失效检查） */
-export function verificationIsCurrent(r: {
-  display_status: string;
-  evidence_state: EvidenceState;
-  evidence_entry: ReadonlyArray<{ effective: string }>;
-}): boolean {
-  return (
-    r.display_status === "verified" &&
-    r.evidence_state === "verified" &&
-    !hasFailedEvidence(r.evidence_entry) &&
-    !hasStaleEvidence(r.evidence_entry)
-  );
 }
 
 /**

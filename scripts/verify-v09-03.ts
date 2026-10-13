@@ -397,31 +397,66 @@ function main(): void {
         (() => {
           // 负例（判据不放宽）：① 锚点前改一个字节 ⇒ 剥离哈希必变（逐字节判据，非模糊匹配）；
           //   ② 宽泛归一（把所有 `- [ ] chk-* ` 前缀一律剥掉）≠ 钉值 ⇒ 本轮只认"精确已审差异"。
-          // 四阶段链钉值（逐阶段一枚，判据不放宽；每阶段只认本阶段"精确已审"差异，不做范围型归一）：
-          //   PIN_V09_03        = 本阶段（V09-62 交付总览卡行：锚点前纯插入一整行已审卡行）后剥离哈希 d72cafa7…
-          //   PREV_PIN_V09_03   = 上一阶段（plan-finalize：V09-09 十条恢复后授稳定键 10 条）后剥离哈希 81161852…
-          //   PREV2_PIN_V09_03  = 再上一阶段（feature-scope-reconcile：84 条授键）后剥离哈希 eb8b1b77…
-          //   LEGACY_PIN_V09_03 = 再再上一阶段（plan-integration：43 条授键）后剥离哈希 4299af1b…
-          const PIN_V09_03 = "92822fdee8af79e68af0b1611642c8d013de72cd1ccf895ecf45d4bbae0bd3c1";
-          const PREV_PIN_V09_03 = "b9192eb68f3adb96d75e619bdcaaf7d6cef577f92fcb1b7ea002406f712db241";
-          const PREV2_PIN_V09_03 = "eb8b1b778253d1f45fb99d4e273a7fd32a4923a09ea4aa84a2985498dfae7c28";
+          // 五阶段链钉值（逐阶段一枚，判据不放宽；每阶段只认本阶段"精确已审"差异，不做范围型归一）：
+          //   CURRENT_PIN_V09_03 = 本阶段（本批 V09-68…V09-71 四行卡行：锚点前纯插入四行已审卡行）后剥离哈希 ba543059…
+          //   PIN_V09_03        = 上一阶段（V09-63…V09-67 五行卡行）后剥离哈希 5ec1cbbf…
+          //   PREV_PIN_V09_03   = 上一阶段（V09-62 交付总览卡行）后剥离哈希 d72cafa7…
+          //   PREV2_PIN_V09_03  = 再上一阶段（plan-finalize：V09-09 十条恢复后授稳定键 10 条）后剥离哈希 81161852…
+          //   PREV3_PIN_V09_03  = 再再上一阶段（feature-scope-reconcile：84 条授键）后剥离哈希 eb8b1b77…
+          //   LEGACY_PIN_V09_03 = 再再再上一阶段（plan-integration：43 条授键）后剥离哈希 4299af1b…
+          const CURRENT_PIN_V09_03 = "e4dfe7cfbcc8da2168c21604b04da9074914cfcc982227cae26ffc503591fdc5";
+          const PIN_V09_03 = "be28524e6b90922d3424302464485c42bca76ea678940d68eb968b3952d4f35a";
+          const PREV_PIN_V09_03 = "92822fdee8af79e68af0b1611642c8d013de72cd1ccf895ecf45d4bbae0bd3c1";
+          const PREV2_PIN_V09_03 = "b9192eb68f3adb96d75e619bdcaaf7d6cef577f92fcb1b7ea002406f712db241";
+          const PREV3_PIN_V09_03 = "eb8b1b778253d1f45fb99d4e273a7fd32a4923a09ea4aa84a2985498dfae7c28";
           const LEGACY_PIN_V09_03 = "4299af1b2d15cc54512e9353634c1561d6679a40c63697a2ecbe4177ecd12762";
-          // 本阶段唯一差异＝锚点前纯插入一整行已审 V09-62 卡行（全文一等）。判据不放宽：删/重复/改正文
-          // 或改它处任一字节都不等于本阶段钉值；只整行去掉这一行应精确回到上一阶段 81161852…。
+          // ── 本阶段（2026-10-13 运行诊断批 V09-68…V09-71）──
+          // 本阶段唯一差异＝锚点前**纯插入 V09-68…V09-71 四行已审卡行**（全文一等）。判据不放宽：删/重复/改正文
+          // 或改它处任一字节都不等于本阶段钉值；只整块去掉这四行应精确回到**上一阶段** 5ec1cbbf…（V09-63…V09-67 阶段）。
+          const BATCH_ROWS_CURRENT = [
+            '| V09-68 | todo | 实现读数修正：缺登记和部分提交不误报未实现或未开始 | 无 | 同源聚合反例、真实界面、非作者复核和安装身份 |',
+            '| V09-69 | todo | 运行健康只读读口与统一状态模型（宿主直答本地读口＋Agent tokened 读口同一 builder；`doctor` 扩展 `runtime` 与 `runtime_only` 轻量模式、不新增工具名；503 按 reason 区分） | 无 | 本卡正反例、四态与超时/503 按 reason 语义、同源读数与零写入字节级判据、源清单与非作者复核 |',
+            '| V09-70 | todo | 专用运行诊断页、主工作面全局轻量异常提示、任一主视图可见时 5 秒监看、有界只读重连与脱敏导出 | 无（读口契约冻结后并行；不等待其它卡完成） | 真实浏览器观察、监看/退避/去重/恢复核验反例、脱敏导出核对、类型与构建通过 |',
+            '| V09-71 | todo | 集成、受控安装与真实大项目 Agent+UI 旅程验收（含既有 V09-37 性能返工收敛） | V09-37、V09-69、V09-70 | 集成读数与安装身份一致、真实大项目 Agent+UI 旅程记录、机械期望逐条点名更新留档、非作者复核 |',
+          ].join("\n") + "\n";
+          const currentHits = stripped.split(BATCH_ROWS_CURRENT).length - 1;
+          ok(currentHits === 1, `④ 本阶段唯一差异：本批 V09-68…V09-71 四行卡行在锚点前恰命中 1 处（实际 ${currentHits}）`);
+          const strippedPrev = stripped.replace(BATCH_ROWS_CURRENT, "");
+          ok(sha256Text(strippedPrev) === PIN_V09_03, "④ 正向证明（本阶段）：整块去掉已审 V09-68…V09-71 四行卡行 ⇒ 精确回到上一阶段剥离哈希 5ec1cbbf…（锚点前无其它改动）");
+          ok(sha256Text(stripped.replace(BATCH_ROWS_CURRENT, BATCH_ROWS_CURRENT + BATCH_ROWS_CURRENT)) !== CURRENT_PIN_V09_03, "④ 负例：重复本批四行卡行 ⇒ ≠ 本阶段钉值");
+          ok(sha256Text(stripped.replace("| V09-68 | todo |", "| V09-68 | done |")) !== CURRENT_PIN_V09_03, "④ 负例：改本批卡行状态列 ⇒ ≠ 本阶段钉值（状态列非差异口径）");
+          const tamperedCur = `${stripped.slice(0, 100)}啊${stripped.slice(100)}`;
+          ok(sha256Text(tamperedCur) !== CURRENT_PIN_V09_03, "④ 负例：锚点前改其它一个字符 ⇒ 本阶段剥离哈希必变（非模糊匹配）");
+          // ── 以下为上一阶段（V09-63…V09-67 五卡）起、逐级可还原的原五阶段链（在 strippedPrev 上复算）──
+          // 本阶段唯一差异＝锚点前**纯插入 V09-63…V09-67 五行已审卡行**（全文一等）。判据不放宽：删/重复/改正文
+          // 或改它处任一字节都不等于本阶段钉值；只整块去掉这五行应精确回到上一阶段 d72cafa7…（V09-62 阶段）。
+          const BATCH_ROWS = [
+            "| V09-63 | todo | 工作区与交付候选登记、接续契约：目标工作区/实际 cwd/可改范围随入口与工作包带出 | 无 | 本卡正反例、真实解析与 HTTP/MCP 读回、源清单与非作者复核 |",
+            "| V09-64 | todo | 候选冻结、证据按候选版本解析与交付版本读数（回收后可从提交还原，不失效） | V09-63 | 本卡正反例、真实解析与读回、源清单与非作者复核 |",
+            "| V09-65 | todo | 写口拒错目标与冻结候选写入拒绝（语义校验，不冒充 OS 沙箱） | V09-63 | 本卡正反例、既有合法路径回归、源清单与非作者复核 |",
+            "| V09-66 | todo | 本地 Git 自动收尾：提交内容等于所受验输入且不空提交、诚实失败、不 push | V09-65 | 本卡正反例、真实仓库隔离夹具读回、源清单与非作者复核 |",
+            "| V09-67 | todo | 交付总览版本一致、运行核对与本批受影响证据续验收口 | V09-63、V09-64、V09-65、V09-66 | 本卡正反例、真实安装与同版读回、续验证据与非作者复核 |",
+          ].join("\n") + "\n";
+          const batchHits = strippedPrev.split(BATCH_ROWS).length - 1;
+          ok(batchHits === 1, `④ 本阶段唯一差异：本批 V09-63…V09-67 五行卡行在锚点前恰命中 1 处（实际 ${batchHits}）`);
+          const baseStripped = strippedPrev.replace(BATCH_ROWS, "");
+          ok(sha256Text(baseStripped) === PREV_PIN_V09_03, "④ 正向证明（本阶段）：整块去掉已审 V09-63…V09-67 五行卡行 ⇒ 精确回到上一阶段剥离哈希 d72cafa7…（锚点前无其它改动）");
+          ok(sha256Text(strippedPrev.replace(BATCH_ROWS, BATCH_ROWS + BATCH_ROWS)) !== PIN_V09_03, "④ 负例：重复本批五行卡行 ⇒ ≠ 本阶段钉值");
+          ok(sha256Text(strippedPrev.replace("| V09-63 | todo |", "| V09-63 | done |")) !== PIN_V09_03, "④ 负例：改本批卡行状态列 ⇒ ≠ 本阶段钉值（状态列非差异口径）");
           const V09_62_ROW = "| V09-62 | todo | 交付总览、完整功能核查与可试用判定 | 无 | 同源读数与负例、浏览器默认入口、非作者复审、实际安装版本核对 |";
-          const v0962Hits = stripped.split(V09_62_ROW).length - 1;
-          ok(v0962Hits === 1, `④ 本阶段唯一差异：V09-62 卡行在锚点前恰命中 1 处（实际 ${v0962Hits}）`);
-          const prevStripped = stripped.replace(V09_62_ROW + "\n", "");
+          const v0962Hits = baseStripped.split(V09_62_ROW).length - 1;
+          ok(v0962Hits === 1, `④ 上一阶段唯一差异：V09-62 卡行在 V09-62 阶段锚点前恰命中 1 处（实际 ${v0962Hits}）`);
+          const prevStripped = baseStripped.replace(V09_62_ROW + "\n", "");
           ok(sha256Text(prevStripped) !== PIN_V09_03, "④ 负例：删掉 V09-62 卡行 ⇒ ≠ 本阶段钉值（该行即本阶段差异，不得当作可不计）");
           ok(
-            sha256Text(stripped.replace(V09_62_ROW + "\n", V09_62_ROW + "\n" + V09_62_ROW + "\n")) !== PIN_V09_03,
+            sha256Text(strippedPrev.replace(V09_62_ROW + "\n", V09_62_ROW + "\n" + V09_62_ROW + "\n")) !== PIN_V09_03,
             "④ 负例：重复 V09-62 卡行 ⇒ ≠ 本阶段钉值",
           );
-          ok(sha256Text(stripped.replace(V09_62_ROW, V09_62_ROW + "（改）")) !== PIN_V09_03, "④ 负例：改 V09-62 卡行正文 ⇒ ≠ 本阶段钉值");
-          const tampered = `${stripped.slice(0, 100)}啊${stripped.slice(100)}`;
+          ok(sha256Text(strippedPrev.replace(V09_62_ROW, V09_62_ROW + "（改）")) !== PIN_V09_03, "④ 负例：改 V09-62 卡行正文 ⇒ ≠ 本阶段钉值");
+          const tampered = `${strippedPrev.slice(0, 100)}啊${strippedPrev.slice(100)}`;
           ok(sha256Text(tampered) !== PIN_V09_03, "④ 负例：锚点前改其它一个字符 ⇒ 剥离哈希必变（非模糊匹配）");
-          const wideStripped = stripped.replace(/^(- \[[ x]\] )chk-[a-z0-9-]+ /gm, "$1");
-          ok(wideStripped !== stripped && sha256Text(wideStripped) !== PIN_V09_03, "④ 负例：宽泛剥掉全部 chk- 前缀 ≠ 钉值（不做无依据归一）");
+          const wideStripped = strippedPrev.replace(/^(- \[[ x]\] )chk-[a-z0-9-]+ /gm, "$1");
+          ok(wideStripped !== strippedPrev && sha256Text(wideStripped) !== PIN_V09_03, "④ 负例：宽泛剥掉全部 chk- 前缀 ≠ 钉值（不做无依据归一）");
           // 语义恒等证明（判据不放宽：只去掉**该阶段精确点名**的已审 token，不用范围型 allowlist、不做宽泛归一）：
           //   从剥离正文逐行只去掉某一份迁移表点名的 `chk-*` token，结果应精确回到该阶段的剥离哈希。
           const stripTokensOf = (src: string, tablePath: string): string => {
@@ -437,18 +472,18 @@ function main(): void {
           };
           const pfMig = path.join(REPO, ".工作台", "project-completion-20261008", "plan-finalize", "migration-table.json");
           const fsMig = path.join(REPO, ".工作台", "project-completion-20261008", "feature-scope-reconcile", "migration-table.json");
-          // 正向证明（本阶段）：只把已审 V09-62 卡行整行去掉 ⇒ 精确回到上一阶段 81161852…（锚点前无其它改动）。
-          ok(sha256Text(prevStripped) === PREV_PIN_V09_03, "④ 正向证明（本阶段）：整行去掉已审 V09-62 卡行 ⇒ 精确回到上一阶段剥离哈希 81161852…（锚点前无其它改动）");
-          // 前两阶段沿用（用**原历史正文**；判据不放宽）：从上一阶段剥离正文去掉 10 个 plan-finalize token
+          // 正向证明（上一阶段）：从 V09-62 阶段再把已审 V09-62 卡行整行去掉 ⇒ 精确回到 plan-finalize 阶段 81161852…。
+          ok(sha256Text(prevStripped) === PREV2_PIN_V09_03, "④ 正向证明（上一阶段）：整行去掉已审 V09-62 卡行 ⇒ 精确回到 plan-finalize 阶段剥离哈希 81161852…（锚点前无其它改动）");
+          // 更早阶段沿用（用**原历史正文**；判据不放宽）：从 plan-finalize 阶段剥离正文去掉 10 个 plan-finalize token
           // ⇒ eb8b1b77…；再去掉 41 个 feature-scope token ⇒ 4299af1b…（旧钉值按原历史正文复算，不在新源上重算）。
           if (fs.existsSync(pfMig)) {
             const back10 = stripTokensOf(prevStripped, pfMig);
-            ok(sha256Text(back10) === PREV2_PIN_V09_03, "④ 正向证明（上一阶段）：去掉 plan-finalize 十处已审精确 token ⇒ 回到 eb8b1b77…（锚点前无其它改动）");
+            ok(sha256Text(back10) === PREV3_PIN_V09_03, "④ 正向证明（再上一阶段）：去掉 plan-finalize 十处已审精确 token ⇒ 回到 eb8b1b77…（锚点前无其它改动）");
             if (fs.existsSync(fsMig)) {
-              ok(sha256Text(stripTokensOf(back10, fsMig)) === LEGACY_PIN_V09_03, "④ 正向证明（再上一阶段）：再去掉 41 个 feature-scope token ⇒ 回到 4299af1b…（四阶段链逐段可还原）");
+              ok(sha256Text(stripTokensOf(back10, fsMig)) === LEGACY_PIN_V09_03, "④ 正向证明（再再上一阶段）：再去掉 41 个 feature-scope token ⇒ 回到 4299af1b…（五阶段链逐段可还原）");
             }
           }
-          return sha256Text(stripped) === PIN_V09_03;
+          return sha256Text(stripped) === CURRENT_PIN_V09_03 && sha256Text(strippedPrev) === PIN_V09_03;
         })(),
         // 定向更新（V09-61 plan-finalize V09-09 十条恢复检查授稳定键，2026-10-08）：钉值 eb8b1b77… → 81161852…。判据未放宽——\r
         //   仍是「剥离追加块后与钉值逐字节恒等，多一字少一字都红」。依据＝逐字审 diff ＋ 三阶段链逐段还原实测：\r
@@ -480,7 +515,15 @@ function main(): void {
         //   锚点前改动（顶部指针段、V09-29 行文本、V09-45…V09-61 卡行），属既有欠账、非本批引入，本轮不代其背书。
         //   新钉值 4299af1b…（＝现行 PLAN 行尾归一 LF 后剥离同一追加块的实测 sha256，项目自身实测非估算）｜
         //   保留意图同上（剥离后逐字节恒等，多一字少一字都红）；追加块之内（需求映射表／卡定义／覆盖表）不受影响。
-        "④ 真实 PLAN.md 剥离追加块后逐字节（行尾归一 LF）匹配 V09-62 交付总览卡行后正文（sha256 恒等 92822fde…，锚点前仅本阶段 1 行纯插入 + 前阶段 10 处 + 再前阶段 41 处纯前缀插入）",
+        // 定向更新（本批「最终源文档与静态契约一致性」批次卡行机械影响，2026-10-09）：钉值 d72cafa7… → 5ec1cbbf…。判据未放宽——
+        //   仍是「剥离追加块后与钉值逐字节恒等，多一字少一字都红」。依据＝逐字审 diff ＋ 剥离还原实测：
+        //   本批在**追加块锚点之前**的**第一张当前任务表**纯插入 V09-63…V09-67 **五行已审卡行**（PLAN「本批机械影响」①预告 90→95）。
+        //   语义恒等证明（非估算，写入上面的 ④ 正向断言）：只把这 5 行**整块**从现行 PLAN 的剥离正文去掉，结果**精确等于**
+        //   上一阶段（V09-62 交付总览卡行）剥离哈希 d72cafa7…；再从该结果去掉 V09-62 卡行 ⇒ 81161852…；再去掉 10 个
+        //   plan-finalize token ⇒ eb8b1b77…；再去掉 41 个 feature-scope token ⇒ 4299af1b…（五阶段链逐段可还原）。
+        //   新钉值 5ec1cbbf…（＝现行 PLAN 行尾归一 LF 后剥离同一追加块的实测 sha256，项目自身实测非估算）｜
+        //   保留意图同上（剥离后逐字节恒等，多一字少一字都红）；追加块之内（需求映射表／卡定义／覆盖表／功能映射表）不受影响。
+        "④ 真实 PLAN.md 剥离追加块后逐字节（行尾归一 LF）匹配本阶段 V09-68…V09-71 四行卡行后正文（当前 sha256 恒等 e4dfe7cf…；去掉这四行精确回到上一阶段 5ec1cbbf…，再逐级还原 d72cafa7…/81161852…/eb8b1b77…/4299af1b…——锚点前仅本阶段 4 行纯插入 + 前一阶段 5 行 + 前阶段 1 行 + 更前阶段 10 处 + 再再前阶段 41 处纯前缀插入）",
       );
     }
 

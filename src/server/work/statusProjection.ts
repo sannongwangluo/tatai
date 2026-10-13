@@ -38,6 +38,8 @@ import { WorkError } from "./types";
 import {
   readFindings,
   evidenceBlobPath,
+  evidenceManifestRootVerdict,
+  sha256Hex,
   type EvidenceBinding,
   type FindingSeverity,
   type FindingState,
@@ -68,6 +70,7 @@ import {
   readRevisionSnapshotText,
   revisionSnapshotExists,
   planContentSnapshotIndex,
+  readBaselineLog,
 } from "./documents";
 import { withDerivationScope } from "./derivationScope";
 import { importTaskDefinitions, parseIntegrationRequirements, type TaskDefinition } from "./plan";
@@ -78,6 +81,7 @@ import {
   projectRootOfWorkDir,
   readManifestCarrier,
   verifySourceManifest,
+  prewarmGitIgnored,
   type SourceManifestCarrier,
   type SourceManifestVerdict,
 } from "./sourceEvidence";
@@ -2067,6 +2071,137 @@ export function withPlanSnapshot(
   };
 }
 
+/** 冻结候选绑定 PLAN 快照的读侧结果（供 Git 收尾/试用提升按**同一候选版本**的卡定义派生判据） */
+export interface FrozenPlanScope {
+  /** true = 已用候选冻结绑定的 PLAN 快照重建定义；false = 未绑定或快照读不回（调用方须按 fail-closed 处理） */
+  applied: boolean;
+  plan_revision: string | null;
+  plan_definition: string | null;
+  reason: string | null;
+}
+
+/**
+ * 按**候选冻结绑定的 PLAN 内容哈希**读不可变快照并重建 `ProjectFacts` 里属于施工图的部分
+ * （定义 / 集成检查要求 / 分段基准），使对旧候选的判据用**它冻结的那一版**卡定义，
+ * 而**不读当前开发目录的最新施工图**（§6.14 第 3 段「不读当前开发目录的最新媒体去判旧版本」）。
+ *
+ * `planHash === null`（旧格式/未绑定）⇒ 不改动 facts，如实返回 `applied=false` 与原因——调用方据此
+ * 决定是否 fail-closed（新冻结必须绑定 PLAN 内容哈希）。
+ */
+export function applyFrozenPlanSnapshot(
+  facts: ProjectFacts,
+  projectId: string,
+  dataDir: string,
+  planHash: string | null,
+): { facts: ProjectFacts; status: FrozenPlanScope } {
+  if (planHash === null || planHash === "") {
+    return {
+      facts,
+      status: { applied: false, plan_revision: null, plan_definition: null, reason: "冻结候选未绑定 PLAN 内容哈希（旧冻结/未绑定）：卡定义取自当前施工图，不按候选版本重建" },
+    };
+  }
+  const text = readPlanTextByContentHash(projectId, dataDir, planHash);
+  if (text === null || sha256Hex(text) !== planHash) {
+    return {
+      facts,
+      status: {
+        applied: false,
+        plan_revision: planHash,
+        plan_definition: null,
+        reason: `冻结候选绑定的 PLAN 快照（${planHash.slice(0, 12)}…）读不到或与冻结声明的内容哈希不符：卡定义无法按候选版本重建（不拿当前施工图顶替）`,
+      },
+    };
+  }
+  const log = readBaselineLog(projectId, dataDir);
+  const match = log.baselines.find((b) => b.plan_revision.content_sha256 === planHash);
+  const planDefinition = match?.plan_revision.definition_sha256 ?? null;
+  return {
+    facts: withPlanSnapshot(facts, { plan_text: text, plan_revision: planHash, plan_definition: planDefinition }),
+    status: { applied: true, plan_revision: planHash, plan_definition: planDefinition, reason: null },
+  };
+}
+
+/**
+ * 按**内容哈希**取施工图不可变快照原文（**与 obligations.planSnapshotReader / 分段复核同一份口径**）：
+ * 施工图对象主名是**定义哈希**，内容哈希只是"同定义下另一份正文"的候选名——直读 `<contentHash>.md`
+ * 只有在"这份正文是该定义下的首份"时才对得上（§2.6/§2.9）。故这里经 `planContentSnapshotIndex`
+ * （内容哈希 → 对象候选名 + 核内容哈希）解析后再读，读不到 → null（不猜、不用当前施工图顶替）。
+ */
+function readPlanTextByContentHash(projectId: string, dataDir: string, contentHash: string): string | null {
+  try {
+    const read = planContentSnapshotIndex(projectId, dataDir).read(contentHash);
+    return read === null ? null : read.text;
+  } catch {
+    return null;
+  }
+}
+
+/** 单个任务在一个候选源下的验证判据（技术有效通过 + 独立审查）。供 Git 收尾/试用提升共用同一份口径。 */
+export interface TaskVerification {
+  task_id: string;
+  technical_verified: boolean;
+  independent_audit_passed: boolean;
+  reviewer_id: string | null;
+  reason: string | null;
+}
+
+/**
+ * 该任务在**指定候选源根**下的技术验证与独立审查判据（复用 canonical 挑选 + 有效性 + 独审义务）。
+ * 与 `gitFinalizeHost` 的收尾判据**同一份**，避免"两处各算一套绿"。调用方应传入按候选版本
+ * 重建过施工图的事实（见 `applyFrozenPlanSnapshot`）。
+ */
+export function verifyTaskOnCandidate(
+  facts: ProjectFacts,
+  args: { candidateRoot: string; workDir: string; taskId: string; independenceRequired: (label: string) => boolean },
+): TaskVerification {
+  const defs = requiredChecksFromDefinitions(facts.definitions)[args.taskId] ?? [];
+  const authorIds = authorIdsOfFacts(facts, args.taskId);
+  if (defs.length === 0) {
+    return { task_id: args.taskId, technical_verified: false, independent_audit_passed: false, reviewer_id: null, reason: `任务 ${args.taskId} 没有可核的必需检查定义（不据此判绿）` };
+  }
+  if (facts.findings.some((f) => f.object_id === args.taskId && findingBlocksObject(f))) {
+    return { task_id: args.taskId, technical_verified: false, independent_audit_passed: false, reviewer_id: null, reason: `任务 ${args.taskId} 有未收口的阻断缺陷` };
+  }
+  const checks = checksWithSourceManifests(facts.audit, { projectRoot: args.candidateRoot, workDir: args.workDir });
+  const picked = pickCheckRecords(checks, authorIds, facts.revisions, facts.binding_segments);
+  let technical = true;
+  let anyIndependent = false;
+  let independenceShortfall = false;
+  let reviewer: string | null = null;
+  for (const d of defs) {
+    const c = picked.get(d.check_id);
+    if (c === undefined) return { task_id: args.taskId, technical_verified: false, independent_audit_passed: false, reviewer_id: null, reason: `检查 ${d.check_id} 无有效记录` };
+    const eff = checkEffectiveness(c, facts.revisions, authorIds, facts.binding_segments);
+    if (eff.effective !== "passed") technical = false;
+    if (eff.effective_independence === "independent") {
+      anyIndependent = true;
+      if (reviewer === null && c.actor_id !== "") reviewer = c.actor_id;
+    } else if (args.independenceRequired(d.label)) {
+      // 独审义务项达成不了（作者自证/同会话）⇒ 独立审查不通过（义务判据由调用方传 canonical 的
+      // `obligations.independenceRequiredOf`，不在此复制第二份）
+      independenceShortfall = true;
+    }
+  }
+  const audit = technical && anyIndependent && !independenceShortfall;
+  return {
+    task_id: args.taskId,
+    technical_verified: technical,
+    independent_audit_passed: audit,
+    reviewer_id: reviewer,
+    reason: technical ? (audit ? null : `任务 ${args.taskId} 缺非作者独立结论（或独审义务项未由非作者达成）`) : `任务 ${args.taskId} 有必需检查未有效通过`,
+  };
+}
+
+function authorIdsOfFacts(facts: ProjectFacts, taskId: string): Set<string> {
+  const ids = new Set<string>();
+  const st = facts.task_states[taskId];
+  if (st !== undefined && typeof st.owner_id === "string" && st.owner_id !== "") ids.add(st.owner_id);
+  for (const sc of Object.values(facts.audit.self_checks)) {
+    if (sc.task_id === taskId && typeof sc.checked_by === "string" && sc.checked_by !== "") ids.add(sc.checked_by);
+  }
+  return ids;
+}
+
 /**
  * 施工图 → 集成检查要求（补修 C）。
  * 只做**读取与归组**，生效判据（有效基线）留给调用方——本函数拿不到基线上下文。
@@ -2260,9 +2395,23 @@ export function resultSubmissionSummaries(events: readonly WorkEvent[]): ResultS
  *
  * **绑定一致**：清单必须**定义**检查所声称的那个 code 修订（`check.binding.revision === manifest.fingerprint`）；
  * 对不上就**不拿这份清单给该检查背书**（按未知待复核）——不允许随便附一份无关清单把旧 check 通行。
- * 现读结论只在本函数**单次投影**内按清单指纹复用，不跨调用缓存（源一变即重算，不跨源保绿）。
+ * 现读结论在**本次派生作用域内**按清单指纹/证据作用域复用，**跨请求一律不缓存**（源一变下一个请求即重算）。
+ *
+ * **性能修复（同根因关联路径补修）**：本入口是**同步纯读**装配，内部对**每条证据**都要解析一次证据作用域
+ * （`evidenceManifestRootVerdict` → 宿主 `scopeRootOf` → 冻结候选现读复核 595 文件）；此前只有调用方自带
+ * `withDerivationScope` 时才去重，`submitChecks.dependencyRecheck → projectFromFacts → checksFromFacts`
+ * 这类**没有任何外层作用域**的关联链就会对同一冻结候选重复复核几百遍（实测 343 条证据 ≈ 148 s）。
+ * 这里把整段收进一层**可嵌套**的 `withDerivationScope`：有外层作用域时复用、无则自开一层，使同一候选在
+ * 本次装配内只现读复核一次。作用域 `finally` 一到整体丢弃（**无 TTL、不跨请求**），判据/返回字段一字不改。
  */
 export function checksWithSourceManifests(
+  records: AuditRecords,
+  ctx: { projectRoot: string; workDir: string },
+): CheckInput[] {
+  return withDerivationScope(() => checksWithSourceManifestsInScope(records, ctx));
+}
+
+function checksWithSourceManifestsInScope(
   records: AuditRecords,
   ctx: { projectRoot: string; workDir: string },
 ): CheckInput[] {
@@ -2282,6 +2431,28 @@ export function checksWithSourceManifests(
     }
     return carriers.get(sha) ?? null;
   };
+  // V09-37 性能返工：进循环前，把同一 root 下**整批**清单引用的路径并集**一次** `git check-ignore`（预热）。
+  // 否则 N 份不同清单各起一个 `git check-ignore` 子进程（现场实测 82 次/请求）。预热只影响"少起几次子进程"：
+  // 与逐清单探测同判据（`git check-ignore` 对每路径独立判定，并集可按子集切片复用）；预热漏/多探只影响
+  // 子进程次数，不改任何 verdict（循环里 `verifySourceManifest` 仍按各自清单判）。
+  const prewarmByRoot = new Map<string, Set<string>>();
+  for (const c of checks) {
+    if (c.binding.revision_kind !== "code" || c.evidence_sha256 === null) continue;
+    const carrier = load(c.evidence_sha256);
+    if (carrier === null || !carrier.intact) continue;
+    if (carrier.manifest.fingerprint !== c.binding.revision) continue;
+    const cb = carrier.binding;
+    if (cb === null || cb.revision.trim() === "" || cb.revision_kind !== c.binding.revision_kind) continue;
+    const scope = evidenceManifestRootVerdict(ctx.workDir, c.evidence_sha256, ctx.projectRoot);
+    if (scope.unavailable_reason !== null) continue;
+    let set = prewarmByRoot.get(scope.root);
+    if (set === undefined) {
+      set = new Set<string>();
+      prewarmByRoot.set(scope.root, set);
+    }
+    for (const f of carrier.manifest.files) set.add(f.path);
+  }
+  for (const [root, paths] of prewarmByRoot) prewarmGitIgnored(root, [...paths]);
   return checks.map((c) => {
     if (c.binding.revision_kind !== "code" || c.evidence_sha256 === null) return c;
     const carrier = load(c.evidence_sha256);
@@ -2332,11 +2503,20 @@ export function checksWithSourceManifests(
           "不拿来源对不上的清单给检查背书，按未知待复核",
       );
     }
+    // 复核根按证据**自身作用域**解析（V09-64）：候选目录回收后走可再生缓存；作用域来源当前不可用
+    // （未知/已回收/篡改）→ 按未知待复核，**不回落开发目录兜底**（不会据此给绿）。
+    const scope = evidenceManifestRootVerdict(ctx.workDir, c.evidence_sha256, ctx.projectRoot);
+    if (scope.unavailable_reason !== null) {
+      return unreadable(
+        manifest.files.length,
+        `检查「${c.check_id}」的源清单证据作用域来源当前不可用：${scope.unavailable_reason}（按未知待复核，不回落开发目录）`,
+      );
+    }
     // 同一份清单只现读复核一次（多个检查引用同一清单时复用结论；作用域 = 本次投影）
-    const key = manifest.fingerprint;
+    const key = `${manifest.fingerprint}\u0000${scope.root}`;
     let verdict = verdicts.get(key);
     if (verdict === undefined) {
-      verdict = verifySourceManifest(ctx.projectRoot, manifest);
+      verdict = verifySourceManifest(scope.root, manifest);
       verdicts.set(key, verdict);
     }
     return { ...c, source_manifest: verdict };
@@ -2350,9 +2530,10 @@ export function checksWithSourceManifests(
  * 不要直接 `checksFromAudit(facts.audit)`——后者会绕过「覆盖源一变即失效 / 无可核对来源即待复核」，
  * 给旧检查假绿。项目根由 `facts.work_dir` 推出，调用方不必再传。
  */
-export function checksFromFacts(facts: ProjectFacts): CheckInput[] {
+export function checksFromFacts(facts: ProjectFacts, opts: { project_root?: string } = {}): CheckInput[] {
   return checksWithSourceManifests(facts.audit, {
-    projectRoot: projectRootOfWorkDir(facts.work_dir),
+    // V09-64：来源根可注入——候选/试用工作区按其自身根现读复核证据；不传 = 现行行为逐字段不变。
+    projectRoot: opts.project_root ?? projectRootOfWorkDir(facts.work_dir),
     workDir: facts.work_dir,
   });
 }

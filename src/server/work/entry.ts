@@ -82,10 +82,13 @@ import {
 import { loadStageReads, STAGE_READS_REL, type StageReadKind, type StageReadsLoad } from "./stageReads";
 import { evaluateEntrySync, SYNC_INBOX_REL, type SyncBlockInfo } from "./sync";
 import { preconditionsOf, type EntryPreconditions } from "./preconditions";
+// V09-63（DESIGN §6.13/§6.14 第 7 段）：接续工作区上下文（仅 opt-in；与 manage_workspace 同一份事件投影）。
+import { foldWorkspaces } from "./workspaces";
+import { continuationFromProjection, readWorkspacesForProject, type WorkspaceContinuation } from "./workspaceGuard";
 import type { SyncRepairPlan, SyncVerdict } from "../../shared/syncEvidence";
 import { parseMarkdownSections, type MarkdownSectionNode } from "../../shared/materialSection";
 import { resolveDesignRefStrict, isDesignRefToken, STRICT_REF_REASON_TEXT } from "../../shared/designRefStrict";
-import { WorkError } from "./types";
+import { WorkError, type WorkEvent } from "./types";
 import { compareIsoTime, latestByTime } from "../time";
 import { withDerivationScope } from "./derivationScope";
 
@@ -188,6 +191,12 @@ export interface ProjectEntryOptions {
    * 它与 MCP 工具入口的 `expected_revision` 参数**真实相连**（不是只有纯函数支持、工具层没接）。
    */
   work_package_expected_revision?: string;
+  /**
+   * V09-63（DESIGN §6.13/§6.14 第 7 段）：请求附一份**接续工作区上下文**（`workspaces`）。默认 **false**＝不附，
+   * 保持 §6.7 只读返回**恰好九个字段**的既有默认契约；true = 附目标工作区、实际 cwd、可改范围、候选状态与
+   * 当前试用候选（与 `manage_workspace(op=read)` 同一份事件投影）。只读附加，不改 next_action/reasons/门禁。
+   */
+  workspaces?: boolean;
   /**
    * V09-31：**本次请求已经现读的事件快照**（`.工作台/work/` 同一 workDir、同一截点）。宿主只读入口一次
    * 取快照后，把它同时喂给入口、六图摘要与同步判据——三者出自**同一版事实**，不再各读一遍盘。
@@ -526,6 +535,12 @@ export interface ProjectEntry {
     omitted: ContextPackage["omitted"];
     stale_reasons: string[];
     coverage: ContextPackage["coverage"];
+    /**
+     * V09-63 续修（DESIGN §6.13/§6.14 第 7 段）：当前开发根/实际 cwd/可改范围/候选状态**默认可见**
+     * （不再只在 `opts.workspaces===true` 才有）。为保持 §6.7 九个**顶层**字段契约不变，把它嵌进
+     * `context_manifest` 这一既有顶层结构；坏指针时 `source="blocked"`、`root=null`（不静默回落 :main）。
+     */
+    workspace: WorkspaceContinuation;
   };
   current_change: {
     change_id: string | null;
@@ -552,6 +567,24 @@ export interface ProjectEntry {
    * `WorkPackageFailure` = 分页游标/入参显式失效（**不静默返回跨版本数据**，带重读入口）。
    */
   work_package?: WorkPackageFull | WorkPackageFailure;
+  /**
+   * V09-63（DESIGN §6.13/§6.14 第 7 段）：接续工作区上下文。**只在 `opts.workspaces===true` 时给出**
+   * （默认省略，保持 §6.7 九字段默认契约）。只读派生，与 `manage_workspace(op=read)` 同一份事件投影；
+   * 不改 `next_action`/`reasons`/门禁。旧项目无工作区记录时按 `:main` 派生口径（`source="main"`）。
+   */
+  workspaces?: EntryWorkspaces;
+}
+
+/** 入口的接续工作区上下文（§6.14 第 7 段：目标工作区/实际 cwd/可改范围/候选状态/当前试用候选） */
+export interface EntryWorkspaces {
+  /** 当前实际开发根（指针所指，缺省回退派生 `:main`） */
+  current_dev: WorkspaceContinuation;
+  /** 项目定位锚点（`ProjectRecord.path`；不被工作区指针改写） */
+  anchor_root: string;
+  /** 项目级指针（当前开发工作区/当前试用候选） */
+  pointer: { current_dev_workspace_id: string | null; current_trial_workspace_id: string | null; revision: number };
+  /** 已登记工作区（含派生 `:main`）的紧凑清单 */
+  workspaces: { workspace_id: string; kind: string; status: string; root: string; derived: boolean }[];
 }
 
 /** 同步证据的响应层摘要（判据来源＝sync 的同一份阻断评估，与 claimTask / 写口**同一份**） */
@@ -627,6 +660,8 @@ export interface EntryFacts {
    * true = `eventsSnapshotOf` 现读成功且沿任务/认领/执行/同步/投影共享；false = 快照读不出、下游各处回退现读。
    */
   eventsShared: boolean;
+  /** V09-63 续修：本次请求现读的**同一事件快照**（供工作区上下文零额外读账本折叠；读不出则 undefined） */
+  events?: readonly WorkEvent[];
   /** 快照读不出来的原因（`eventsShared=false` 时给；成功时 null） */
   eventsSnapshotUnreadable: string | null;
   /**
@@ -1027,6 +1062,7 @@ function gatherFacts(
     syncRepairPlan,
     syncBlockUnreadable,
     eventsShared,
+    events: sharedEvents,
     eventsSnapshotUnreadable,
     eventSeqOf,
     design,
@@ -2430,6 +2466,38 @@ function workPackageOf(input: {
   return result.ok ? result.work_package : result;
 }
 
+/** 坏/读不出时的 fail-closed 续接上下文：如实报未知，不静默当 :main（§6.14 第 2/10 段） */
+function blockedContinuation(reason: string): WorkspaceContinuation {
+  return {
+    workspace_id: "",
+    root: null,
+    source: "blocked",
+    writable: false,
+    status: "blocked",
+    trial: null,
+    trial_status: "none",
+    trial_reason: null,
+    blocked_reason: reason,
+    note: "工作区上下文未知：如实报 unknown，不静默回退 :main（§6.14 第 2/10 段）",
+  };
+}
+
+/**
+ * V09-63 续修：入口的工作区续接上下文——从**本次已读的同一事件快照**折叠（不额外读账本，§6.14 第 7 段），
+ * 账本快照读不出/折叠失败时 fail-closed（blocked），**不静默当 :main**、也不再读一次损坏账本抛错。
+ */
+function entryWorkspaceContinuation(facts: EntryFacts): WorkspaceContinuation {
+  if (facts.events === undefined) {
+    return blockedContinuation("事件账本快照读不出：工作区续接上下文未知（fail-closed，不静默当 :main）");
+  }
+  try {
+    const projection = foldWorkspaces(facts.events, { projectId: facts.projectId });
+    return continuationFromProjection(facts.projectId, path.resolve(facts.project.path), projection);
+  } catch (e) {
+    return blockedContinuation(`工作区事件折叠失败：${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 export function evaluateProjectEntry(input: ProjectEntryInput, opts: ProjectEntryOptions = {}): ProjectEntry {
   // 2026-10-07 运行时阻塞修复：整段跑在一次派生的只读复用作用域里——事实快照、
   // 图纸源读取解析、不可变修订对象读+核哈希、源清单复核、git 忽略探针在同一次派生内只算一次。
@@ -2484,7 +2552,9 @@ function evaluateProjectEntryInScope(input: ProjectEntryInput, opts: ProjectEntr
 
   const currentChange = currentChangeOf(facts);
   const runs = currentRunsOf(facts);
-  const manifest = contextManifestOf(facts.context);
+  // V09-63 续修：当前开发根/实际 cwd/可改范围/候选状态**默认可见**（不再藏在 opts.workspaces 之后）。
+  const workspaceCont = entryWorkspaceContinuation(facts);
+  const manifest = { ...contextManifestOf(facts.context), workspace: workspaceCont };
   // V09-34：本次动作指向的任务（取自已定 decision 的 reasons；只为前置说明定位，不重算判定）。
   const chosenTaskId =
     decision.reasons.map((r) => r.task_id).find((id): id is string => typeof id === "string" && id !== "") ?? null;
@@ -2612,10 +2682,33 @@ function evaluateProjectEntryInScope(input: ProjectEntryInput, opts: ProjectEntr
       : {}),
     // V09-53：逐 check 工作包（仅 opt-in；旧字段逐字保留，本字段是兼容扩展）。
     ...(workPackage === null ? {} : { work_package: workPackage }),
+    // V09-63（DESIGN §6.13/§6.14 第 7 段）：接续工作区上下文（仅 opt-in；旧九字段默认契约不变）。
+    ...(opts.workspaces === true ? { workspaces: entryWorkspacesOf(facts, workspaceCont) } : {}),
   };
 }
 
-function contextManifestOf(pkg: ContextPackage | null): ProjectEntry["context_manifest"] {
+/** 入口工作区上下文：与 `manage_workspace(op=read)` 同一份 `readWorkspacesForProject` 投影 */
+function entryWorkspacesOf(facts: EntryFacts, cont: WorkspaceContinuation): EntryWorkspaces {
+  const view = readWorkspacesForProject(facts.projectId, facts.dataDir);
+  return {
+    current_dev: cont,
+    anchor_root: view.anchor_root,
+    pointer: {
+      current_dev_workspace_id: view.pointer.current_dev_workspace_id,
+      current_trial_workspace_id: view.pointer.current_trial_workspace_id,
+      revision: view.pointer.revision,
+    },
+    workspaces: view.workspaces.map((w) => ({
+      workspace_id: w.workspace_id,
+      kind: w.kind,
+      status: w.status,
+      root: w.root,
+      derived: w.derived,
+    })),
+  };
+}
+
+function contextManifestOf(pkg: ContextPackage | null): Omit<ProjectEntry["context_manifest"], "workspace"> {
   if (pkg === null) {
     return {
       package_id: "",

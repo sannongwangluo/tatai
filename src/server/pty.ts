@@ -1,16 +1,19 @@
 import { spawn as spawnProcess } from "node:child_process";
+import fs from "node:fs";
 import os from "node:os";
 import { spawn, type IPty } from "node-pty";
 import { getProject } from "./registry";
 import { TerminalHistoryRecorder } from "./terminalHistory";
 import { WsError } from "./workstation";
+import { resolveCurrentDevRoot } from "./work/workspaces";
 
 // 终端 PTY 通道（T1，DESIGN.md §3.7 终端视图的后端半边，T2 xterm.js 接本通道）。
 // 选型：node-pty（MIT，LICENSE 原文已核对）真伪终端——Windows 下走 ConPTY，
 // 有真 resize、真交互语义；非 child_process 降级路。
 //
-// 工作目录红线（DoD③）：shell 启动 cwd 锁在【项目根】（注册表 registry.getProject 解析），
-// 绝不落到全局数据目录，也不接受调用方直接传路径（与 watcher.ts / workstation.ts 同一红线）。
+// 工作目录红线（DoD③）：shell 启动 cwd 锁在【当前开发工作区根】（V09-63 源根贯通；无工作区指针时
+// 即注册表 `ProjectRecord.path`），绝不落到全局数据目录，也不接受调用方直接传路径（与 watcher.ts /
+// workstation.ts 同一红线）。**有显式指针却坏/目录不在** → 拒绝启动，不静默回退项目根。
 // 用户进入 shell 后自行 cd 属于交互行为，不在本层限制。
 //
 // 生命周期（DoD④）：会话全在内存 Map 里；close 走 pty.kill() 并等待 onExit 拿到退出码，
@@ -111,6 +114,18 @@ export function createTerminalSession(
   if (!project) {
     throw new WsError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`);
   }
+  // V09-63 源根贯通：shell 的 cwd 是**当前开发工作区根**（§6.14 第 2/6 段）；坏指针/目录不在 → 不启动。
+  const dev = resolveCurrentDevRoot(projectId);
+  if (dev.root === null) {
+    throw new WsError(
+      "INVALID_INPUT",
+      `当前开发指针不可用（source=${dev.source}）：${dev.blocked_reason ?? "目标工作区不可用"}——拒绝启动终端，不静默回退项目根（DESIGN.md §6.14 第 2/10 段）`,
+    );
+  }
+  if (!fs.existsSync(dev.root) || !fs.statSync(dev.root).isDirectory()) {
+    throw new WsError("INVALID_INPUT", `当前开发工作区目录不在盘上：${dev.root}（工作区 ${dev.workspace_id}）——拒绝以它作 cwd 启动终端`);
+  }
+  const sessionCwd = dev.root;
   const active = listTerminalSessions(projectId).length;
   if (active >= MAX_SESSIONS_PER_PROJECT) {
     throw new WsError(
@@ -122,14 +137,14 @@ export function createTerminalSession(
     name: "tatai-terminal",
     cols,
     rows,
-    cwd: project.path,
+    cwd: sessionCwd,
   });
   const sid = `t${Date.now().toString(36)}-${nextSid++}`;
   const session: TerminalSession = {
     id: sid,
     projectId,
     pid: pty.pid,
-    cwd: project.path,
+    cwd: sessionCwd,
     cols,
     rows,
     exited: false,
@@ -137,8 +152,10 @@ export function createTerminalSession(
     pty,
     dataListeners: new Set(),
     exitListeners: new Set(),
-    // E3：历史记录器每会话一个（session id / 项目 id / cwd 建会话时定死，不由调用方传）
-    history: new TerminalHistoryRecorder(sid, projectId, project.path),
+    // E3：历史记录器每会话一个（session id / 项目 id / cwd 建会话时定死，不由调用方传）；
+    // cwd 是会话的**边界根**（用于跟踪 `cd` 是否仍在工作区内），落盘位置仍由 terminalHistory 的
+    // 中央记录域（`.工作台/logs/`）决定——本项不改变其 ledger 路径。
+    history: new TerminalHistoryRecorder(sid, projectId, sessionCwd),
   };
   sessions.set(session.id, session);
   pty.onData((data) => {

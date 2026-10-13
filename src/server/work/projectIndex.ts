@@ -27,6 +27,10 @@ import path from "node:path";
 import { getProject } from "../registry";
 import { withFileLock } from "../fileLock";
 import { resolveProjectRelative, sha256Hex } from "./documents";
+// V09-63 源根贯通：`docs/project-notes.json` 是**项目根内的真实源文件**，按"当前开发工作区"读写（§6.14 第 6 段）；
+// 写前过托管写守卫（拒冻结候选源码写）。中央账本/证据不受影响（仍落注册表锚点的 `.工作台/`）。
+import { resolveCurrentDevRoot } from "./workspaces";
+import { assertHostedWriteAllowed } from "./workspaceGuard";
 import {
   isForbiddenManifestPath,
   isSha256Hex,
@@ -382,7 +386,20 @@ interface NotesTarget {
 function resolveNotesTarget(projectId: string, dataDir?: string): NotesTarget {
   const project = getProject(projectId, dataDir);
   if (!project) throw new WorkError("INVALID_COMMAND", `项目不存在: ${projectId}`, { project_id: projectId });
-  const root = path.resolve(project.path);
+  // 说明文件是项目根内的**源文件**：根按"当前开发工作区"解析（§6.14 第 2/6 段）。
+  // 坏指针/目录不在 → 明确拒绝，不静默回退注册表锚点根（不用 ProjectRecord.path 顶替）。
+  const dev = resolveCurrentDevRoot(projectId, dataDir);
+  if (dev.root === null) {
+    throw new WorkError(
+      "INVALID_COMMAND",
+      `当前开发指针不可用（source=${dev.source}）：${dev.blocked_reason ?? "目标工作区不可用"}——拒绝读写说明文件，不静默回退项目根（DESIGN.md §6.14 第 2/10 段）`,
+      { project_id: projectId, workspace_id: dev.workspace_id },
+    );
+  }
+  const root = path.resolve(dev.root);
+  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
+    throw new WorkError("INVALID_COMMAND", `当前开发工作区目录不在盘上：${root}（工作区 ${dev.workspace_id}）——拒绝读写说明文件`, { project_id: projectId, root });
+  }
   const res = resolveProjectRelative(root, PROJECT_NOTES_REL);
   if (!res.ok) {
     throw new WorkError(
@@ -941,6 +958,7 @@ function serialize(doc: ProjectNotesDocument): Buffer {
 
 export function upsertProjectNotes(projectId: string, input: UpsertNotesInput, dataDir?: string): ProjectIndexWriteResult {
   const target = resolveNotesTarget(projectId, dataDir);
+  assertHostedWriteAllowed({ projectId, dataDir, workspaceId: null, targetRoot: target.root, kind: "source" });
   const expected = normalizeExpected(input.expected_file_sha256);
   if (!Array.isArray(input.entries) || input.entries.length === 0) {
     throw new WorkError("INVALID_COMMAND", "upsert 需要非空的 entries 数组（增量 upsert 只维护指定条目）", { field: "entries" });
@@ -1009,6 +1027,7 @@ export function upsertProjectNotes(projectId: string, input: UpsertNotesInput, d
 
 export function removeProjectNotes(projectId: string, input: RemoveNotesInput, dataDir?: string): ProjectIndexWriteResult {
   const target = resolveNotesTarget(projectId, dataDir);
+  assertHostedWriteAllowed({ projectId, dataDir, workspaceId: null, targetRoot: target.root, kind: "source" });
   const expected = normalizeExpected(input.expected_file_sha256);
   if (!Array.isArray(input.ids) || input.ids.length === 0) {
     throw new WorkError("INVALID_COMMAND", "remove 需要非空的 ids 数组（删除说明是显式动作，不猜）", { field: "ids" });

@@ -730,7 +730,7 @@ def run_checks(page, base, backend, fx, tmp):
     ok(attr(page, it, "data-verification") != "verified", "B：验证未通过（绿只取 verification）")
     ok(attr(page, it, "data-user-acceptance") == "pending", "B：用户接受=pending（与设计审定分开）")
     bt = txt(page, it) or ""
-    ok("无运行记录" in bt, "B：缺运行说「无运行记录」（人话）")
+    ok("暂无执行记录" in bt, "B：缺执行登记如实说明，不推成未实现")
     ok("未实现" not in bt, "B：**不写**「未实现」")
     ok("缺设计" not in bt, "B：有设计 → 不误报缺设计")
     # 四维每维都有文字标签（无颜色也能辨）

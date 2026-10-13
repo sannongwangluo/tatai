@@ -22,6 +22,7 @@ import {
   activeBaseline,
   buildSectionIndex,
   loadDocuments,
+  planContentSnapshotIndex,
   projectWorkbenchDir,
   readBaselineLog,
   readRevisionSnapshotText,
@@ -61,6 +62,8 @@ import {
 import { readIntentFile } from "./intent";
 import { evidenceBlobPath } from "./evidence";
 import { projectRootOfWorkDir } from "./sourceEvidence";
+import { readWorkspacesForProject, resolveFrozenCandidateSource } from "./workspaces";
+import type { WorkspaceRecord } from "../../shared/workspaceTypes";
 import { withDerivationScope } from "./derivationScope";
 import {
   buildDeliveryOverview,
@@ -76,6 +79,7 @@ import type {
   FeatureLedger,
   FeatureItem,
   FeatureLedgerDocumentSelection,
+  FeatureLedgerWorkspace,
   LedgerCoverage,
   LedgerPaging,
   PendingDecision,
@@ -100,6 +104,11 @@ export interface FeatureLedgerParams {
   cursor?: string;
   /** 1..200；缺省 50 */
   limit?: number;
+  /**
+   * V09-64（§6.14 第 8 段）：选读哪个工作区版本。"dev"＝当前开发工作区；"trial"＝当前试用候选；
+   * <workspace_id>＝该工作区；缺省＝已登记的当前试用候选（无指针才按旧行为读 :main）。未知值 → 400。
+   */
+  workspace?: string;
 }
 
 export type FeatureLedgerErrorCode =
@@ -134,7 +143,7 @@ const fail = (
 
 /** 参数**全契约严格验证**：未知键/类型错/越界一律 400 INVALID_INPUT（不静默忽略） */
 export function parseFeatureLedgerParams(raw: Record<string, unknown>): FeatureLedgerParams | FeatureLedgerError {
-  const allowed = ["scope", "document", "artifact_ref", "expected_revision", "cursor", "limit"];
+  const allowed = ["scope", "document", "artifact_ref", "expected_revision", "cursor", "limit", "workspace"];
   const extra = Object.keys(raw).filter((k) => !allowed.includes(k));
   if (extra.length > 0) {
     return fail("INVALID_INPUT", 400, `未知参数：${extra.join("、")}（只收 ${allowed.join("/")}）`, { extra });
@@ -148,7 +157,7 @@ export function parseFeatureLedgerParams(raw: Record<string, unknown>): FeatureL
     return v.trim();
   };
   const out: FeatureLedgerParams = {};
-  for (const k of ["scope", "document", "artifact_ref", "expected_revision", "cursor"] as const) {
+  for (const k of ["scope", "document", "artifact_ref", "expected_revision", "cursor", "workspace"] as const) {
     const v = str(k);
     if (v !== undefined && typeof v !== "string") return v;
     if (typeof v === "string") out[k] = v;
@@ -168,7 +177,7 @@ export function parseFeatureLedgerParams(raw: Record<string, unknown>): FeatureL
 
 const sha256 = (s: string): string => createHash("sha256").update(s, "utf8").digest("hex");
 // 同一事实在不同派生契约下不能跨版本续页；不绑定无关宿主源码。
-const FEATURE_LEDGER_DERIVATION_VERSION = "feature-ledger/2";
+const FEATURE_LEDGER_DERIVATION_VERSION = "feature-ledger/3";
 
 /**
  * **递归**稳定序列化：对象键排序、数组保序（但元素里的对象也排序）。
@@ -263,6 +272,158 @@ export type ProjectExistsFn = (projectId: string) => boolean;
  * 「各读各的」逐字段相同；作用域 `finally` 一到即整体丢弃，**跨请求一律不缓存**，源一变下一个请求立刻看见。
  * 证据：E/runtime-load-fix/REPORT.md（同数据 before/after），机制与 `collectProjectFacts`/`entry` 同族。
  */
+interface LedgerWorkspaceResolution {
+  ws: FeatureLedgerWorkspace;
+  root: string | null;
+  failure: { message: string; detail: Record<string, unknown> } | null;
+  /** 冻结候选绑定的 DESIGN/PLAN 内容哈希（§6.14 第 3 段）：非 null ⇒ 文档选择走**冻结快照**，不读当前目录 */
+  frozen: FrozenDocsBinding | null;
+}
+
+/** 冻结候选的文档版本绑定（只取读侧文档选择要用的三项；ledger 游标等不参与文档选择） */
+interface FrozenDocsBinding {
+  design_sha256: string | null;
+  plan_sha256: string | null;
+  baseline_id: string | null;
+}
+
+function frozenBindingOf(rec: WorkspaceRecord): FrozenDocsBinding | null {
+  if (rec.status !== "frozen" || rec.freeze === null) return null;
+  const vb = rec.freeze.version_binding;
+  return { design_sha256: vb.design_sha256, plan_sha256: vb.plan_sha256, baseline_id: vb.baseline_id };
+}
+
+const legacyWs = (requested: string | null, reason: string | null): FeatureLedgerWorkspace => ({
+  requested,
+  workspace_id: null,
+  kind: null,
+  root: null,
+  source_commit: null,
+  content_fingerprint: null,
+  status: null,
+  resolved: false,
+  reason,
+});
+
+const wsOf = (rec: WorkspaceRecord, requested: string): FeatureLedgerWorkspace => ({
+  requested,
+  workspace_id: rec.workspace_id,
+  kind: rec.kind,
+  root: rec.root,
+  source_commit: rec.source_commit,
+  content_fingerprint: rec.freeze?.content_fingerprint ?? rec.content_fingerprint ?? null,
+  status: rec.status,
+  resolved: true,
+  reason: null,
+});
+
+/**
+ * 解析一个已登记工作区的**实际可读根**（V09-64 集成；§6.14 第 3/5 段）：
+ *   · 冻结候选：读统一紧凑引用的完整索引/恢复材料 → `resolveCandidateSource`；present/recovered 用核过的
+ *     真实根（目录回收走可再生缓存）；**tampered/unknown 如实降级为失败**（不回落开发目录、不参考另一版）。
+ *   · 旧格式冻结（无统一引用）/ 非冻结（dev 等）：用记录根（逐字段兼容）。
+ */
+function ownedResolution(
+  workDir: string,
+  rec: WorkspaceRecord,
+  requested: string | null,
+): { root: string | null; ws: FeatureLedgerWorkspace; failure: LedgerWorkspaceResolution["failure"]; frozen: FrozenDocsBinding | null } {
+  const frozen = frozenBindingOf(rec);
+  if (rec.freeze === null) {
+    return { root: rec.root, ws: wsOf(rec, requested ?? rec.workspace_id), failure: null, frozen: null };
+  }
+  const read = resolveFrozenCandidateSource(workDir, rec);
+  if (read.ref === null) {
+    // 新格式冻结的引用**损坏**：不得按旧口径回落 rec.root（那会把损坏当 legacy 成功）
+    if (read.corrupt) {
+      const reason = read.blocked_reason ?? "冻结候选引用损坏";
+      return {
+        root: null,
+        ws: { ...wsOf(rec, requested ?? rec.workspace_id), resolved: false, reason },
+        failure: {
+          message: `工作区 ${rec.workspace_id} 的候选引用损坏：${reason}（如实标失效，不按旧口径回落工作区根、不借另一版）`,
+          detail: { workspace: rec.workspace_id, corrupt: true, candidate_index_revision: rec.freeze.candidate_index_revision },
+        },
+        frozen,
+      };
+    }
+    return { root: rec.root, ws: wsOf(rec, requested ?? rec.workspace_id), failure: null, frozen };
+  }
+  const res = read.resolution;
+  if (res !== null && (res.status === "present" || res.status === "recovered") && res.root !== null) {
+    return { root: res.root, ws: wsOf(rec, requested ?? rec.workspace_id), failure: null, frozen };
+  }
+  const reason = read.blocked_reason ?? `候选来源不可用（status=${res?.status ?? "unknown"}）`;
+  return {
+    root: null,
+    ws: { ...wsOf(rec, requested ?? rec.workspace_id), resolved: false, reason },
+    failure: {
+      message: `工作区 ${rec.workspace_id} 的候选来源当前不可用：${reason}（如实降级为未知/失效，不回落开发目录、不借另一版）`,
+      detail: { workspace: rec.workspace_id, status: res?.status ?? "unknown", candidate_index_revision: rec.freeze.candidate_index_revision },
+    },
+    frozen,
+  };
+}
+
+/**
+ * V09-64（§6.14 第 8 段）：解析本次读口实际读哪个工作区版本。
+ * 缺省＝已登记的**当前试用候选**（无该指针才保持旧行为读 :main/active）；"dev"＝当前开发工作区；
+ * 未知值/已回收/坏指针/候选来源不可用 → 400（稳定失败，不静默回落主目录、不造绿）。
+ */
+function resolveLedgerWorkspace(
+  projectId: string,
+  dataDir: string,
+  requested: string | undefined,
+): LedgerWorkspaceResolution {
+  const workDir = projectWorkDir(projectId, dataDir);
+  let view: ReturnType<typeof readWorkspacesForProject>;
+  try {
+    view = readWorkspacesForProject(projectId, dataDir);
+  } catch (e) {
+    // 坏账本 = 未知：不拿"读不到"当"无指针"，也不回落 :main 造绿（fail-closed）
+    const reason = "工作区记录读取失败（" + (e as Error).message + "）";
+    return { ws: legacyWs(requested ?? null, reason), root: null, failure: { message: (requested === undefined ? "缺省（试用）读口" : "workspace=" + requested) + " 无法解析：" + reason, detail: { workspace: requested ?? null } }, frozen: null };
+  }
+  const byId = (id: string): WorkspaceRecord | undefined => view.workspaces.find((w) => w.workspace_id === id);
+  if (requested === undefined) {
+    const trialId = view.pointer.current_trial_workspace_id;
+    if (trialId === null) return { ws: legacyWs(null, null), root: null, failure: null, frozen: null };
+    const rec = byId(trialId);
+    if (rec === undefined) {
+      // 显式试用指针却无记录 = 坏指针：如实失败，绝不落到 legacy derivation 读原根显示旧绿
+      return { ws: legacyWs(null, "当前试用候选 " + trialId + " 不在工作区记录里（坏指针，不造绿、不回 :main）"), root: null, failure: { message: "当前试用候选 " + trialId + " 不在工作区记录里（坏指针）", detail: { workspace: trialId } }, frozen: null };
+    }
+    return ownedResolution(workDir, rec, trialId);
+  }
+  if (requested === "dev") {
+    const cur = view.current_dev;
+    const rec = byId(cur.workspace_id);
+    if (cur.source === "blocked" || (rec === undefined && cur.root === null)) {
+      return { ws: { ...legacyWs(requested, cur.blocked_reason ?? null), workspace_id: cur.workspace_id, kind: "dev", root: null, resolved: false }, root: null, failure: { message: `当前开发指针坏：${cur.blocked_reason ?? "目标不可用"}（如实报未知，不回落 :main）`, detail: { workspace: cur.workspace_id } }, frozen: null };
+    }
+    return rec === undefined
+      ? { ws: { ...legacyWs(requested, null), workspace_id: cur.workspace_id, kind: "dev", root: cur.root, resolved: true }, root: cur.root, failure: null, frozen: null }
+      : ownedResolution(workDir, rec, requested);
+  }
+  if (requested === "trial") {
+    const trialId = view.pointer.current_trial_workspace_id;
+    if (trialId === null) {
+      return { ws: legacyWs(requested, null), root: null, failure: { message: "workspace=trial 但没有已登记的固定试用版（当前试用候选指针为空）", detail: { workspace: requested } }, frozen: null };
+    }
+    const rec = byId(trialId);
+    if (rec === undefined) return { ws: legacyWs(requested, null), root: null, failure: { message: "当前试用候选 " + trialId + " 不在工作区记录里", detail: { workspace: requested } }, frozen: null };
+    return ownedResolution(workDir, rec, requested);
+  }
+  const rec = byId(requested);
+  if (rec === undefined) {
+    return { ws: legacyWs(requested, null), root: null, failure: { message: "未知工作区 " + requested + "（不属本项目）", detail: { workspace: requested } }, frozen: null };
+  }
+  // 已回收（retired）**不等于版本失效**：能从来源提交/中央快照按同版还原的候选仍可**显式**读取
+  // （§6.14 第 5/10 段：能从提交/既有保管处还原的候选不判失效）；取不回时由 ownedResolution 如实失败。
+  // 注意：这是**显式**读某工作区；默认试用指针指向已回收版本仍如实 blocked（见 resolveCurrentTrialState）。
+  return ownedResolution(workDir, rec, requested);
+}
+
 export function readFeatureLedger(
   projectId: string,
   dataDir: string,
@@ -295,6 +456,13 @@ function readFeatureLedgerInScope(
   const revalidated = parseFeatureLedgerParams(params as unknown as Record<string, unknown>);
   if ("ok" in revalidated) return revalidated;
   params = revalidated;
+
+  // ── 工作区版本解析（V09-64；§6.14 第 8 段）：默认读当前试用候选，开发视图读当前开发工作区 ──
+  const workspaceResolution = resolveLedgerWorkspace(projectId, dataDir, params.workspace);
+  if (workspaceResolution.failure !== null) {
+    return fail("INVALID_INPUT", 400, workspaceResolution.failure.message, workspaceResolution.failure.detail);
+  }
+  const wsRoot = workspaceResolution.root;
 
   const want = params.document ?? "active";
   const scope_id = params.scope === undefined || params.scope === "current" ? null : params.scope;
@@ -344,6 +512,7 @@ function readFeatureLedgerInScope(
     active,
     docs,
     unexamined,
+    frozen: workspaceResolution.frozen,
   });
   if (selection.kind === "not_derived") {
     return {
@@ -351,7 +520,7 @@ function readFeatureLedgerInScope(
       status: 200,
       ledger: notDerivedLedger(
         { reason: selection.reason, next_read: selection.next_read },
-        { scope_id, artifact_ref: params.artifact_ref ?? null, selection: selection.selection },
+        { scope_id, workspace: workspaceResolution.ws, artifact_ref: params.artifact_ref ?? null, selection: selection.selection },
       ),
     };
   }
@@ -379,7 +548,7 @@ function readFeatureLedgerInScope(
               "拿不到它当时的事件边界，不能把当前结果借给它（§2.9）",
             next_read: "改用 document=active／current 读取有完整配套材料的版本",
           },
-          { scope_id, artifact_ref: params.artifact_ref ?? null, selection: sel.selection },
+          { scope_id, workspace: workspaceResolution.ws, artifact_ref: params.artifact_ref ?? null, selection: sel.selection },
         ),
       };
     }
@@ -453,13 +622,13 @@ function readFeatureLedgerInScope(
               "改用能唯一定位的产物引用（检查记录里 evidence_sha256 命中的证据哈希），" +
               "或先在证据/提交里记录该产物绑定的是哪一版来源",
           },
-          { scope_id, artifact_ref: params.artifact_ref, selection: sel.selection, artifact: artifactSelection },
+          { scope_id, workspace: workspaceResolution.ws, artifact_ref: params.artifact_ref, selection: sel.selection, artifact: artifactSelection },
         ),
       };
     }
     // 只采信**绑定到该产物那一版**的检查记录：两个不同绑定的产物不会互相借结论；
     // 当前源码后来改变也不回改这个产物在**当时**的验证结论（binding 是记录时的声明，不是现值）。
-    artifactChecks = checksFromFacts(factsForScope).filter(
+    artifactChecks = checksFromFacts(factsForScope, wsRoot === null ? {} : { project_root: wsRoot }).filter(
       (c) => c.binding.revision === artifactSelection!.bound_revision,
     );
   }
@@ -495,7 +664,7 @@ function readFeatureLedgerInScope(
     facts: factsForScope,
     // 原始事件同一快照：**唯一义务层**据此自己从不可变施工图快照推导 check 身份映射与逐条定义绑定
     events: scopedEvents,
-    ...(artifactChecks === null ? {} : { checks: artifactChecks }),
+    checks: artifactChecks ?? checksFromFacts(factsForScope, wsRoot === null ? {} : { project_root: wsRoot }),
     features,
     plan_mapping_approved: planMappingApproved,
     plan_mapping_revision: planMappingRevision,
@@ -523,11 +692,20 @@ function readFeatureLedgerInScope(
   const featureAcceptance: Record<string, { state: import("../../shared/coverageTypes").AcceptanceDimension; gate_refs: string[]; accepted_tasks: string[]; unmet: string | null }> = {};
   const featureHasRun: Record<string, boolean> = {};
   const featureRunBasis: Record<string, string | null> = {};
+  const featureResultRegistration: Record<string, NonNullable<import("../../shared/coverageTypes").ImplementationReadout["result_registration"]>> = {};
   for (const [fid, read] of Object.entries(obligations.features)) {
     featureStatus[fid] = { projection: read.projection, input_gaps: read.input_gaps };
     featureAcceptance[fid] = read.acceptance;
     const f = features.find((x) => x.feature_id === fid);
     const members = (f?.task_ids ?? []).filter((t) => task_has_run.has(t));
+    const taskIds = [...new Set(f?.task_ids ?? [])];
+    const submitted = taskIds.filter((t) => factsForScope.task_states[t]?.status === "result_submitted");
+    const pending = taskIds.filter((t) => factsForScope.task_states[t]?.status !== "result_submitted");
+    featureResultRegistration[fid] = {
+      state: submitted.length === 0 ? "none" : pending.length === 0 ? "complete" : "partial",
+      submitted_task_ids: submitted,
+      pending_task_ids: pending,
+    };
     featureHasRun[fid] = members.length > 0;
     featureRunBasis[fid] =
       members.length === 0
@@ -541,7 +719,7 @@ function readFeatureLedgerInScope(
   }
 
   // ── ⑤ 章节索引的可读回调（核 review.ref 指的文件是否真实存在） + 证据存在性 ──
-  const projectRoot = projectRootOfWorkDir(projectWorkDir(projectId, dataDir));
+  const projectRoot = wsRoot ?? projectRootOfWorkDir(projectWorkDir(projectId, dataDir));
   const sectionsOfFile = (rel: string): DocumentSection[] | null => {
     const resolved = resolveProjectRelative(projectRoot, rel);
     if (!resolved.ok) return null;
@@ -623,6 +801,7 @@ function readFeatureLedgerInScope(
     feature_acceptance: featureAcceptance,
     feature_has_run: featureHasRun,
     feature_run_basis: featureRunBasis,
+    feature_result_registration: featureResultRegistration,
     task_fingerprints: taskFingerprints,
     sections,
     design_rel_path: sel.design_rel_path,
@@ -673,7 +852,7 @@ function readFeatureLedgerInScope(
           reason: "DESIGN 没有功能清单声明区，且需求投影为空：没有可派生的功能定义（不等于空项目）",
           next_read: "先在 DESIGN 正文补功能清单声明区（§2.5.1），或经 manage_requirement 登记需求",
         },
-        { scope_id, artifact_ref: params.artifact_ref ?? null, selection: sel.selection },
+        { scope_id, workspace: workspaceResolution.ws, artifact_ref: params.artifact_ref ?? null, selection: sel.selection },
       ),
     };
   }
@@ -831,6 +1010,9 @@ function readFeatureLedgerInScope(
       baseline_id: sel.selection.baseline_id,
       ledger_last_seq: factsForScope.last_seq,
       drift: sel.selection.drift,
+      workspace_id: workspaceResolution.ws.workspace_id,
+      workspace_root: workspaceResolution.ws.root,
+      content_fingerprint: workspaceResolution.ws.content_fingerprint,
     },
   });
 
@@ -854,6 +1036,7 @@ function readFeatureLedgerInScope(
     package_revision,
     package_revision_basis: packageRevisionBasis,
     document_selection: sel.selection,
+    workspace: workspaceResolution.ws,
     artifact_ref: params.artifact_ref ?? null,
     artifact_selection: artifactSelection,
     generated_at: new Date().toISOString(),
@@ -902,8 +1085,10 @@ function selectDocuments(args: {
   active: ProjectBaseline | null;
   docs: ReturnType<typeof loadDocuments>;
   unexamined: UnexaminedSource[];
+  /** 冻结候选绑定的 DESIGN/PLAN 内容哈希（§6.14 第 3 段）；非 null ⇒ 读**冻结快照**，不读当前目录 */
+  frozen: FrozenDocsBinding | null;
 }): SelectResult {
-  const { projectId, dataDir, want, active, docs, unexamined } = args;
+  const { projectId, dataDir, want, active, docs, unexamined, frozen } = args;
   const curDesign = docs.design?.text ?? null;
   const curPlan = docs.plan?.text ?? null;
   const curDesignRev = docs.design?.revision.content_sha256 ?? null;
@@ -920,6 +1105,84 @@ function selectDocuments(args: {
     baseline_id: active?.baseline_id ?? null,
     drift: null,
   };
+
+  // 冻结候选（§6.14 第 3 段）：交付读数与检查判据一律用它**冻结的** DESIGN/PLAN 快照，
+  // **不读当前开发目录的最新文档**；文档选择固定在候选版本上（`want` 不再改变来源）。
+  if (frozen !== null) {
+    const designHash = frozen.design_sha256;
+    const planHash = frozen.plan_sha256;
+    const frozenSelection: FeatureLedgerDocumentSelection = {
+      ...baseSelection,
+      mode: "frozen_candidate",
+      baseline_id: frozen.baseline_id ?? baseSelection.baseline_id,
+      // `drift` 的既有语义是「**现行源相对所选版本已漂移** ⇒ 该版本不可采信」（§3.16／§6.14）。
+      // 冻结候选读的**就是它自己绑定的快照**，与"现行稿≠所选版本"无关：这里不能占 drift，否则交付读数
+      // 一进门就被判不可信（合格冻结候选永远 unknown）。读的版本来源由 `mode=frozen_candidate` 表达。
+      drift: null,
+    };
+    if (designHash === null) {
+      return {
+        kind: "not_derived",
+        reason: "冻结候选没有绑定 DESIGN 内容哈希（version_binding.design_sha256 缺）：无法按候选版本读设计，不套当前文档",
+        next_read: "重新冻结该候选并绑定 DESIGN/PLAN 内容哈希（§6.14 第 3 段）后重读",
+        selection: frozenSelection,
+      };
+    }
+    const designSnapshot = readRevisionSnapshotText(projectId, "design", designHash, dataDir);
+    if (designSnapshot === null || sha256Hex(designSnapshot) !== designHash) {
+      return {
+        kind: "not_derived",
+        reason: `冻结候选绑定的设计快照（${short(designHash)}）读不到或与冻结声明的内容哈希不一致：该候选版本无法重建（§6.14 第 3 段）`,
+        next_read: "从既有不可变修订库恢复该候选绑定的 DESIGN 快照（design-revisions）后重读；或重新冻结并绑定",
+        selection: { ...frozenSelection, design_revision: designHash },
+      };
+    }
+    // 施工图不可变对象的**主名是定义哈希**（`documents.ts` `keyHashOf`；§2.6），内容哈希只是"同一定义
+    // 下的另一份正文"的候选名。按内容哈希直读只有在"这份正文恰是该定义下的首份"时才对得上，非 Git／
+    // CRLF 环境下会读不回 ⇒ 卡定义/映射/交付核对声明全 null。这里复用**同一份权威解析器**
+    // `planContentSnapshotIndex`（与 `statusProjection.applyFrozenPlanSnapshot` / `obligations.planSnapshotReader`
+    // 同源）：内容哈希 → 对象候选名 + 逐候选核内容哈希，读不回仍返回 null（**保持 fail-closed**，不套当前施工图）。
+    const planTextRaw = planHash !== null ? (planContentSnapshotIndex(projectId, dataDir).read(planHash)?.text ?? null) : null;
+    const planOk = planTextRaw !== null && planHash !== null && sha256Hex(planTextRaw) === planHash;
+    if (!planOk) {
+      unexamined.push({
+        ref: planHash === null ? "plan-revisions（冻结候选未绑定 PLAN 哈希）" : `plan-revisions/${short(planHash)}`,
+        kind: "plan",
+        reason: "冻结候选绑定的施工图快照读不到或与冻结声明不一致：功能映射与卡定义拿不到（不套当前施工图）",
+      });
+    }
+    // 该候选绑定的 PLAN 定义哈希：从基线流水补齐（拿不到 = null，如实标注）
+    const frozenBaseline =
+      frozen.baseline_id === null
+        ? null
+        : (readBaselineLog(projectId, dataDir).baselines.find((b) => b.baseline_id === frozen.baseline_id) ?? null);
+    const planDefinition =
+      planOk && frozenBaseline !== null && frozenBaseline.plan_revision.content_sha256 === planHash
+        ? frozenBaseline.plan_revision.definition_sha256
+        : null;
+    return {
+      kind: "ok",
+      sel: {
+        designText: designSnapshot,
+        planText: planOk ? planTextRaw : null,
+        designRev: designHash,
+        planRev: planOk ? planHash : null,
+        planDefinition,
+        design_rel_path: designRel,
+        plan_from_snapshot: true,
+        design_baseline_approved: true,
+        design_baseline_note: null,
+        plan_mapping_approved: planOk,
+        plan_mapping_revision: planOk ? planHash : null,
+        selection: {
+          ...frozenSelection,
+          design_revision: designHash,
+          plan_revision: planOk ? planHash : null,
+          plan_definition: planDefinition,
+        },
+      },
+    };
+  }
 
   if (want === "current") {
     if (curDesign === null) {
@@ -1430,6 +1693,7 @@ function notDerivedLedger(
     artifact_ref: string | null;
     selection: FeatureLedgerDocumentSelection;
     artifact?: ArtifactBinding | null;
+    workspace?: FeatureLedgerWorkspace;
   },
 ): FeatureLedger {
   return {
@@ -1439,6 +1703,7 @@ function notDerivedLedger(
     package_revision: "",
     package_revision_basis: [],
     document_selection: opts.selection,
+    workspace: opts.workspace,
     artifact_ref: opts.artifact_ref,
     artifact_selection: opts.artifact ?? null,
     generated_at: new Date().toISOString(),
@@ -1484,6 +1749,9 @@ function notDerivedLedger(
         baseline_id: opts.selection.baseline_id,
         ledger_last_seq: 0,
         drift: opts.selection.drift,
+        workspace_id: opts.workspace?.workspace_id ?? null,
+        workspace_root: opts.workspace?.root ?? null,
+        content_fingerprint: opts.workspace?.content_fingerprint ?? null,
       },
       user_acceptance: { pending: 0, accepted: 0, rejected: 0, accepted_known_limit: 0 },
     },

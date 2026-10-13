@@ -76,6 +76,69 @@ function abortError(): Error {
   return e;
 }
 
+// ── V09-70：只读请求观测旁路（**仅观察**，不改共享语义）────────────────────────────
+// 运行诊断的「客户端观测」需要一个**只读旁路**：让界面知道"这页最近有没有读到、读得慢不慢"，
+// 而不是把服务端遥测当成唯一事实（DESIGN §3.18「前端自身网络失败只作客户端观测」）。观测点放在
+// **唯一裸 fetch 出口**（经本模块发起的**真实网络**）上——注意是**每个真实网络结算一次**，不是每个
+// 订阅者一次（在途合并下 N 个订阅者仍只观测到 1 笔网络）。发出去的是一条**脱敏**事件：
+// **不含** URL、query、token、请求/响应正文、堆栈；仅保留时间、成败、状态码、耗时与一个**分类布尔**
+// （是否运行诊断读口本身，供上层避免诊断请求自我递归）。**默认无人注册 ⇒ 行为逐字不变**。
+export interface SharedReadEvent {
+  /** 观测时刻（epoch ms） */
+  at: number;
+  /** 是否成功（HTTP 2xx/3xx；网络层失败为 false） */
+  ok: boolean;
+  /** HTTP 状态码；网络层失败为 null */
+  status: number | null;
+  duration_ms: number;
+  /** 被订阅者/换代/卸载取消（取消**不算失败**） */
+  aborted: boolean;
+  /** 只作分类：这条读是否就是运行诊断读口本身（不含原始 URL） */
+  diagnostics: boolean;
+}
+
+type SharedReadObserver = (event: SharedReadEvent) => void;
+let readObserver: SharedReadObserver | null = null;
+
+/** 注册只读观测旁路（null 清除）。**不注册时行为逐字不变**。旁路自身抛错被吞掉，绝不影响真实请求。 */
+export function setSharedReadObserver(observer: SharedReadObserver | null): void {
+  readObserver = observer;
+}
+
+/** 只读分类：这条读是否运行诊断读口（只返回布尔，**不保留/不外发 URL**）。 */
+function isDiagnosticsRead(url: string): boolean {
+  const q = url.indexOf("?");
+  const path = q === -1 ? url : url.slice(0, q);
+  return path.endsWith("/api/runtime/diagnostics") || path.endsWith("/api/work/diagnostics");
+}
+
+function emitReadEvent(event: SharedReadEvent): void {
+  const observer = readObserver;
+  if (observer === null) return;
+  try {
+    observer(event);
+  } catch {
+    /* 观测旁路自身异常绝不影响真实请求 */
+  }
+}
+
+function readEventOf(response: Response, startedAt: number, diagnostics: boolean): SharedReadEvent {
+  const status = response.status;
+  return {
+    at: Date.now(),
+    ok: status >= 200 && status < 400,
+    status,
+    duration_ms: Date.now() - startedAt,
+    aborted: false,
+    diagnostics,
+  };
+}
+
+function readErrorEventOf(error: unknown, startedAt: number, diagnostics: boolean): SharedReadEvent {
+  const aborted = error instanceof Error && error.name === "AbortError";
+  return { at: Date.now(), ok: false, status: null, duration_ms: Date.now() - startedAt, aborted, diagnostics };
+}
+
 /**
  * 头规范化：头名大小写及不同头的顺序无关；同名多值保留平台 Headers 的追加顺序。
  * 返回二维数组（交给 JSON 序列化），不能按值排序而把 a,b 与 b,a 合并。
@@ -299,6 +362,8 @@ export function sharedReadFetch(url: string, init: RequestInit | undefined, raw:
   const slot: Slot = { key, gen: readGeneration, controller, subscribers: new Set() };
   inflight.set(key, slot); // 先登记槽，再发起：并发调用才能命中同一笔网络
   let promise: Promise<Response>;
+  const observationStartedAt = Date.now(); // V09-70：每笔**真实网络**观测一次耗时（不是每订阅者）
+  const observationDiagnostics = isDiagnosticsRead(url);
   try {
     promise = raw(url, { ...rest, method, signal: controller.signal });
   } catch (e) {
@@ -307,8 +372,14 @@ export function sharedReadFetch(url: string, init: RequestInit | undefined, raw:
     return Promise.reject(e);
   }
   promise.then(
-    (response) => settle(slot, { response }),
-    (error) => settle(slot, { error }),
+    (response) => {
+      emitReadEvent(readEventOf(response, observationStartedAt, observationDiagnostics));
+      settle(slot, { response });
+    },
+    (error) => {
+      emitReadEvent(readErrorEventOf(error, observationStartedAt, observationDiagnostics));
+      settle(slot, { error });
+    },
   );
   return subscribe(slot, init?.signal);
 }

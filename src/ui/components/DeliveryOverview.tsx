@@ -26,7 +26,7 @@
 //   · 卡片用**审定短名 + 一句用途**（精确原文别名表在同目录 `deliveryOverviewDisplay.ts`），
 //     表里没有的原文**原样完整显示**，右栏始终保留**原名与原场景**——只动呈现，不动 ID/计数/通过状态；
 //   · 读数落字按同源判据分开写：提交且技术验证**当前有效**才叫「已实现」，只是提交过叫「已提交实现」，
-//     图上无运行投影叫「暂无实现记录」，证据失效 / 有明确失败检查显式「需要复验」/「有问题」，
+//     执行登记与验证依据分开解释，部分登记不读作未开始；证据失效 / 有明确失败检查显式「需要复验」/「有问题」，
 //     后端没给审查读数就是「未知」；刷新失败（旧读数）逐张标「（上次）」并撤下绿态；
 //   · 关掉详情后网格占满可用宽度；窄屏详情叠到**网格上方**，且**只在用户主动到达**（选卡 / 重开详情 /
 //     切到窄屏）时滚进可视区——同项目成功刷新不得抢走用户已经下滑的滚动位置；关闭后焦点回到触发方块（Esc 亦可）。
@@ -48,7 +48,14 @@ import type {
   FeatureItem,
   FeatureLedger,
 } from "../../shared/coverageTypes";
-import { getFeatureLedger, type ProjectItem } from "../api";
+import {
+  getFeatureLedger,
+  getWorkspaces,
+  type FeatureLedgerWorkspace as FeatureLedgerWorkspaceRead,
+  type ProjectItem,
+  type WorkspaceRecord,
+  type WorkspaceView,
+} from "../api";
 import { useBoundedReloader, useProjectRefresh } from "../useProjectRefresh";
 import type { ViewKey } from "../projectScope";
 import {
@@ -57,10 +64,141 @@ import {
   implementationChip,
   reviewChip,
   verificationChip,
-  verificationIsCurrent,
   type ChipDisplay,
 } from "./deliveryOverviewDisplay";
+import { verificationIsCurrent } from "../../shared/implementationReadout";
 import "./DeliveryOverview.css";
+
+// ── V09-67（DESIGN §6.14 第 8 段；PLAN V09-67）：「读哪个版本」的只读派生 ──
+//
+// 交付总览默认读**当前试用候选**（无该指针才按旧 current/active 语义读 :main），开发视图读**当前开发
+// 工作区**；界面必须**实际带上解析出的工作区**去读功能清单，不得省略参数继续读活动主目录。
+//
+// 这一节只做两件事，且**都不改交付判据**：
+//   ① 把 `GET /api/projects/:id/workspaces` 的只读视图翻成"这次读哪个版本"（选择器 + 人话说明）；
+//   ② 如实标出**服务端实际读到的版本**（`ledger.workspace` / `delivery.version`），与所选版本不一致时
+//      显式降级——**不把别的版本的绿结论带过来**（§6.14 第 8 段「缺字段显示未知，不拿其它绿状态代替」）。
+//
+// 坏指针 / 未知 / 旧宿主一律**不回落**：按 §6.13 第 8 段如实标未知，由人来判断（人工核对，不伪调用工具）。
+
+type ScopeKey = "trial" | "dev";
+
+interface ScopeOption {
+  key: ScopeKey;
+  name: string;
+  hint: string;
+}
+
+/** 选择器只有两项（§6.14 第 8 段：默认试用视图 + 开发视图）；**不**把项目锚点当成第三个活跃开发版。 */
+export const SCOPE_OPTIONS: readonly ScopeOption[] = [
+  { key: "trial", name: "试用版", hint: "你正在试用的那个固定版本（默认）" },
+  { key: "dev", name: "开发中", hint: "当前开发工作区（还在改的版本）" },
+];
+
+/** 工作区用途/状态的中文标签（**本地映射**：不从 `shared/workspaceTypes` 引值，避免把服务端模块拉进前端包） */
+const WS_KIND_LABEL: Record<string, string> = {
+  dev: "开发工作区",
+  trial: "固定试用候选",
+  candidate: "候选/准备区",
+};
+const WS_STATUS_LABEL: Record<string, string> = {
+  preparing: "准备中",
+  frozen: "已冻结",
+  retired: "已回收",
+};
+const WS_SOURCE_LABEL: Record<string, string> = {
+  directory: "目录",
+  git_worktree: "Git 工作树",
+  git_commit: "Git 提交",
+  content_snapshot: "内容快照",
+};
+
+/** 一次「读哪个版本」的解析结果（**只读派生**：不猜、不回落；坏指针不静默改读主目录） */
+export interface ScopeSelection {
+  key: ScopeKey;
+  /** 送给 feature-ledger 的 `workspace` 参数；`null` ＝ 没解析到明确工作区（按活动主目录旧语义读） */
+  param: string | null;
+  /** 回落到旧 current/active 语义（没有登记的固定试用版） */
+  legacy: boolean;
+  /** 工作区登记还没读回来（此时**先不发清单请求**，避免先按旧语义读一次） */
+  pending: boolean;
+  /** 工作区登记读不到/形态不明（旧宿主 404、读失败）——按旧语义读但**如实标未知** */
+  unknown: boolean;
+  /** 人话说明：这次读的是哪个版本 */
+  label: string;
+  /** 登记记录（有的话；派生 `:main` 也在 `workspaces` 里） */
+  record: WorkspaceRecord | null;
+  /** 展示用根目录（登记根，或旧语义下的项目锚点） */
+  root: string | null;
+  /** 坏指针/不可用（**不回落主目录**，点名原因） */
+  blockedReason: string | null;
+}
+
+export function resolveScope(
+  view: WorkspaceView | null,
+  key: ScopeKey,
+  settled: boolean,
+  readError: string | null,
+): ScopeSelection {
+  const base = { key, param: null as string | null, legacy: true, pending: false, unknown: false, label: "", record: null as WorkspaceRecord | null, root: null as string | null, blockedReason: null as string | null };
+  if (!settled) {
+    return { ...base, pending: true, label: "工作区登记还在读取" };
+  }
+  // 读失败（旧宿主 404 / 读错）⇒ **不沿用上次的工作区结论**：这次读不到就是未知，
+  // 按活动主目录旧语义读并如实标出来（不拿上次的"固定试用版"标签顶替，见 §6.13 第 8 段）。
+  if (view === null || readError !== null) {
+    return {
+      ...base,
+      unknown: true,
+      label: readError === null ? "工作区登记读不到：按活动主目录（旧 current/active）读" : `工作区登记读不到（${readError}）：按活动主目录（旧 current/active）读`,
+    };
+  }
+  const byId = (id: string | null): WorkspaceRecord | null =>
+    id === null ? null : (view.workspaces.find((w) => w.workspace_id === id) ?? null);
+  if (key === "dev") {
+    const cd = view.current_dev;
+    if (cd.source === "blocked") {
+      return {
+        ...base,
+        legacy: false,
+        param: cd.workspace_id,
+        label: "开发指针异常（不回落主目录）",
+        blockedReason: cd.blocked_reason ?? `开发指针指向的工作区不可用：${cd.workspace_id}`,
+      };
+    }
+    return {
+      ...base,
+      legacy: false,
+      param: cd.workspace_id,
+      label: cd.source === "pointer" ? "当前开发工作区" : "主开发目录（派生的开发根）",
+      record: byId(cd.workspace_id),
+      root: cd.root ?? view.anchor_root,
+    };
+  }
+  const id = view.pointer.current_trial_workspace_id;
+  const rec = byId(id);
+  if (id !== null && rec !== null && rec.status !== "retired") {
+    return { ...base, legacy: false, param: id, label: "已登记的固定试用版", record: rec, root: rec.root };
+  }
+  if (id !== null) {
+    // 有显式试用指针却不可用 ⇒ **不静默按主目录读**，点名原因（§6.13 第 5/8 段）
+    return {
+      ...base,
+      legacy: false,
+      label: "试用指针不可用（不按主目录兜底）",
+      root: view.anchor_root,
+      blockedReason: rec === null ? `当前试用候选 ${id} 不在工作区记录里` : `当前试用候选 ${id} 已回收（retired）`,
+    };
+  }
+  return { ...base, label: "还没有登记的固定试用版：按活动主目录（旧 current/active）读", root: view.anchor_root };
+}
+
+/** 根目录的尾部短名（完整路径另存 title／可展开），只作呈现 */
+function shortRoot(p: string): string {
+  const parts = p.split(/[\\/]+/).filter((s) => s !== "");
+  if (parts.length <= 2) return p;
+  return `…\\${parts.slice(-2).join("\\")}`;
+}
 
 // ── 运行时形态归一（只读消费；畸形/部分字段降级成安全值，缺核心结构 = null ⇒ 界面显式未知） ──
 
@@ -438,6 +576,16 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
   /** 窄屏：详情栏叠到**网格上方**（不埋到十几张卡下面），用户选中后要把详情带进可视区 */
   const [narrow, setNarrow] = useState(() => window.matchMedia("(max-width: 1120px)").matches);
 
+  // ── V09-67：读哪个版本（工作区/交付候选） ──
+  // 选择与项目绑定：**换项目即回默认「试用版」**（§6.14 第 8 段：交付总览默认读当前试用候选）。
+  const [scopeChoice, setScopeChoice] = useState<{ project: string; key: ScopeKey }>({ project: project.id, key: "trial" });
+  const scopeKey: ScopeKey = scopeChoice.project === project.id ? scopeChoice.key : "trial";
+  const [wsView, setWsView] = useState<WorkspaceView | null>(null);
+  const [wsSettled, setWsSettled] = useState(false);
+  const [wsError, setWsError] = useState<{ unsupported: boolean; message: string; status: number | null } | null>(null);
+  const [rootFull, setRootFull] = useState(false);
+  const [scopeNote, setScopeNote] = useState<string | null>(null);
+
   const idRef = useRef(project.id);
   idRef.current = project.id;
   const ledgerRef = useRef<FeatureLedger | null>(null);
@@ -445,6 +593,17 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
   const loadedForRef = useRef<string | null>(null);
   const pagingGenRef = useRef(0);
   const pagingForceResetRef = useRef(false);
+  /** 当前 ledger 是**用哪个 workspace 参数**读到的（续页必须用同一个，否则页与页会串版本） */
+  const loadedParamRef = useRef<string | null>(null);
+  /** 本次「读哪个版本」的解析（只读派生；`pending` 时先不发清单请求） */
+  const scopeSel = resolveScope(wsView, scopeKey, wsSettled, wsError === null ? null : wsError.message);
+  const scopeParam = scopeSel.pending ? null : scopeSel.param;
+  /** 清单请求的身份：项目 + 实际工作区参数（换 scope 即换 key ⇒ 撤结论、取消上一 scope 的分页） */
+  const loadKey = `${project.id}::${scopeSel.pending ? "@pending" : scopeParam ?? "@legacy"}`;
+  const loadKeyRef = useRef(loadKey);
+  loadKeyRef.current = loadKey;
+  /** 工作区登记读过了哪个项目（换项目才清空，周期对账不清空——否则每次刷新都会把结论打回加载态） */
+  const wsProjectRef = useRef<string | null>(null);
   /** 详情栏本体（窄屏选中后滚进可视区用） */
   const paneRef = useRef<HTMLElement>(null);
   /** 触发选中/打开详情的那张方块（关闭详情后焦点要回到它，键盘用户不丢位置） */
@@ -474,10 +633,54 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
     if (el !== null && document.contains(el)) el.focus();
   }, []);
 
+  /**
+   * 切换「读哪个版本」（V09-67）：**立即**撤下旧结论、取消上一 scope 的分页，再按新 scope 读第一页。
+   * 旧回包由 `loadKeyRef` / `pagingGenRef` 双重作废——页号与迟到回包都**不串**工作区。
+   */
+  const chooseScope = useCallback(
+    (key: ScopeKey): void => {
+      if (key === scopeKey) return;
+      pagingGenRef.current += 1;
+      pagingForceResetRef.current = false;
+      loadedForRef.current = null;
+      loadedParamRef.current = null;
+      setLedger(null);
+      setError(null);
+      setStaleReason(null);
+      setLoading(true);
+      setPagingBusy(false);
+      setPagingError(null);
+      setPagingNotice(null);
+      setSelectedId(null);
+      setDetailClosed(false);
+      setScopeNote(null);
+      setScopeChoice({ project: idRef.current, key });
+    },
+    [scopeKey],
+  );
+
+  /**
+   * 复制目录到剪贴板（只作核对便利）：剪贴板不可用（无权限/非安全上下文）时**如实说不可用**，不谎称已复制。
+   */
+  const copyRoot = useCallback((root: string): void => {
+    void (async () => {
+      try {
+        await navigator.clipboard.writeText(root);
+        setScopeNote("目录已复制");
+      } catch {
+        setScopeNote("复制不可用（浏览器未授权剪贴板），请手动选中上面的路径");
+      }
+    })();
+  }, []);
+
   const load = useCallback((signal: AbortSignal): Promise<void> => {
     const id = project.id;
-    if (loadedForRef.current !== id) {
-      loadedForRef.current = id;
+    if (scopeSel.pending) return Promise.resolve(); // 登记还没读回来：先不发请求，避免先按旧语义读一次
+    const key = loadKey;
+    if (loadedForRef.current !== key) {
+      loadedForRef.current = key;
+      pagingGenRef.current += 1; // 换 scope：在途的下一页一律作废（不拼两个工作区）
+      pagingForceResetRef.current = false;
       setLedger(null);
       setError(null);
       setStaleReason(null);
@@ -488,9 +691,11 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
       setSelectedId(null);
       setDetailClosed(false);
     }
-    return getFeatureLedger(id, { document: "active" }, { signal })
+    loadedParamRef.current = scopeParam;
+    const req = scopeParam === null ? { document: "active" as const } : { document: "active" as const, workspace: scopeParam };
+    return getFeatureLedger(id, req, { signal })
       .then((l) => {
-        if (signal.aborted || idRef.current !== id) return;
+        if (signal.aborted || idRef.current !== id || loadKeyRef.current !== key) return;
         pagingGenRef.current += 1; // 第一页落地：在途下一页作废（不拼两版）
         const prev = ledgerRef.current;
         const forceReset = pagingForceResetRef.current;
@@ -507,7 +712,7 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
         setPagingBusy(false);
       })
       .catch((e: unknown) => {
-        if (signal.aborted || idRef.current !== id) return;
+        if (signal.aborted || idRef.current !== id || loadKeyRef.current !== key) return;
         const err = e as { message?: string; status?: number | null; code?: string; unsupported?: boolean };
         const view: ReadError = {
           unsupported: err.unsupported === true,
@@ -522,14 +727,50 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
       .finally(() => {
         if (!signal.aborted) setLoading(false);
       });
-  }, [project.id]);
+  }, [project.id, scopeSel.pending, loadKey, scopeParam]);
 
-  // 统一周期对账（V09-26/F2）：换项目/回前台/在线恢复都重取；卸载与换项目作废在途回包
+  // 统一周期对账（V09-26/F2）：换项目/回前台/在线恢复都重取；卸载与换项目作废在途回包。
+  // V09-67：**loadKey 把工作区参数并进身份**——切 scope 即换 key ⇒ 作废旧 scope 的在途回包并立即开读新版本。
   const token = useProjectRefresh(project.id);
-  const reload = useBoundedReloader(project.id, load);
+  const reload = useBoundedReloader(loadKey, load);
   useEffect(() => {
     reload();
   }, [project.id, token, reloadTick, reload]);
+
+  /**
+   * 读工作区/交付候选登记（V09-67）。**纯读**、只作"读哪个版本"的依据：
+   *   · 换项目清空（回默认试用视图）；同项目周期对账保留上次成功结果（否则每 5 秒把选择打回加载态）；
+   *   · 读失败**如实标出**并沿用上次结果，不假装读到了固定试用版，也不在本地另算判据。
+   */
+  useEffect(() => {
+    const id = project.id;
+    if (wsProjectRef.current !== id) {
+      wsProjectRef.current = id;
+      setWsView(null);
+      setWsSettled(false);
+      setWsError(null);
+      setRootFull(false);
+    }
+    const ctrl = new AbortController();
+    getWorkspaces(id, { signal: ctrl.signal })
+      .then((v) => {
+        if (ctrl.signal.aborted || idRef.current !== id) return;
+        setWsView(v);
+        setWsError(null);
+        setWsSettled(true);
+      })
+      .catch((e: unknown) => {
+        if (ctrl.signal.aborted || idRef.current !== id) return;
+        const err = e as { message?: string; status?: number | null; code?: string; unsupported?: boolean };
+        setWsError({
+          unsupported: err.unsupported === true,
+          message: err.message ?? String(e),
+          status: typeof err.status === "number" ? err.status : null,
+        });
+        setWsSettled(true);
+      });
+    return () => ctrl.abort();
+  }, [project.id, token]);
 
   // 窄屏把详情栏带进可视区：**只在用户主动到达时**跳一次——选卡 / 重新打开详情（`detailScrollIntent`）
   // 或切换到窄屏（`narrow` 变化）。**刻意不依赖 `ledger`**：同项目周期对账每轮都会把 `ledger` 换成
@@ -551,18 +792,27 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
     return () => window.removeEventListener("keydown", onKey);
   }, [detailClosed, ledger, selectedId, narrow, closeDetail]);
 
-  /** 真实续读下一页：cursor 绑 package_revision；版本变了（409）旧页作废、重读第一页，不拼接两版 */
+  /**
+   * 真实续读下一页：cursor 绑 package_revision；版本变了（409）旧页作废、重读第一页，不拼接两版。
+   * V09-67：**续页必须带上同一个工作区参数**（用当前 ledger 读到的那个），否则页与页会串版本。
+   */
   const loadMore = useCallback((): void => {
     const cur = ledger;
     if (cur === null || cur.paging.complete || pagingBusy) return;
     const cursor = cur.paging.cursor;
     if (cursor === null) return;
     const key = project.id;
+    const wsParam = loadedParamRef.current;
     const gen = ++pagingGenRef.current;
     setPagingBusy(true);
     setPagingError(null);
     setPagingNotice(null);
-    getFeatureLedger(project.id, { document: "active", cursor, expected_revision: cur.package_revision })
+    getFeatureLedger(
+      project.id,
+      wsParam === null
+        ? { document: "active", cursor, expected_revision: cur.package_revision }
+        : { document: "active", cursor, expected_revision: cur.package_revision, workspace: wsParam },
+    )
       .then((next) => {
         if (gen !== pagingGenRef.current || idRef.current !== key) return;
         setLedger((prev) => (prev === null ? next : mergePages(prev, next)));
@@ -588,11 +838,188 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
   // ── 结论态：只取服务端 delivery.state；当前读数失效/缺字段/不支持分别如实降级 ──
   const delivery = ledger === null ? null : readDelivery(ledger);
   const withdrawn = staleReason !== null && ledger !== null;
+
+  // ── V09-67：这次读的版本（只读派生；服务端实际读到的版本以 `ledger.workspace` 为准） ──
+  const readWs: FeatureLedgerWorkspaceRead | null = ledger === null ? null : (ledger.workspace ?? null);
+  const scopeRoot = scopeSel.root;
+  const otherWorkspaces = wsView === null
+    ? []
+    : wsView.workspaces
+        .filter(
+          (w) =>
+            !w.derived &&
+            w.workspace_id !== wsView.pointer.current_trial_workspace_id &&
+            w.workspace_id !== wsView.current_dev.workspace_id,
+        )
+        .map((w) => `${WS_KIND_LABEL[w.kind] ?? w.kind}·${WS_STATUS_LABEL[w.status] ?? w.status} ${w.workspace_id}`);
+  /**
+   * 服务端实际读的版本 ≠ 我所选的版本（也是"后端还没把 `workspace` 参数透传"的可观测信号）。
+   * 只做**呈现层**降级：不自己续读、不另算判据，也**不把别的版本的绿结论带过来**（§6.14 第 8 段）。
+   * 旧宿主没这个字段（`undefined`）时不断言一致或不一致 ⇒ 只能显式未知，不能假装核对过。
+   */
+  let versionMismatch: string | null = null;
+  if (ledger !== null && scopeParam !== null && readWs !== null) {
+    if (!readWs.resolved) {
+      versionMismatch = `这次没有按你选的版本读取（服务端未解析到明确工作区${readWs.reason !== null && readWs.reason !== "" ? `：${readWs.reason}` : ""}）：下面的读数不能当作所选版本的交付结论。`;
+    } else if (readWs.workspace_id !== scopeParam) {
+      versionMismatch = `服务端实际读的是「${readWs.workspace_id ?? "未知"}」，和你选的「${scopeParam}」不是同一个版本：下面的读数不能当作所选版本的交付结论。`;
+    }
+  }
+
+  /**
+   * 「读哪个版本」的来源明细（选择器自己的依据 + 服务端**实际读到**的版本）。
+   * 两个折叠区共用这一段：`delivery` 在时并进「完整读数与版本依据」；`delivery` 缺失时另起一个
+   * 只讲版本的折叠区——**缺字段就是未知**，不因为交付读数缺失就把"读的是哪一版"也藏起来。
+   */
+  const versionRows = (
+    <>
+      <div className="tt-dlv-muted" data-delivery-scope-source>
+        本次选择：{scopeKey === "trial" ? "试用版" : "开发中"} — {scopeSel.label}
+        {scopeSel.record !== null && (
+          <>
+            {" · 用途 "}
+            {scopeSel.record.purpose !== "" ? scopeSel.record.purpose : "（没写用途）"}
+            {" · 状态 "}
+            {WS_STATUS_LABEL[scopeSel.record.status] ?? scopeSel.record.status}
+            {" · 来源 "}
+            {WS_SOURCE_LABEL[scopeSel.record.source_kind] ?? scopeSel.record.source_kind}
+          </>
+        )}
+      </div>
+      {scopeSel.record !== null && scopeSel.record.freeze !== null && (
+        <div className="tt-dlv-muted" data-delivery-scope-binding>
+          冻结内容指纹 {shortHash(scopeSel.record.freeze.content_fingerprint)} · 基线{" "}
+          {scopeSel.record.freeze.version_binding.baseline_id ?? "（未激活）"} · 设计{" "}
+          {shortHash(scopeSel.record.freeze.version_binding.design_sha256)} · 施工{" "}
+          {shortHash(scopeSel.record.freeze.version_binding.plan_sha256)} · 账本末序号{" "}
+          {scopeSel.record.freeze.version_binding.ledger_last_seq ?? "未知"}
+        </div>
+      )}
+      <div className="tt-dlv-muted" data-delivery-scope-select-root>
+        本次选择的工作区：{scopeParam ?? "（没有明确工作区：按活动主目录旧语义读）"} · 根目录 {scopeRoot ?? "（未知）"}
+      </div>
+      <div className="tt-dlv-muted" data-delivery-read-workspace>
+        服务端实际读取的版本：
+        {readWs === null
+          ? "未知（旧宿主没有工作区字段，不能断言与所选版本一致）"
+          : readWs.resolved
+            ? `${WS_KIND_LABEL[readWs.kind ?? ""] ?? readWs.kind ?? "工作区"} · ${readWs.workspace_id ?? "未知"}${
+                readWs.status !== null ? `（${WS_STATUS_LABEL[readWs.status] ?? readWs.status}）` : ""
+              }`
+            : `未解析到明确工作区${readWs.reason !== null && readWs.reason !== "" ? `：${readWs.reason}` : ""}`}
+      </div>
+      <div className="tt-dlv-muted" data-delivery-read-root>
+        实际读的目录：{readWs?.root ?? delivery?.version.workspace_root ?? "未知"} · 内容指纹{" "}
+        {shortHash(readWs?.content_fingerprint ?? delivery?.version.content_fingerprint ?? null)} · 来源提交{" "}
+        {shortHash(readWs?.source_commit ?? null)}
+      </div>
+      {otherWorkspaces.length > 0 && (
+        <div className="tt-dlv-muted" data-delivery-scope-others>
+          其它已登记工作区（不参与本页默认读取）：{otherWorkspaces.join("、")}
+        </div>
+      )}
+    </>
+  );
+
+  const scopeBar = (
+    <div
+      className="tt-dlv-scope"
+      data-delivery-version-picker
+      data-scope-active={scopeKey}
+      data-scope-param={scopeParam ?? ""}
+      data-scope-legacy={scopeSel.legacy ? "1" : "0"}
+      data-scope-pending={scopeSel.pending ? "1" : "0"}
+      data-scope-unknown={scopeSel.unknown ? "1" : "0"}
+      data-scope-blocked={scopeSel.blockedReason === null ? "0" : "1"}
+    >
+      <span className="tt-dlv-scope-label">读哪个版本</span>
+      <span className="tt-dlv-scope-seg" role="group" aria-label="选择要读的版本">
+        {SCOPE_OPTIONS.map((o) => (
+          <button
+            key={o.key}
+            type="button"
+            className="tt-dlv-scope-btn"
+            data-delivery-scope-option={o.key}
+            aria-pressed={scopeKey === o.key}
+            title={o.hint}
+            onClick={() => chooseScope(o.key)}
+          >
+            {o.name}
+          </button>
+        ))}
+      </span>
+      <span className="tt-dlv-scope-note" data-delivery-scope-note title={scopeRoot ?? undefined}>
+        {scopeSel.label}
+        {scopeRoot !== null && (
+          <>
+            {" · "}
+            <code className="tt-dlv-scope-root" data-delivery-scope-root>
+              {shortRoot(scopeRoot)}
+            </code>
+          </>
+        )}
+      </span>
+      {scopeRoot !== null && (
+        <span className="tt-dlv-scope-actions">
+          <button
+            type="button"
+            className="tt-dlv-scope-btn"
+            data-delivery-scope-root-toggle
+            aria-pressed={rootFull}
+            onClick={() => setRootFull((v) => !v)}
+          >
+            {rootFull ? "收起路径" : "展开路径"}
+          </button>
+          <button type="button" className="tt-dlv-scope-btn" data-delivery-scope-root-copy onClick={() => copyRoot(scopeRoot)}>
+            复制
+          </button>
+        </span>
+      )}
+      {scopeNote !== null && (
+        <span className="tt-dlv-scope-copied" data-delivery-scope-copied>
+          {scopeNote}
+        </span>
+      )}
+    </div>
+  );
+
+  /** 「展开路径」时才出现的一行（默认不占首屏高度；完整路径用于用户自己核对目录） */
+  const scopeRootRow =
+    rootFull && scopeRoot !== null ? (
+      <p className="tt-dlv-muted" data-delivery-scope-root-full>
+        工作区根目录：<code className="tt-dlv-scope-root-full">{scopeRoot}</code>
+      </p>
+    ) : null;
+
+  /** 「这个版本读得靠不靠得住」的如实提示（两个渲染分支共用：坏指针 / 登记读不到） */
+  const scopeWarn = (
+    <>
+      {scopeSel.blockedReason !== null && (
+        <p data-delivery-scope-blocked className="tt-dlv-warn">
+          所选的版本指针不可用（不按主目录兜底）：{scopeSel.blockedReason}
+        </p>
+      )}
+      {wsError !== null && (
+        <p data-delivery-scope-error className="tt-dlv-warn">
+          {wsError.unsupported
+            ? "这个后端还没有工作区登记读口（旧宿主）：这次按活动主目录（旧 current/active）读取，不能确认这就是固定试用版。"
+            : `工作区登记读不到（${wsError.message}${wsError.status !== null ? `，HTTP ${wsError.status}` : ""}）：这次按活动主目录（旧 current/active）读取，不能确认这就是固定试用版。`}
+        </p>
+      )}
+    </>
+  );
+
   let state: string;
   if (ledger === null) {
     state = error === null ? "loading" : error.unsupported ? "unsupported" : "error";
   } else if (withdrawn) {
     state = "stale";
+  } else if (versionMismatch !== null) {
+    // 读到的不是所选版本 ⇒ 不给出这个版本的交付结论（旧绿不带过来）
+    state = "version_mismatch";
+  } else if (scopeSel.blockedReason !== null) {
+    // 坏指针（不回落主目录）：显式未知，不给这个版本的交付结论
+    state = "scope_blocked";
   } else if (ledger.state === "not_derived") {
     state = "not_derived";
   } else if (delivery === null) {
@@ -618,7 +1045,11 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
         data-delivery-stale="0"
         className="tt-dlv"
       >
-        <h3 className="tt-dlv-title">交付总览</h3>
+        <header className="tt-dlv-head">
+          <h3 className="tt-dlv-title">交付总览</h3>
+          {scopeBar}
+        </header>
+        {scopeRootRow}
         <p data-delivery-conclusion className="tt-dlv-conclusion tt-dlv-neutral">
           {state === "loading"
             ? "正在读取交付总览…"
@@ -628,6 +1059,7 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
                 ? "这个版本还没有可核对的交付数据"
                 : "交付总览暂时读不到"}
         </p>
+        {scopeWarn}
         {error !== null && (
           <p data-delivery-error className="tt-dlv-error">
             {error.unsupported
@@ -686,11 +1118,15 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
       ? "可以开始人工试用"
       : state === "not_ready"
         ? "还不能开始人工试用"
-        : state === "stale"
-          ? "刚才刷新失败，暂时无法确认是否可以试用"
-          : state === "not_derived"
-            ? "这个版本还没有可核对的交付数据"
-            : "暂时无法判断能否开始人工试用";
+        : state === "version_mismatch"
+          ? "读取的版本和你选的不是同一个，暂时不能给出这个版本的交付结论"
+          : state === "scope_blocked"
+            ? "所选的版本指针不可用，暂时不能给出这个版本的交付结论"
+            : state === "stale"
+            ? "刚才刷新失败，暂时无法确认是否可以试用"
+            : state === "not_derived"
+              ? "这个版本还没有可核对的交付数据"
+              : "暂时无法判断能否开始人工试用";
   const conclusionClass =
     state === "ready_for_trial" ? "tt-dlv-positive" : state === "not_ready" ? "tt-dlv-warning" : "tt-dlv-neutral";
   const staleSuffix = withdrawn ? "（上次）" : "";
@@ -707,7 +1143,9 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
       <header className="tt-dlv-head">
         <h3 className="tt-dlv-title">交付总览</h3>
         <span className="tt-dlv-sub">现在能不能交给你试用、还差什么</span>
+        {scopeBar}
       </header>
+      {scopeRootRow}
 
       {/* 首屏只留：一句总体结论 + **一行**紧凑计数（含人的接受计数）；完整读数/核对/依据都在折叠区。 */}
       <div className="tt-dlv-hero">
@@ -724,6 +1162,13 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
           </p>
         )}
       </div>
+      {/* V09-67：读到的不是所选版本 ⇒ 显式降级（绿结论不带过来）；坏指针 / 登记读失败分别点名 */}
+      {versionMismatch !== null && (
+        <p data-delivery-version-mismatch className="tt-dlv-warn">
+          {versionMismatch}
+        </p>
+      )}
+      {scopeWarn}
       {delivery !== null && delivery.scope !== "project" && (
         <p data-delivery-scope-note className="tt-dlv-warn">
           {delivery.scope === "historical"
@@ -778,7 +1223,18 @@ export function DeliveryOverview({ project, onNavigate }: DeliveryOverviewProps)
             </div>
             <div className="tt-dlv-muted">读取的文档版本：{ledger.document_selection.mode}（包版本 {shortHash(ledger.package_revision)}）</div>
             <div className="tt-dlv-muted">包版本依据：{ledger.package_revision_basis.join(" / ") || "（无）"}</div>
+            {/* V09-67：所选版本（选择器）＋ 服务端**实际读到**的版本；缺字段一律显式未知 */}
+            {versionRows}
           </div>
+        </details>
+      )}
+      {/* delivery 缺失（旧宿主/未派生）也不把"读的是哪一版"藏起来：另起一个只讲版本的折叠区 */}
+      {delivery === null && (
+        <details className="tt-dlv-block tt-dlv-fold" data-delivery-version>
+          <summary className="tt-dlv-block-head">
+            {withdrawn ? `读取的版本与工作区依据${staleMark}` : "读取的版本与工作区依据"}
+          </summary>
+          <div className="tt-dlv-detail-body">{versionRows}</div>
         </details>
       )}
 
@@ -1072,8 +1528,7 @@ function DeliveryCard({
         : item.user_description !== ""
           ? item.user_description
           : "（还没有用途说明）";
-  const readoutVerified = verificationIsCurrent(item.verification);
-  const impl = implementationChip(item.implementation.state, readoutVerified, stale);
+  const impl = implementationChip(item.implementation, item.verification, stale);
   const verify = verificationChip(item.verification, stale);
   const reviewState = review === null ? null : review.state;
   const rev = reviewChip(reviewState, stale);
@@ -1122,8 +1577,7 @@ function DeliveryDetailPane({
   const review = readAgentReview(item);
   const dc = item.design_coverage;
   const dcState = DESIGN_LABEL[dc.state] ?? dc.state;
-  const readoutVerified = verificationIsCurrent(item.verification);
-  const impl = implementationChip(item.implementation.state, readoutVerified, stale);
+  const impl = implementationChip(item.implementation, item.verification, stale);
   const verify = verificationChip(item.verification, stale);
   const purpose = item.scenario !== "" ? `用在：${item.scenario}` : item.user_description !== "" ? item.user_description : "（还没有用途说明）";
   const reviewState = review === null ? null : review.state;
@@ -1163,7 +1617,7 @@ function DeliveryDetailPane({
 
       <section className="tt-dlv-pane-sec">
         <h4 className="tt-dlv-pane-sec-label">实现依据</h4>
-        <p>{impl.label}{item.implementation.basis !== null ? "（账本有对应运行记录）" : "（还没有运行投影）"}</p>
+        <p data-implementation-explanation>{impl.note}</p>
       </section>
 
       <section className="tt-dlv-pane-sec">
@@ -1227,6 +1681,7 @@ function DeliveryDetailPane({
             <dt>实现依据</dt>
             <dd>
               {impl.label} · {item.implementation.basis ?? "（没有运行投影）"}
+              {item.implementation.result_registration !== undefined && <span> · 已登记：{item.implementation.result_registration.submitted_task_ids.join("、") || "无"}；未登记：{item.implementation.result_registration.pending_task_ids.join("、") || "无"}</span>}
             </dd>
             <dt>技术验证证据</dt>
             <dd>
@@ -1264,7 +1719,7 @@ function DeliveryDetailPane({
               {item.provenance.unmapped.length > 0 && <div>未映射：{item.provenance.unmapped.join("、")}</div>}
             </dd>
             <dt>本项技术验证</dt>
-            <dd>{readoutVerified ? `${verify.label}（最终结论以上方交付总览为准）` : verify.label}</dd>
+            <dd>{verificationIsCurrent(item.verification) ? `${verify.label}（最终结论以上方交付总览为准）` : verify.label}</dd>
           </dl>
         </div>
       </details>

@@ -162,6 +162,33 @@ export const REMOTE_ROUTES: readonly RemoteRoute[] = [
     anchors: ['if (req.method === "GET" && reqPath === "/api/work/entry") {'],
     query: "?project_id=:id&role=executor",
   },
+  // ── V09-69（DESIGN §3.18/§6.15）：运行诊断**只读**读口（两条，同一 builder）──
+  // ① tokened `/api/work/diagnostics`（Agent / MCP doctor.runtime 读它）；② 本地
+  // `/api/runtime/diagnostics`（界面用，**不索要 work token**、远程来源在路由内 403）。
+  {
+    id: "work-diagnostics",
+    method: "GET",
+    path: "/api/work/diagnostics",
+    kind: "read",
+    note:
+      "运行诊断只读读口（V09-69，DESIGN §6.15）：宿主装配一次 → 统一状态模型（healthy/degraded/unavailable/unknown；" +
+      "超时≠服务已死、503 按 reason 区分）；只读有界内存遥测 + worker 队列，不重推导、不写账；" +
+      "仍要描述符令牌：无/错令牌 401 SERVICE_UNAVAILABLE",
+    anchors: ['if (req.method === "GET" && reqPath === "/api/work/diagnostics") {'],
+    query: "?project_id=:id&detail=summary",
+  },
+  {
+    id: "runtime-diagnostics-local",
+    method: "GET",
+    path: "/api/runtime/diagnostics",
+    kind: "read",
+    note:
+      "运行诊断**本地**只读读口（V09-69，DESIGN §3.18/§6.15）：同源本地安全注册（**不索要 work token**），" +
+      "与 tokened `/api/work/diagnostics` 同一 builder；**远程来源默认禁止**（路由内 403 REMOTE_LOCAL_ONLY，" +
+      "不对外暴露本机运行时细节）；错误 400 INVALID_INPUT／503 SOURCE_UNAVAILABLE（纯读，不写账/不自愈）",
+    anchors: ['if (req.method === "GET" && reqPath === "/api/runtime/diagnostics") {'],
+    query: "?project_id=:id&detail=summary",
+  },
   // ── P2/V09-47（DESIGN §6.11）：结果提交前的**只读预检**路由（`kind: "write"` 沿用远程既有授权规则）──
   // 语义**只读**（不写事件/证据/租约、不自愈、不产生认领、不是门禁/通行票），但用 POST 承载表单式大对象：
   // `claim_token` 是**业务**秘密（走 body，避免日志/代理留痕），与**传输**凭据（描述符令牌
@@ -492,6 +519,33 @@ export const REMOTE_ROUTES: readonly RemoteRoute[] = [
       "**纯读**：不写事件/证据/租约、不触发扫描、不自愈、不调模型",
     anchors: ['if (req.method === "GET" && featureLedgerMatch) {'],
     query: "?scope=current&document=active&limit=50",
+  },
+  // ── V09-63（DESIGN.md §6.13/§6.14）：工作区/交付候选**只读**读口——同一份事件投影 → WorkspaceView ──
+  {
+    id: "workspace-list-read",
+    method: "GET",
+    path: "/api/projects/:id/workspaces",
+    kind: "read",
+    note:
+      "工作区/交付候选只读读口（V09-63，DESIGN.md §6.13/§6.14）：同一份事件投影 → WorkspaceView" +
+      "（含派生 `<project_id>:main`、项目级指针 current_dev/current_trial、当前实际开发根）；" +
+      "旧项目无工作区记录时按 `:main` 派生口径继续可用（逐字段兼容）；**纯读**：不写事件/指针、不自愈、" +
+      "不启动写宿主、不调模型；远程来源经 withoutLocalPaths 去掉本机绝对路径",
+    anchors: ['if (req.method === "GET" && workspacesMatch) {'],
+    query: "",
+  },
+  // ── V09-66（DESIGN.md §6.13 第 7 段／§6.14 第 9 段）：本地 Git 自动收尾唯一宿主写面 ──
+  {
+    id: "git-finalize-write",
+    method: "POST",
+    path: "/api/work/git/finalize",
+    kind: "write",
+    note:
+      "本地 Git 自动收尾（V09-66）：技术验证与独立审查通过且持有有效任务授权时，经唯一宿主对冻结候选" +
+      "做本地提交（提交内容===受验输入，不空提交、不 push）。授权/目标根/技术/独审状态由宿主读真实账本派生，" +
+      "**请求不得自带** grant/通过布尔/root。只读远程模式下由本表 kind=\"write\" 先拒（403 REMOTE_READ_ONLY）。",
+    anchors: ['if (req.method === "POST" && reqPath === "/api/work/git/finalize") {'],
+    body: { project_id: "tatai", task_id: "V09-66", workspace_id: "ws-fixture", subject: "fixture" },
   },
   // ── V06-12：Git 保存版本提醒（只读探测；不写工作树、不碰 Git 配置、不联网）──
   {

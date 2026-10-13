@@ -67,6 +67,15 @@ export const INPUT_SETS: Record<BuildComponent, InputSetSpec> = {
       "public/**",
       "scripts/build-server.ts",
       "scripts/lib/buildIdentity.ts",
+      // V09-63/V09-65（§6.14 第 3/8 段）：运行时试用提升的**包身份实测**复用同一批构建 helper——
+      // `src/server/work/workspaceBuildBinding.ts` 经 `scripts/lib/packageVerdict.ts` 调
+      // `buildStamp`／`sourceFingerprint`／`buildOutputManifest`。它们因此**真实打进后端产物**，
+      // 必须进显式输入集，否则构建后的漂移检测会判「清单外模块」FAIL（bundler drift）。
+      // 算法一字未改，只是把"运行时也复用它们"这件事如实登记进输入集。
+      "scripts/lib/packageVerdict.ts",
+      "scripts/lib/buildStamp.ts",
+      "scripts/lib/sourceFingerprint.ts",
+      "scripts/lib/buildOutputManifest.ts",
       "package.json",
       "pnpm-lock.yaml",
       "tsconfig.json",

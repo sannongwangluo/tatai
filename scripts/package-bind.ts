@@ -17,99 +17,57 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { evaluateBuildStamps, STAMP_REL } from "./lib/buildStamp";
-import { buildOutputManifest, collectReferencedOutputs, outputManifestFingerprint, releaseCoverage } from "./lib/buildOutputManifest";
-import { checkArtifactIdentity, computeComponentInputs, identityStampFields } from "./lib/buildIdentity";
+import { STAMP_REL } from "./lib/buildStamp";
+import { computeComponentInputs, identityStampFields } from "./lib/buildIdentity";
+import { evaluateReleasePackage } from "./lib/packageVerdict";
 import { sourceFingerprint } from "./lib/sourceFingerprint";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const OUT_DIR = process.env.V0904_BIND_OUT ?? path.join(ROOT, ".工作台", "evidence", "V09-04", "1");
 
-// ① 写盘前拦截：戳不新鲜就不产生绑定证据（判据与 verify:v09-04 共用，见 lib/buildStamp.ts）
-const verdict = evaluateBuildStamps(ROOT);
+// ① 写盘前拦截：整份发布核验**只走同一份判据**（`lib/packageVerdict.ts`，运行时试用提升也调它）。
+// 它覆盖：构建戳新鲜度、戳里的构建身份与现算身份相符、输出与构建期冻结清单逐字节一致、
+// 真实产物的内嵌身份逐字段相符、发布完整性（缺分片即拒）与引用闭包。任一步不通过即拒绝写 binding.json。
+const fields = identityStampFields(ROOT);
+const verdict = evaluateReleasePackage(
+  ROOT,
+  {
+    release_id: fields.release_id,
+    build_id: fields.build_id,
+    server_input_fingerprint: fields.server_input_fingerprint,
+    ui_input_fingerprint: fields.ui_input_fingerprint,
+  },
+  { scope: "full" },
+);
+
 if (!verdict.ok) {
-  console.error("[bind] FAIL 拒绝写 binding.json——构建戳校验未通过：");
-  for (const r of verdict.reasons) console.error(`[bind]   FAIL ${r}`);
+  console.error("[bind] FAIL 拒绝写 binding.json——发布核验未通过：");
+  for (const r of verdict.problems) console.error(`[bind]   FAIL ${r}`);
   console.error("[bind] 正确做法：重跑 pnpm tauri:build（构建尾部自动写戳并绑定）；不要手工补戳或改戳");
   process.exit(1);
 }
-console.log(`[bind] PASS 构建戳在场且一致（dist/ 与 release/ 同内容，built_at=${verdict.dist!.built_at}）`);
-console.log(`[bind] PASS 戳指纹 === 当前实测（${verdict.current.fingerprint.slice(0, 16)}… / ${verdict.current.file_count} 文件）`);
 
-// ①′ P0/V09-45：身份必须与当前工作树现算一致（构建后漂移 ⇒ 拒绝写绑定，不静默放行）
-const fields = identityStampFields(ROOT);
-const stampIdentity = verdict.dist!.build_identity;
-if (stampIdentity === undefined) {
-  console.error("[bind] FAIL 戳里没有构建身份段（build_identity）——这批产物不是 P0 之后的构建链做出来的，拒绝绑定");
-  process.exit(1);
-}
-if (stampIdentity.release_id !== fields.release_id) {
-  console.error(
-    `[bind] FAIL 构建身份与当前输入不一致：戳 release ${stampIdentity.release_id.slice(0, 12)}… ≠ 现算 ${fields.release_id.slice(0, 12)}…`,
-  );
-  console.error("[bind] 说明构建后输入已漂移（或戳被人改过）——拒绝写 binding.json");
-  process.exit(1);
-}
+const dist = verdict.stamps.dist!;
+console.log(`[bind] PASS 构建戳在场且一致（dist/ 与 release/ 同内容，built_at=${dist.built_at}）`);
+console.log(`[bind] PASS 戳指纹 === 当前实测（${verdict.stamps.current.fingerprint.slice(0, 16)}… / ${verdict.stamps.current.file_count} 文件）`);
 console.log(`[bind] PASS 构建身份与当前输入一致（release ${fields.release_id.slice(0, 12)}…）`);
-
-// ①‴ P0/V09-45 集成复核 1：核对当前输出与**构建期在构建尾部冻结的完整输出清单**逐字节一致。
-// 不重新扫目录再签字：旧分片换字节、旧壳/安装器被替换、分片被删都会在此被判出来。
-const frozenOutput = outputManifestFingerprint(ROOT);
-if (stampIdentity.output_manifest_sha256 === undefined) {
-  console.error("[bind] FAIL 戳里没有冻结构建输出清单（output_manifest_sha256）——旧戳可读，但不冒称支持新的发布完整性，拒绝绑定");
-  process.exit(1);
-}
-if (stampIdentity.output_manifest_sha256 !== frozenOutput.sha256) {
-  console.error(
-    `[bind] FAIL 输出与构建期冻结清单不一致：戳 ${stampIdentity.output_manifest_sha256.slice(0, 12)}… ≠ 现算 ${frozenOutput.sha256.slice(0, 12)}…`,
-  );
-  console.error("[bind] 某个产物（含旧分片 / 旧壳 / 安装器）在构建后被换过或缺失——拒绝写 binding.json");
-  process.exit(1);
-}
-console.log(`[bind] PASS 输出与构建期冻结清单逐字节一致（${frozenOutput.file_count} 项产物，排除戳自身落点）`);
-
-// ①‴ P0/V09-45：从**真实产物**读回内嵌身份并逐字段核对（Codex 纠正 5/7）——
-// "戳与源码一致"不能替代"产物里真的内嵌了这份身份"；server 产物与 ui 产物混批同样在此被拒。
-const artifact = checkArtifactIdentity(ROOT, {
-  release_id: fields.release_id,
-  build_id: fields.build_id,
-  server_input_fingerprint: fields.server_input_fingerprint,
-  ui_input_fingerprint: fields.ui_input_fingerprint,
-});
-if (!artifact.ok) {
-  console.error("[bind] FAIL 真实产物的内嵌身份与期望不符——拒绝写 binding.json：");
-  for (const p of artifact.problems) console.error(`[bind]   FAIL ${p}`);
-  process.exit(1);
-}
+console.log(`[bind] PASS 输出与构建期冻结清单逐字节一致（${verdict.output_manifest.file_count} 项产物，排除戳自身落点）`);
 console.log(
-  `[bind] PASS 产物内嵌身份逐字段相符（server ${artifact.server?.file} / ui ${artifact.ui?.file}；` +
-    `扫 ${artifact.server?.scanned ?? 0}+${artifact.ui?.scanned ?? 0} 个 js）`,
+  `[bind] PASS 产物内嵌身份逐字段相符（server ${verdict.artifact.server?.file} / ui ${verdict.artifact.ui?.file}；` +
+    `扫 ${verdict.artifact.server?.scanned ?? 0}+${verdict.artifact.ui?.scanned ?? 0} 个 js）`,
+);
+console.log(`[bind] PASS 发布必需部件齐全（整包 full，${verdict.coverage.present.length} 项）`);
+console.log(
+  `[bind] PASS 引用闭包完整（入口 ${verdict.closure.entries.length} 个 → 引用 ${verdict.closure.referenced.length} 项产物，均在场且在清单内）`,
 );
 
+// 下面写绑定记录用的现场数据都取自**同一次核验**（不再重扫目录）
 const fp = sourceFingerprint(ROOT);
-const manifest = buildOutputManifest(ROOT);
-
-// ①″ P0/V09-45：发布完整性——整包必需部件缺一即拒绝（缺分片的发布被拒）
-const coverage = releaseCoverage(manifest.entries, { scope: "full" });
-if (!coverage.ok) {
-  console.error(`[bind] FAIL 发布不完整，缺必需部件：${coverage.missing.join(", ")}——拒绝写 binding.json`);
-  process.exit(1);
-}
-console.log(`[bind] PASS 发布必需部件齐全（整包 full，${coverage.present.length} 项）`);
-
-// ①⁗ P0/V09-45：引用闭包——入口所引用的 chunk/CSS/资源必须都在场且都在冻结构建清单里
-// （不是"重新扫一遍目录当完整清单"：引用由入口文件内容解析，删掉仍被引用的产物会被判出来）。
-const closure = collectReferencedOutputs(ROOT, { scope: "full", manifestPaths: manifest.entries.map((e) => e.path) });
-if (!closure.ok) {
-  for (const p of closure.missing) console.error(`[bind]   FAIL 引用的产物缺失：${p}`);
-  for (const p of closure.not_in_manifest) console.error(`[bind]   FAIL 引用的产物不在冻结构建清单里：${p}`);
-  for (const p of closure.errors) console.error(`[bind]   FAIL 读产物失败：${p}`);
-  console.error("[bind] FAIL 发布引用闭包不完整——拒绝写 binding.json");
-  process.exit(1);
-}
-console.log(
-  `[bind] PASS 引用闭包完整（入口 ${closure.entries.length} 个 → 引用 ${closure.referenced.length} 项产物，均在场且在清单内）`,
-);
+const manifest = verdict.manifest;
+const artifact = verdict.artifact;
+const coverage = verdict.coverage;
+const closure = verdict.closure;
+const frozenOutput = verdict.output_manifest;
 
 const record = {
   version: 1,
@@ -117,7 +75,7 @@ const record = {
   source_fingerprint: fp.fingerprint,
   source_file_count: fp.file_count,
   manifest_sha256: manifest.manifest_sha256,
-  build_stamp: verdict.dist,
+  build_stamp: verdict.stamps.dist,
   build_identity: fields,
   input_manifest: {
     note: "两组显式构建输入集的逐文件清单（相对路径 + sha256，定序）——判据唯一定义在 scripts/lib/buildIdentity.ts",

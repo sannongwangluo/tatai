@@ -14,6 +14,7 @@
 // 可展开区，不写在正常用户要读的句子里（也不出现裸的 `**` 标记）。
 import { useState } from "react";
 import type { CoverageDesignSectionRef, FeatureItem, FeatureLedger } from "../../shared/coverageTypes";
+import { implementationInterpretation } from "../../shared/implementationReadout";
 
 /** 清单读口失败的人话现场（unsupported 与业务失败分开） */
 export interface FeatureLedgerErrorView {
@@ -57,17 +58,8 @@ export interface FeatureLedgerBundle {
 
 // ── 维度取值 → 人话（不靠颜色；绿色只在 verification 一档出现） ──
 
-const IMPL_LABEL: Record<string, string> = {
-  no_run_record: "无运行记录",
-  not_started: "未开始",
-  in_progress: "进行中",
-  result_submitted: "结果已提交",
-  blocked: "阻塞",
-  cancelled: "已取消",
-};
-
 const DISPLAY_LABEL: Record<string, string> = {
-  planned: "已规划（还没有执行）",
+  planned: "验证尚未完成",
   in_progress: "正在实现",
   pending_verification: "结果待验证",
   verified: "要求的验证已通过",
@@ -89,10 +81,6 @@ const ACCEPT_LABEL: Record<string, string> = {
   rejected: "你已退回",
   accepted_known_limit: "你已接受（含已知限制）",
 };
-
-function implLabel(state: string): string {
-  return IMPL_LABEL[state] ?? state;
-}
 
 /** 绿色只取 verification：`display_status=verified ∧ evidence_state=verified`（复用 canonical 判据） */
 function verificationIsGreen(item: FeatureItem): boolean {
@@ -153,7 +141,7 @@ function agentTodoReasons(item: FeatureItem): string[] {
     if (item.verification.missing.length > 0) out.push(`还差 ${item.verification.missing.length} 项验证证据`);
     else out.push("还没有有效验证证据");
   }
-  if (item.implementation.state === "no_run_record") out.push("还没有运行记录");
+  if (item.implementation.state === "no_run_record") out.push("执行结果尚未登记");
   else if (item.implementation.state === "blocked") out.push("当前阻塞");
   if (item.provenance.unmapped.length > 0) out.push("需求还没映射到功能");
   if (item.provenance.pending_leads.length > 0) out.push("有未审定线索（模型提案，待审）");
@@ -711,6 +699,7 @@ function FeatureLedgerItem({
 }) {
   const dc = item.design_coverage.state;
   const green = verificationIsGreen(item);
+  const implementation = item.implementation.interpretation ?? implementationInterpretation(item.implementation, item.verification);
   const isActive =
     activeSectionLine !== null &&
     item.design_section_refs.some((r) => r.status === "located" && r.line === activeSectionLine);
@@ -756,7 +745,7 @@ function FeatureLedgerItem({
         </span>
         <span data-ledger-dim="implementation" className="tt-fl-dim">
           <span className="tt-fl-dim-label">实现</span>
-          <span className="tt-fl-dim-value">{implLabel(item.implementation.state)}</span>
+          <span className="tt-fl-dim-value">{implementation.label}</span>
         </span>
         <span data-ledger-dim="verification" className="tt-fl-dim">
           <span className="tt-fl-dim-label">验证</span>
@@ -841,7 +830,9 @@ function FeatureLedgerItem({
             <dt>功能 ID</dt>
             <dd>{item.item_id}</dd>
             <dt>实现依据</dt>
-            <dd>{item.implementation.basis ?? "（账本没有运行投影）"}</dd>
+            <dd>{implementation.note} · {item.implementation.basis ?? "（账本没有运行投影）"}
+              {item.implementation.result_registration !== undefined && <span> · 已登记：{item.implementation.result_registration.submitted_task_ids.join("、") || "无"}；未登记：{item.implementation.result_registration.pending_task_ids.join("、") || "无"}</span>}
+            </dd>
             <dt>验证有效版本</dt>
             <dd>{item.verification.effective_version ?? "（拿不到）"}</dd>
             <dt>缺的证据</dt>

@@ -13,8 +13,18 @@
 //     "存不下现场"而崩掉。
 import { useCallback, useSyncExternalStore } from "react";
 
-/** 主工作面页面（§3.1 主导航六个 + 辅助入口两个）；V09-62 起「交付总览」为人的默认入口 */
-export type ViewKey = "delivery" | "arch" | "design" | "plan" | "chat" | "live" | "overview" | "terminal";
+/** 主工作面页面（§3.1 主导航六个 + 辅助入口三个）；V09-62 起「交付总览」为人的默认入口；
+ *  V09-70 起辅助入口「维护诊断」组新增「运行诊断」（`diagnostics`，DESIGN §3.18，与终端并列）。 */
+export type ViewKey =
+  | "delivery"
+  | "arch"
+  | "design"
+  | "plan"
+  | "chat"
+  | "live"
+  | "overview"
+  | "terminal"
+  | "diagnostics";
 
 export interface ProjectScope {
   /** 当前页面（每项目各记各的） */

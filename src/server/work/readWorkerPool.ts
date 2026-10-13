@@ -20,6 +20,292 @@ import { fileURLToPath } from "node:url";
 import os from "node:os";
 import { Worker } from "node:worker_threads";
 import { runReadJobLocal, type ReadJobKind } from "./readJobs";
+import { toIso } from "../time";
+import {
+  RUNTIME_DIAGNOSTICS_INCIDENT_LIMIT,
+  isRuntimeJobKind,
+  type RuntimeIncident,
+  type RuntimeIncidentOutcome,
+  type RuntimeJobKind,
+  type RuntimeReasonCode,
+  type RuntimeTimingStat,
+} from "../../shared/runtimeDiagnostics";
+
+// ═══ V09-69（DESIGN §3.18／§6.15）：有界**内存**运行遥测 ═══════════════════════════════
+// 为什么收在池里：作业的排队/开始/成功/失败/超时/取消**只有池知道**（生命周期点在此）。
+// 硬口径：**只内存**（不落账本/不写事件）、**有界**（incidents ≤ 40、时延样本环 ≤ 256）；只记
+// **异常**进 incidents（成功只更新新鲜度）；正常恢复后 incidents **历史保留**、当前告警随状态回正。
+const TIMING_SAMPLE_LIMIT = 256;
+/** `byProject` 的**容量上限**（R69-04）：超出按最旧淘汰（LRU 触达），不随 distinct project_id 无界增长。 */
+export const RUNTIME_TELEMETRY_MAX_PROJECTS = 64;
+/** incident reason 是**受控模板**（R69-05）：不含 `err.message`/路径/query/正文原文 */
+const INCIDENT_REASON_TEMPLATE: Record<RuntimeIncidentOutcome, string> = {
+  failed: "只读作业失败（结构化错误，详见宿主日志）",
+  timed_out: "只读作业超时未返回（已取消该 worker，不占住队列）",
+  aborted: "只读作业被调用方主动取消（正常收口，不算故障）",
+  rejected_full: "只读作业队列已满（有界拒绝，稍后重试）",
+  rejected_group_full: "单分组排队已达上限（有界拒绝，单项目不占满队列）",
+  unavailable: "只读 worker 池不可用（未回退主线程）",
+};
+/** 结构化错误码闭集形态：非法一律回退，避免把 query/token/正文塞进 incident.code。 */
+const ERROR_CODE_RE = /^[A-Z][A-Z0-9_]{0,79}$/;
+function safeErrorCode(code: string | null | undefined, fallback: string): string {
+  return typeof code === "string" && ERROR_CODE_RE.test(code) ? code : fallback;
+}
+
+interface PendingJobTelemetry {
+  /** 稳定作业种类闭集；未知 kind 记 null（R69-07：不默认误标成 `entry`） */
+  kind: RuntimeJobKind | null;
+  project_id: string | null;
+  queued_at: number;
+  started_at: number | null;
+}
+interface AnomalySignal {
+  at: number;
+  outcome: RuntimeIncidentOutcome;
+  code: RuntimeReasonCode;
+}
+interface ProjectSignal {
+  last_success_at: number | null;
+  last_anomaly: AnomalySignal | null;
+  last_rejection_at: number | null;
+}
+
+interface TelemetryState {
+  incidents: RuntimeIncident[];
+  pending: Map<number, PendingJobTelemetry>;
+  queueSamples: number[];
+  executionSamples: number[];
+  totalSamples: number[];
+  lastSuccessAt: number | null;
+  lastAnomaly: AnomalySignal | null;
+  lastRejectionAt: number | null;
+  byProject: Map<string, ProjectSignal>;
+}
+
+const ANOMALY_REASON_CODE: Record<RuntimeIncidentOutcome, RuntimeReasonCode> = {
+  failed: "READ_FAILED",
+  timed_out: "READ_TIMED_OUT",
+  aborted: "READ_ABORTED",
+  rejected_full: "QUEUE_SATURATED",
+  rejected_group_full: "QUEUE_SATURATED",
+  unavailable: "READ_WORKERS_UNAVAILABLE",
+};
+
+function newTelemetry(): TelemetryState {
+  return {
+    incidents: [],
+    pending: new Map(),
+    queueSamples: [],
+    executionSamples: [],
+    totalSamples: [],
+    lastSuccessAt: null,
+    lastAnomaly: null,
+    lastRejectionAt: null,
+    byProject: new Map(),
+  };
+}
+
+let telemetry: TelemetryState = newTelemetry();
+
+function telemetryProject(projectId: string | null): ProjectSignal | null {
+  if (projectId === null) return null;
+  let s = telemetry.byProject.get(projectId);
+  if (s === undefined) {
+    s = { last_success_at: null, last_anomaly: null, last_rejection_at: null };
+    telemetry.byProject.set(projectId, s);
+    // R69-04：有界——超出上限按**最旧**淘汰（不随项目数无界增长）。
+    while (telemetry.byProject.size > RUNTIME_TELEMETRY_MAX_PROJECTS) {
+      const oldest = telemetry.byProject.keys().next().value;
+      if (oldest === undefined || oldest === projectId) break;
+      telemetry.byProject.delete(oldest);
+    }
+  } else {
+    // LRU 触达：把该 scope 移到末尾（最近使用），淘汰时先丢最久未用的。
+    telemetry.byProject.delete(projectId);
+    telemetry.byProject.set(projectId, s);
+  }
+  return s;
+}
+
+function pushIncident(inc: RuntimeIncident): void {
+  telemetry.incidents.push(inc);
+  if (telemetry.incidents.length > RUNTIME_DIAGNOSTICS_INCIDENT_LIMIT) {
+    telemetry.incidents.splice(0, telemetry.incidents.length - RUNTIME_DIAGNOSTICS_INCIDENT_LIMIT);
+  }
+}
+
+function pushSample(ring: number[], v: number): void {
+  ring.push(v);
+  if (ring.length > TIMING_SAMPLE_LIMIT) ring.splice(0, ring.length - TIMING_SAMPLE_LIMIT);
+}
+
+function statOf(ring: number[]): RuntimeTimingStat | null {
+  if (ring.length === 0) return null;
+  let min = ring[0]!;
+  let max = ring[0]!;
+  let sum = 0;
+  for (const v of ring) {
+    if (v < min) min = v;
+    if (v > max) max = v;
+    sum += v;
+  }
+  return { count: ring.length, min_ms: min, max_ms: max, avg_ms: Math.round(sum / ring.length) };
+}
+
+/**
+ * 「尚未恢复的故障」：上一条异常**不是取消**，且其后**没有**更新的成功观测（成功即解除对应故障）。
+ * 供 `noteAnomaly` 判定普通取消能否覆盖当前异常信号（ND1）——全局/项目 scope 各用各自的信号。
+ */
+function hasOutstandingFault(lastAnomaly: AnomalySignal | null, lastSuccessAt: number | null): boolean {
+  if (lastAnomaly === null || lastAnomaly.outcome === "aborted") return false;
+  return lastSuccessAt === null || lastSuccessAt < lastAnomaly.at;
+}
+
+function noteAnomaly(outcome: RuntimeIncidentOutcome, at: number, projectId: string | null): void {
+  const signal: AnomalySignal = { at, outcome, code: ANOMALY_REASON_CODE[outcome] };
+  const p = telemetryProject(projectId);
+  if (outcome === "aborted") {
+    // ND1（2026-10-13 复审判据）：普通取消**只作历史**（incidents 已记），**不覆盖尚未恢复的故障信号**。
+    // 否则「成功 → 真失败/超时 → 普通取消（无新成功）」会用最后一次取消盖掉真故障，而
+    // `deriveRuntimeHealth` 忽略 aborted ⇒ 掩盖故障落 healthy。全局/项目 scope 各自独立判定。
+    if (!hasOutstandingFault(telemetry.lastAnomaly, telemetry.lastSuccessAt)) telemetry.lastAnomaly = signal;
+    if (p !== null && !hasOutstandingFault(p.last_anomaly, p.last_success_at)) p.last_anomaly = signal;
+    return;
+  }
+  telemetry.lastAnomaly = signal;
+  if (p !== null) p.last_anomaly = signal;
+}
+
+/** settle：把在途作业结算成耗时样本 + 返回入账依据（作业不在册则只给 now） */
+function settleTelemetry(id: number): {
+  job: PendingJobTelemetry | null;
+  now: number;
+  queue_ms: number | null;
+  execution_ms: number | null;
+  total_ms: number | null;
+} {
+  const job = telemetry.pending.get(id) ?? null;
+  const at = Date.now();
+  if (job === null) return { job: null, now: at, queue_ms: null, execution_ms: null, total_ms: null };
+  const queueMs = job.started_at === null ? null : Math.max(0, job.started_at - job.queued_at);
+  const executionMs = job.started_at === null ? null : Math.max(0, at - job.started_at);
+  const totalMs = Math.max(0, at - job.queued_at);
+  telemetry.pending.delete(id);
+  if (queueMs !== null) pushSample(telemetry.queueSamples, queueMs);
+  if (executionMs !== null) pushSample(telemetry.executionSamples, executionMs);
+  pushSample(telemetry.totalSamples, totalMs);
+  return { job, now: at, queue_ms: queueMs, execution_ms: executionMs, total_ms: totalMs };
+}
+
+function noteQueued(id: number, kind: ReadJobKind, projectId: string | null): void {
+  telemetry.pending.set(id, {
+    kind: isRuntimeJobKind(kind) ? kind : null,
+    project_id: projectId,
+    queued_at: Date.now(),
+    started_at: null,
+  });
+}
+function noteStarted(id: number): void {
+  const job = telemetry.pending.get(id);
+  if (job !== undefined && job.started_at === null) job.started_at = Date.now();
+}
+function noteSucceeded(id: number): void {
+  const s = settleTelemetry(id);
+  telemetry.lastSuccessAt = s.now;
+  const p = telemetryProject(s.job?.project_id ?? null);
+  if (p !== null) p.last_success_at = s.now;
+}
+function noteAnomalyOutcome(id: number, outcome: RuntimeIncidentOutcome, code: string | null): void {
+  const s = settleTelemetry(id);
+  const projectId = s.job?.project_id ?? null;
+  pushIncident({
+    at: toIso(new Date(s.now)),
+    outcome,
+    job_kind: s.job?.kind ?? null,
+    project_id: projectId,
+    code: safeErrorCode(code, ANOMALY_REASON_CODE[outcome]),
+    reason: INCIDENT_REASON_TEMPLATE[outcome],
+    queue_ms: s.queue_ms,
+    execution_ms: s.execution_ms,
+    total_ms: s.total_ms,
+  });
+  noteAnomaly(outcome, s.now, projectId);
+}
+function noteRejected(kind: ReadJobKind, projectId: string | null, outcome: "rejected_full" | "rejected_group_full"): void {
+  const at = Date.now();
+  pushIncident({
+    at: toIso(new Date(at)),
+    outcome,
+    job_kind: isRuntimeJobKind(kind) ? kind : null,
+    project_id: projectId,
+    code: "READ_QUEUE_FULL",
+    reason: INCIDENT_REASON_TEMPLATE[outcome],
+    queue_ms: null,
+    execution_ms: null,
+    total_ms: null,
+  });
+  telemetry.lastRejectionAt = at;
+  const p = telemetryProject(projectId);
+  if (p !== null) p.last_rejection_at = at;
+  noteAnomaly(outcome, at, projectId);
+}
+function noteWorkersUnavailable(count: number, projectId: string | null): void {
+  if (count <= 0) return;
+  const at = Date.now();
+  pushIncident({
+    at: toIso(new Date(at)),
+    outcome: "unavailable",
+    job_kind: null,
+    project_id: projectId,
+    code: "READ_WORKERS_UNAVAILABLE",
+    reason: INCIDENT_REASON_TEMPLATE.unavailable,
+    queue_ms: null,
+    execution_ms: null,
+    total_ms: null,
+  });
+  noteAnomaly("unavailable", at, projectId);
+}
+
+/** 只读遥测快照（供运行诊断 builder 与验证脚本；不泄漏可变引用） */
+export interface RuntimeTelemetrySnapshot {
+  incidents: RuntimeIncident[];
+  last_success_at: number | null;
+  last_anomaly: AnomalySignal | null;
+  last_rejection_at: number | null;
+  by_project: Record<string, { last_success_at: number | null; last_anomaly: AnomalySignal | null; last_rejection_at: number | null }>;
+  queue_ms: RuntimeTimingStat | null;
+  execution_ms: RuntimeTimingStat | null;
+  total_ms: RuntimeTimingStat | null;
+  samples: number;
+}
+
+export function runtimeTelemetry(): RuntimeTelemetrySnapshot {
+  const byProject: RuntimeTelemetrySnapshot["by_project"] = {};
+  for (const [k, v] of telemetry.byProject) {
+    byProject[k] = {
+      last_success_at: v.last_success_at,
+      last_anomaly: v.last_anomaly === null ? null : { ...v.last_anomaly },
+      last_rejection_at: v.last_rejection_at,
+    };
+  }
+  return {
+    incidents: telemetry.incidents.slice(),
+    last_success_at: telemetry.lastSuccessAt,
+    last_anomaly: telemetry.lastAnomaly === null ? null : { ...telemetry.lastAnomaly },
+    last_rejection_at: telemetry.lastRejectionAt,
+    by_project: byProject,
+    queue_ms: statOf(telemetry.queueSamples),
+    execution_ms: statOf(telemetry.executionSamples),
+    total_ms: statOf(telemetry.totalSamples),
+    samples: telemetry.totalSamples.length,
+  };
+}
+
+/** 测试用重置（不暴露给产品路径；验证脚本用来隔离遥测） */
+export function __resetRuntimeDiagnosticsForTest(): void {
+  telemetry = newTelemetry();
+}
 
 /** worker 不可用/起不来（明确错误；不在主线程重算） */
 export class ReadWorkersUnavailable extends Error {
@@ -310,10 +596,12 @@ class ReadWorkerPool {
     if (job.queued.cleanup !== null) job.queued.cleanup();
     if (m.ok === true) {
       this.completed += 1;
+      noteSucceeded(m.id);
       job.queued.resolve(m.result);
     } else {
       this.failed += 1;
       const err = m.error as { message?: string; code?: string; detail?: Record<string, unknown> } | undefined;
+      noteAnomalyOutcome(m.id, "failed", err?.code ?? "READ_JOB_FAILED");
       job.queued.reject(
         new ReadJobFailed(err?.code ?? "READ_JOB_FAILED", err?.message ?? "worker 只读作业失败", err?.detail ?? {}),
       );
@@ -330,13 +618,19 @@ class ReadWorkerPool {
     const idx = this.slots.indexOf(slot);
     if (idx >= 0) this.slots.splice(idx, 1);
     if (slot.busy !== null) {
-      const job = this.pending.get(slot.busy);
-      this.pending.delete(slot.busy);
+      const id = slot.busy;
+      const job = this.pending.get(id);
+      this.pending.delete(id);
       slot.busy = null;
       if (job !== undefined) {
         if (job.timer !== null) clearTimeout(job.timer);
         if (job.queued.cleanup !== null) job.queued.cleanup();
         this.failed += 1;
+        // V09-69 遥测：按真实收口原因记异常（超时/取消/worker 故障），不把三者混成一类。
+        // R69-05：reason 只出受控模板——`err.message`（可能含路径/正文）不内联进报告。
+        if (err instanceof ReadJobTimeout) noteAnomalyOutcome(id, "timed_out", "READ_JOB_TIMEOUT");
+        else if (err instanceof ReadJobAborted) noteAnomalyOutcome(id, "aborted", "READ_JOB_ABORTED");
+        else noteAnomalyOutcome(id, "failed", "READ_JOB_FAILED");
         job.queued.reject(err ?? new Error("worker 已退出，在途只读作业未完成"));
       }
     }
@@ -417,11 +711,18 @@ class ReadWorkerPool {
         if (slot === null) {
           // worker 起不来：把队列里的作业**明确失败**（不静默本地重算），并解除各自的 signal 监听（不泄漏）。
           const err = new ReadWorkersUnavailable(this.startError ?? "只读 worker 不可用");
+          let rejectedCount = 0;
+          // R69-07：如实带上被拒作业所属项目（只有一个 distinct 项目时归它，否则记全局）——项目过滤时能看到自身失败。
+          const scopeProjects = new Set<string>();
           for (const q of this.queue) {
             this.failed += 1;
+            rejectedCount += 1;
+            const key = projectKeyOf(q.args);
+            if (key !== "") scopeProjects.add(key);
             if (q.cleanup !== null) q.cleanup();
             q.reject(err);
           }
+          if (rejectedCount > 0) noteWorkersUnavailable(rejectedCount, scopeProjects.size === 1 ? [...scopeProjects][0]! : null);
           this.queue = [];
           return;
         }
@@ -444,6 +745,7 @@ class ReadWorkerPool {
     }, this.opts.timeoutMs);
     timer.unref();
     this.pending.set(job.id, { queued: job, timer, slot });
+    noteStarted(job.id);
     try {
       slot.worker.postMessage({ id: job.id, kind: job.kind, args: job.args });
     } catch (e) {
@@ -453,6 +755,7 @@ class ReadWorkerPool {
       slot.worker.unref();
       if (job.cleanup !== null) job.cleanup();
       this.failed += 1;
+      noteAnomalyOutcome(job.id, "failed", "READ_JOB_FAILED");
       job.reject(e);
     }
   }
@@ -465,15 +768,18 @@ class ReadWorkerPool {
     if (this.stopped) return Promise.reject(new ReadWorkersUnavailable("只读 worker 池已停止"));
     if (this.opts.forceLocal) return Promise.resolve().then(() => runReadJobLocal(kind, args));
     if (opts.signal?.aborted === true) return Promise.reject(new ReadJobAborted("只读作业在提交前已被取消"));
+    const telemetryProject = projectKeyOf(args) || null;
     // 满则显式拒绝（有界；不无限排队）
     if (this.queue.length >= this.opts.queueLimit) {
       this.rejectedFull += 1;
+      noteRejected(kind, telemetryProject, "rejected_full");
       return Promise.reject(new ReadQueueFull(`只读作业队列已满（上限 ${this.opts.queueLimit}）——稍后重试`));
     }
     // 单分组上限：一个项目/类别不能把整条队列占满（别的项目仍有位置）——有限资源下的多项目公平。
     const { group, prep } = groupOf(kind, args);
     if (this.queue.filter((q) => q.group === group).length >= this.opts.groupLimit) {
       this.rejectedGroupFull += 1;
+      noteRejected(kind, telemetryProject, "rejected_group_full");
       return Promise.reject(
         new ReadQueueFull(`分组 ${group} 的排队已达上限 ${this.opts.groupLimit}（单项目不占满队列）——稍后重试`),
       );
@@ -492,12 +798,14 @@ class ReadWorkerPool {
           const idx = this.queue.indexOf(job);
           if (idx >= 0) {
             this.queue.splice(idx, 1);
+            noteAnomalyOutcome(job.id, "aborted", "READ_JOB_ABORTED");
             reject(new ReadJobAborted("只读作业被调用方取消"));
           }
         };
         opts.signal.addEventListener("abort", onAbort, { once: true });
         job.cleanup = () => opts.signal?.removeEventListener("abort", onAbort);
       }
+      noteQueued(job.id, kind, telemetryProject);
       this.queue.push(job);
       this.pump();
     });

@@ -29,6 +29,7 @@ import { applySupplementInput, MAX_SUP_EDGES, MAX_SUP_NODES } from "../arch/supp
 import { sanitizeErrorMessage } from "./redact";
 import { getProject } from "./registry";
 import { workstationDir } from "./workstation";
+import { resolveCurrentDevRoot } from "./work/workspaces";
 import type { ToolSpec } from "./flash";
 
 /** read_file 单次读回的字符上限（超长截前段并注明总量） */
@@ -787,9 +788,14 @@ export interface ChatToolResult {
  */
 export function executeChatTool(projectId: string, name: string, argsJson: string): ChatToolResult {
   try {
-    const project = getProject(projectId);
-    if (!project) throw new Error(`项目不存在: ${projectId}`);
-    const root = project.path;
+    if (!getProject(projectId)) throw new Error(`项目不存在: ${projectId}`);
+    // V09-63 源根贯通：聊天工具读的是**当前开发工作区**的源码（§6.14 第 6 段）；
+    // 坏指针/目录不在 → 明确失败，不静默回退注册表锚点根。
+    const dev = resolveCurrentDevRoot(projectId);
+    if (dev.root === null) {
+      throw new Error(`当前开发指针不可用（source=${dev.source}）：${dev.blocked_reason ?? "目标工作区不可用"}——拒绝读源，不静默回退项目根`);
+    }
+    const root = dev.root;
     let args: Record<string, unknown> = {};
     try {
       args = argsJson.trim() === "" ? {} : (JSON.parse(argsJson) as Record<string, unknown>);

@@ -47,7 +47,7 @@ const USER_ONLY_OPS = new Set(["human_acceptance", "acceptance", "accepted_risk"
 const ENVELOPE = ["op", "project_id", "role", "actor_id", "change_id", "occurred_at"] as const;
 const OP_KEYS: Record<Op, readonly string[]> = {
   correction: [...ENVELOPE, "correction_id", "expected_revision", "correction"],
-  store: ["op", "project_id", "role", "kind", "content", "summary", "created_by", "binding", "source_ref", "source_manifest", "occurred_at"],
+  store: ["op", "project_id", "role", "kind", "content", "summary", "created_by", "binding", "source_ref", "source_manifest", "workspace_id", "occurred_at"],
   read: ["op", "project_id", "sha256"],
   submission: [
     ...ENVELOPE,
@@ -280,6 +280,11 @@ export const recordWorkEvidenceTool: McpTool = {
         },
       },
       source_ref: { type: "string", description: "store：来源引用" },
+      workspace_id: {
+        type: "string",
+        description:
+          "store：本条证据作用的目标工作区 id（DESIGN.md §6.14 第 6 段）。给了它，source_manifest 按**该工作区**当前开发根现读，而不是从 .工作台 目录硬推的项目主根。**只传工作区 id**（不接受绝对路径）；未知/已回收工作区 → 拒绝存证，不回落主根。",
+      },
       sha256: { type: "string", description: "read：证据内容哈希" },
       record_id: { type: "string", description: "submission/self_check/independent_audit/fix/retest：记录 id" },
       correction_id: { type: "string", description: "correction：稳定纠正实体id" },
@@ -517,6 +522,7 @@ export const recordWorkEvidenceTool: McpTool = {
           role,
           binding: binding as never,
           source_ref: strOrUndef(args, "source_ref") ?? null,
+          ...(strOrUndef(args, "workspace_id") === undefined ? {} : { workspace_id: str(args, "workspace_id") }),
           ...(hasManifest ? { source_manifest: args.source_manifest } : {}),
           ...(occurredAt === undefined ? {} : { occurred_at: occurredAt }),
         });

@@ -248,6 +248,12 @@ export const claimTaskTool: McpTool = {
       change_id: { type: "string", description: "本次变更批次 id" },
       expected_revision: { type: "number", description: "领取前读到的实体版本（project_entry 的 reasons 给了 task_revision）" },
       workspace: { type: "string", description: "隔离工作目录（缺省 .工作台/runs/<task>/<attempt>；隔离要执行器真落实）" },
+      workspace_id: {
+        type: "string",
+        description:
+          "V09-63（DESIGN §6.13/§6.14）：目标**工作区 id**（manage_workspace 登记的工作区；`:main` 派生）。" +
+          "绑定时认领事件带 workspace_id、入口读回同一 id；未知/不属本项目/已回收一律拒绝认领。与隔离工作目录 workspace 不是一回事",
+      },
       lease_ms: { type: "number", description: `租约时长毫秒（缺省 ${DEFAULT_LEASE_MS}）` },
       attempt: { type: "number", description: "第几次尝试（重派 +1）" },
       takeover_basis: {
@@ -327,6 +333,7 @@ export const claimTaskTool: McpTool = {
               ? {}
               : { expected_revision: numOrNull(args, "expected_revision")! }),
             ...(strOrNull(args, "workspace") === null ? {} : { workspace: str(args, "workspace") }),
+            ...(strOrNull(args, "workspace_id") === null ? {} : { workspace_id: str(args, "workspace_id") }),
             ...(numOrNull(args, "lease_ms") === null ? {} : { lease_ms: numOrNull(args, "lease_ms")! }),
             ...(numOrNull(args, "attempt") === null ? {} : { attempt: numOrNull(args, "attempt")! }),
             ...(strOrNull(args, "takeover_basis") === null ? {} : { takeover_basis: str(args, "takeover_basis") }),
@@ -351,6 +358,7 @@ export const claimTaskTool: McpTool = {
             change_id: changeId,
             claim_token: token,
             expected_revision: expected,
+            ...(strOrNull(args, "workspace_id") === null ? {} : { workspace_id: str(args, "workspace_id") }),
             ...(numOrNull(args, "lease_ms") === null ? {} : { lease_ms: numOrNull(args, "lease_ms")! }),
           },
           submitter,

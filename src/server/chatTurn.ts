@@ -23,6 +23,7 @@
 import path from "node:path";
 import { CHAT_TOOLS, collectFiles, executeChatTool } from "./chatTools";
 import { getProject } from "./registry";
+import { resolveCurrentDevRoot } from "./work/workspaces";
 import {
   buildContextPackage,
   buildResumeCheckpoint,
@@ -155,18 +156,22 @@ export async function* runChatTurn(
   let manifestState: { files: string[]; truncated: boolean; skippedBinary: number } | null | undefined;
   const getManifest = (): { files: string[]; truncated: boolean; skippedBinary: number } | null => {
     if (manifestState !== undefined) return manifestState;
-    const project = getProject(projectId);
-    if (!project) return null;
+    if (!getProject(projectId)) return null;
+    // V09-63 源根贯通：覆盖清单收集的是**当前开发工作区**的源码（§6.14 第 6 段）；
+    // 坏指针/目录不在 → 如实给不出清单（返回 null），不静默回退注册表锚点根。
+    const dev = resolveCurrentDevRoot(projectId);
+    if (dev.root === null) return null;
+    const sourceRoot = dev.root;
     const scopes = (opts.coverageScope ?? []).filter((s) => typeof s === "string" && s.trim() !== "");
     let collected: { files: string[]; truncated: boolean };
     if (scopes.length === 0) {
-      collected = collectFiles(project.path, "", COVERAGE_MANIFEST_MAX_FILES);
+      collected = collectFiles(sourceRoot, "", COVERAGE_MANIFEST_MAX_FILES);
     } else {
       // 范围口径：多个目录的并集（去重排序保持确定性）；目录有效性由 ask_flash 侧先校验
       const files = new Set<string>();
       let truncated = false;
       for (const rel of scopes) {
-        const r = collectFiles(project.path, rel, COVERAGE_MANIFEST_MAX_FILES);
+        const r = collectFiles(sourceRoot, rel, COVERAGE_MANIFEST_MAX_FILES);
         for (const f of r.files) files.add(f);
         truncated = truncated || r.truncated;
       }

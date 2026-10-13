@@ -42,6 +42,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { getProject } from "../registry";
+import type { WorkspaceDevResolution } from "../../shared/workspaceTypes";
 import { nowIso } from "../time";
 import { withFileLock } from "../fileLock";
 import { appendJsonlLine } from "../lineStream";
@@ -80,7 +81,10 @@ export interface DocumentSource {
   rel_path: string;
   /** 本机绝对路径（排错用；HTTP 层不外发） */
   abs_path: string;
+  /** 注册表锚点根（中央修订库/基线/账本**永远**从这里派生；**不被工作区指针改写**，§6.14 第 1 段） */
   project_root: string;
+  /** 图纸**当前源**所在的根：默认 = `project_root`；注入当前开发根后 = 该开发工作区根（§6.13 第 4 段） */
+  source_root: string;
 }
 
 /** 章节索引一条（标题路径 + 行范围 + 该节正文逐字节哈希） */
@@ -266,9 +270,88 @@ function relBackOutside(rel: string): boolean {
 }
 
 /**
+ * 当前开发根解析器（注入式；V09-64）。`documents.ts` **不静态 import** `workspaces.ts`
+ * （`workspace.ts → workstation.ts → documents.ts` 会成环）：由入口/服务启动时注入
+ * `resolveCurrentDevRoot`（`workspaces.ts` 导出）。未注入 → 图纸源按注册表锚点根（旧行为，逐字段兼容）。
+ */
+export type CurrentDevRootResolver = (projectId: string, dataDir?: string) => WorkspaceDevResolution;
+let currentDevRootResolver: CurrentDevRootResolver | null = null;
+export function setCurrentDevRootResolver(fn: CurrentDevRootResolver | null): void {
+  currentDevRootResolver = fn;
+}
+
+/**
+ * 注册表锚点根（`ProjectRecord.path`）：**中央**修订库/基线/账本/证据的定位根，**不随开发指针改写**
+ * （§6.14 第 1 段）。只读注册表——指针坏掉/源解析抛错都不影响按锚点读历史固定候选，
+ * 中央恢复路径不连坐当前开发源。
+ */
+export function projectAnchorRoot(projectId: string, dataDir?: string): string {
+  const project = getProject(projectId, dataDir);
+  if (!project) {
+    throw new WorkError("INVALID_COMMAND", `项目不存在: ${projectId}`, { project_id: projectId });
+  }
+  return path.resolve(project.path);
+}
+
+/**
+ * 图纸**当前源**的根：解析当前开发工作区根（§6.13 第 4 段）。
+ *   ① 未注入解析器 → 注册表锚点根（旧行为，逐字段兼容）；
+ *   ② 注入后解析器抛错，或它明确判定「当前开发指针不可用」（`root=null`，如指向不存在/已回收的工作区）
+ *      → **明确拒绝**，绝不静默回落锚点根：回落会把**旧主根**的图纸当成当前源读出来
+ *      （"读了错版本"比"读不到"更糟；§6.14 第 2/10 段同一口径）。
+ */
+function resolveCurrentSourceRoot(projectId: string, dataDir: string | undefined, anchorRoot: string): string {
+  if (currentDevRootResolver === null) return anchorRoot;
+  let dev: WorkspaceDevResolution;
+  try {
+    dev = currentDevRootResolver(projectId, dataDir);
+  } catch (e) {
+    throw new WorkError(
+      "INVALID_COMMAND",
+      `当前开发源解析失败：${(e as Error).message}——拒绝读图纸源，不静默回退项目根（DESIGN.md §6.13／§6.14 第 2/10 段）`,
+      { project_id: projectId, reason: "dev_source_unresolved" },
+    );
+  }
+  if (dev.root === null || dev.root === "") {
+    throw new WorkError(
+      "INVALID_COMMAND",
+      `当前开发指针不可用（source=${dev.source}）：${dev.blocked_reason ?? "目标工作区不可用"}` +
+        "——拒绝读图纸源，不静默回退项目根（DESIGN.md §6.13／§6.14 第 2/10 段）",
+      {
+        project_id: projectId,
+        reason: "dev_source_blocked",
+        workspace_id: dev.workspace_id,
+        dev_source: dev.source,
+      },
+    );
+  }
+  return path.resolve(dev.root);
+}
+
+/**
+ * 托管文档写守卫（注入式；V09-64；§6.14 第 6 段）：对冻结候选源目录的写入拒绝。
+ * 由入口注入 `workspaceGuard.assertHostedWriteAllowed`（同理由：避免 documents → workspaceGuard → workspaces 成环）。
+ * 未注入 → 不在此拒（旧行为；生产接线由入口负责）。
+ */
+export type DocumentWriteGuard = (input: { projectId: string; dataDir?: string; targetRoot: string; kind: "document" }) => void;
+let documentWriteGuard: DocumentWriteGuard | null = null;
+export function setDocumentWriteGuard(fn: DocumentWriteGuard | null): void {
+  documentWriteGuard = fn;
+}
+
+/** 调用注入的托管文档写守卫（若已接线）：落在冻结候选源目录里的文档写入在此拒绝 */
+export function assertDocumentWriteAllowed(input: { projectId: string; dataDir?: string; targetRoot: string }): void {
+  if (documentWriteGuard === null) return;
+  documentWriteGuard({ ...input, kind: "document" });
+}
+
+/**
  * 解析一份图纸的**唯一当前源**（DESIGN.md §2.9）。
- * 塔台自身固定 repo 根 DESIGN.md / PLAN.md（登记字段对塔台不生效——"固定"就是不接受覆盖）；
+ * 塔台自身固定**文件名** repo 根 DESIGN.md / PLAN.md（登记字段对塔台不生效——"固定"就是不接受覆盖）；
  * 其他项目按注册表登记的项目根内相对路径，缺省 `.工作台/design.md` / `.工作台/plan.md`。
+ * **V09-64**：注入了当前开发根解析器时，图纸源根用**当前开发工作区根**（§6.13 第 4 段），
+ * **塔台自身同样遵循**——固定的是文件名/相对位置，不是旧主根，`abs_path` 因此指向真实开发根；
+ * `project_root`（中央修订库/基线/账本锚点）**始终**是注册表锚点根，不被指针改写。
  */
 export function resolveDocumentSource(
   projectId: string,
@@ -281,35 +364,43 @@ export function resolveDocumentSource(
   }
   const root = path.resolve(project.path);
   const isTatai = project.self_managed === true || project.id === "tatai";
+  // 当前开发根（塔台自身同样遵循；坏指针/解析失败在此**明确拒绝**，绝不静默读旧主根）
+  const sourceRoot = resolveCurrentSourceRoot(projectId, dataDir, root);
   if (isTatai) {
     const rel = kind === "design" ? TATAI_DESIGN_REL : TATAI_PLAN_REL;
     return {
       kind,
       origin: "tatai_root",
       rel_path: rel,
-      abs_path: path.join(root, rel),
+      abs_path: path.join(sourceRoot, rel),
       project_root: root,
+      source_root: sourceRoot,
     };
   }
   const registered = (kind === "design" ? project.design_path : project.plan_path)?.trim() ?? "";
   if (registered !== "") {
-    const abs = resolveRegisteredPath(root, kind, registered, { project_id: projectId });
+    const abs = resolveRegisteredPath(sourceRoot, kind, registered, { project_id: projectId });
     return {
       kind,
       origin: "registered",
-      rel_path: path.relative(root, abs).split(path.sep).join("/"),
+      rel_path: path.relative(sourceRoot, abs).split(path.sep).join("/"),
       abs_path: abs,
       project_root: root,
+      source_root: sourceRoot,
     };
   }
   const rel = kind === "design" ? DEFAULT_DESIGN_REL : DEFAULT_PLAN_REL;
-  const abs = path.resolve(root, rel);
-  return { kind, origin: "default", rel_path: rel, abs_path: abs, project_root: root };
+  const abs = path.resolve(sourceRoot, rel);
+  return { kind, origin: "default", rel_path: rel, abs_path: abs, project_root: root, source_root: sourceRoot };
 }
 
-/** `.工作台/` 目录（路径只从注册表取；`workstationDir` 同一口径） */
+/**
+ * `.工作台/` 目录（路径只从注册表**锚点根**取；与 `workstationDir` 同一口径）。
+ * 中央修订库/基线/账本/证据都在这里：**不解析当前开发根**（§6.14 第 1 段），
+ * 坏指针不阻断历史固定候选的读回。
+ */
 export function projectWorkbenchDir(projectId: string, dataDir?: string): string {
-  return path.join(resolveDocumentSource(projectId, "design", dataDir).project_root, WORKBENCH_DIRNAME);
+  return path.join(projectAnchorRoot(projectId, dataDir), WORKBENCH_DIRNAME);
 }
 
 // ── 读原文 / 哈希 / 章节索引 ──
@@ -548,7 +639,8 @@ function readGitSnapshotText(
   if (rec === null) return null;
   const oid = gitOidOf(rec);
   if (oid === null) return null;
-  const root = resolveDocumentSource(projectId, kind, dataDir).project_root;
+  // 中央 Git 恢复位置按**锚点根**取（不解析当前开发源）：坏指针也要能把历史固定候选读回
+  const root = projectAnchorRoot(projectId, dataDir);
   return memoizedForDerivation("documents:git-blob-text", `${root}\u0000${oid}\u0000${rec.sha256}`, () => {
     let out: Buffer;
     try {
@@ -646,7 +738,8 @@ function revisionSnapshotAbs(
   dataDir?: string,
 ): string | null {
   if (hash === "") return null;
-  const root = resolveDocumentSource(projectId, kind, dataDir).project_root;
+  // 不可变快照按**锚点根**取（§6.14 第 1 段）：历史固定候选不因当前开发源坏掉而读不回
+  const root = projectAnchorRoot(projectId, dataDir);
   return path.join(root, revisionObjectRel(kind, hash));
 }
 

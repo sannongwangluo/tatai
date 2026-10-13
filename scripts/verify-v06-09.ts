@@ -92,6 +92,7 @@ import { REQUIREMENT_EVENT_TYPES } from "../src/server/work/requirements";
 import { CHANGE_EVENT_TYPES } from "../src/server/work/changes";
 import { BUDGET_EVENT_TYPES } from "../src/server/work/budget";
 import { SYNC_EVENT_TYPES } from "../src/server/work/sync";
+import { WORKSPACE_EVENT_TYPES } from "../src/server/work/workspaces";
 import {
   REGISTERED_EVENT_TYPES,
   registeredEventTypes,
@@ -1858,6 +1859,8 @@ async function main(): Promise<void> {
   // 2026-09-20 V06-11 并入 5 类执行事件（11 个类型，实体前缀 execution:）——期望集合按新事实逐个点名，
   // 判据仍是"恰好相等"（不许放宽成包含）。
   const registered = registeredEventTypes().sort();
+  // 2026-10-09 V09-63：工作区/候选词表（5 个类型，实体前缀 workspace: / workspace-pointer:）并入中央登记面，
+  // 与 V06-11 并入执行词表同一先例——期望集合按新事实逐个点名，判据仍是"恰好相等"（不许放宽成包含）。
   const moduleTypes = [
     ...TASK_EVENT_TYPES,
     ...FINDING_EVENT_TYPES,
@@ -1867,10 +1870,11 @@ async function main(): Promise<void> {
     ...CHANGE_EVENT_TYPES,
     ...BUDGET_EVENT_TYPES,
     ...SYNC_EVENT_TYPES,
+    ...WORKSPACE_EVENT_TYPES,
   ].sort();
   ok(
     registered.length === moduleTypes.length && registered.join(",") === moduleTypes.join(","),
-    `④-2 登记面 = 八个模块词表的并集（${registered.length} 条：task ${TASK_EVENT_TYPES.length} / finding ${FINDING_EVENT_TYPES.length} / audit ${AUDIT_EVENT_TYPES.length} / execution ${EXECUTION_EVENT_TYPES.length} / requirement ${REQUIREMENT_EVENT_TYPES.length} / change ${CHANGE_EVENT_TYPES.length} / budget ${BUDGET_EVENT_TYPES.length} / sync ${SYNC_EVENT_TYPES.length}；2026-09-20 V06-11 并入执行、T21 并入需求与变更批次、T23 并入项目预算约束、2026-09-30 V09-23 并入同步证据域）`,
+    `④-2 登记面 = 九个模块词表的并集（${registered.length} 条：task ${TASK_EVENT_TYPES.length} / finding ${FINDING_EVENT_TYPES.length} / audit ${AUDIT_EVENT_TYPES.length} / execution ${EXECUTION_EVENT_TYPES.length} / requirement ${REQUIREMENT_EVENT_TYPES.length} / change ${CHANGE_EVENT_TYPES.length} / budget ${BUDGET_EVENT_TYPES.length} / sync ${SYNC_EVENT_TYPES.length} / workspace ${WORKSPACE_EVENT_TYPES.length}；2026-09-20 V06-11 并入执行、T21 并入需求与变更批次、T23 并入项目预算约束、2026-09-30 V09-23 并入同步证据域、2026-10-09 V09-63 并入工作区与候选词表）`,
   );
   ok(
     EXECUTION_EVENT_TYPES.every((t) => registeredEventTypes().includes(t)) &&
@@ -1888,6 +1892,10 @@ async function main(): Promise<void> {
         (r.type.startsWith("change.") && r.entity_prefix === "change:") ||
         (r.type.startsWith("budget.") && r.entity_prefix === "budget:") ||
         (r.type.startsWith("sync.") && r.entity_prefix === "sync:") ||
+        // V09-63 工作区：普通工作区事件挂 workspace:，项目级指针 workspace.pointed 挂 workspace-pointer:（两条各管各的，
+        // 混用即红）——与 workspaces.ts 的 WORKSPACE_ENTITY_PREFIX / POINTER_ENTITY_PREFIX 同一约定。
+        (r.type.startsWith("workspace.") &&
+          r.entity_prefix === (r.type === "workspace.pointed" ? "workspace-pointer:" : "workspace:")) ||
         (Object.values(AUDIT_ENTITY_PREFIXES) as string[]).includes(r.entity_prefix),
     ),
     "④-2 每条登记都带实体前缀，且与各模块的实体约定一致",

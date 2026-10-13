@@ -228,27 +228,97 @@ async function main(): Promise<void> {
     ok(!ids1.includes("t2") && ids2.includes("t2"), "E 追加的新事件在下一次调用立刻可见（不沿用上次快照）", { before: ids1, after: ids2 });
   }
 
-  // ════════ F. 同一份快照共享 vs 本地三次重派生：读盘计数对照 ════════
+  // ════════ F. 共享派生 vs 非共享派生：**相同工作量**的读盘计数对照 ════════
+  // 老断言把「宿主入口（含回包前设计/施工/基线/图输入的前后复核）」与「无复核的本地入口+图」相比，
+  // 两者工作量不等（宿主多一轮复核读盘），旧树长期 26 vs 22 红（见 logs/OLD-TREE-...log）。这里改成同工作量：
+  // 两侧都做「入口 + 图摘要」两次同源派生，唯一变量是**是否在同一次派生作用域内共享现读折叠**。
   {
+    const entryMod = await loadSrc<any>("src/server/work/entry.ts");
+    const sixMod = await loadSrc<any>("src/arch/sixGraphs.ts");
+    const dsMod = await loadSrc<any>("src/server/work/derivationScope.ts");
+    const input = { project_id: PID, role: "executor" };
+    const deriveTwice = (): void => {
+      entryMod.evaluateProjectEntry(input, { dataDir: HOME });
+      sixMod.graphSummaryOf(PID, { dataDir: HOME });
+    };
+    const deriveTwiceShared = (): void => dsMod.withDerivationScope(deriveTwice);
+
     const origStat = fs.statSync.bind(fs);
-    let target = path.resolve(EVENTS).toLowerCase();
+    const target = path.resolve(EVENTS).toLowerCase();
     let count = 0;
+    let tamper = false;
+    let tamperLeft = 0;
+    let tamperInFlight = false;
+    let tamperSeq = 3;
     (fs as any).statSync = (p: any, ...rest: any[]) => {
-      if (path.resolve(String(p)).toLowerCase() === target) count += 1;
+      if (path.resolve(String(p)).toLowerCase() === target) {
+        count += 1;
+        // 计算期间篡改探针：**有界**地（最多 2 次）在账本被 statSync 到时追加一条真实事件，
+        // 模拟"入口计算期间源在变"——第一次读与回包前复核读会看到不同的账本内容。
+        if (tamper && tamperLeft > 0 && !tamperInFlight) {
+          tamperLeft -= 1;
+          tamperInFlight = true;
+          try {
+            fs.appendFileSync(EVENTS, JSON.stringify(ev(tamperSeq++, "task:t9", "blocked")) + "\n");
+          } catch {
+            /* 附加失败不影响计数 */
+          } finally {
+            tamperInFlight = false;
+          }
+        }
+      }
       return (origStat as any)(p, ...rest);
     };
+    const countOf = (fn: () => void): number => {
+      count = 0;
+      fn();
+      return count;
+    };
     try {
-      count = 0;
-      readJobs.computeEntryView({ projectId: PID, dataDir: HOME, input: { project_id: PID, role: "executor" } });
-      const sharedCount = count;
-      const entryMod = await loadSrc<any>("src/server/work/entry.ts");
-      const sixMod = await loadSrc<any>("src/arch/sixGraphs.ts");
-      count = 0;
-      entryMod.evaluateProjectEntry({ project_id: PID, role: "executor" }, { dataDir: HOME });
-      sixMod.graphSummaryOf(PID, { dataDir: HOME });
-      const fallbackCount = count;
-      info(`账本 statSync 计数：宿主入口（同一快照）${sharedCount} 次 ／ 本地重派生（入口+图各一）${fallbackCount} 次`);
-      ok(sharedCount <= fallbackCount, "F 同一快照共享的读盘次数 ≤ 本地重派生（减少重复解析）", { sharedCount, fallbackCount });
+      const nonShared = countOf(deriveTwice);
+      const shared = countOf(deriveTwiceShared);
+      info(`账本 statSync（同工作量：入口+图两次同源派生）：共享同一作用域 ${shared} 次 ／ 两个独立派生 ${nonShared} 次`);
+      // 实质阻断（不是提阈值）：共享真的把重复现读折叠掉才“小于”，一旦共享失效两者相等即红。
+      ok(
+        shared < nonShared,
+        "F 同一派生作用域内共享现读折叠的读盘次数 < 两个独立派生（同工作量；重复现读被共享掉）",
+        { shared, nonShared },
+      );
+      // 跨请求不缓存：新的一次派生必须重新现读（作用域一次性，绝不留旧绿）。
+      const sharedAgain = countOf(deriveTwiceShared);
+      ok(
+        sharedAgain === shared && sharedAgain > 0,
+        "F 新的一次派生仍要现读账本（派生作用域一次性，不跨请求缓存旧绿）",
+        { shared, sharedAgain },
+      );
+      // 计算期间篡改：账本在入口计算期间被改写 → 宿主入口必须拒绝旧绿或重算到稳定版。
+      const preTamperBytes = fs.statSync(EVENTS).size;
+      tamper = true;
+      tamperLeft = 2;
+      let threw: unknown = null;
+      let result: any = null;
+      try {
+        result = readJobs.computeEntryView({ projectId: PID, dataDir: HOME, input });
+      } catch (e) {
+        threw = e;
+      } finally {
+        tamper = false;
+        // 恢复夹具账本原字节：篡改探针只在本次调用窗口内生效，不污染后续段落（不制造 seq 洞）。
+        try {
+          fs.truncateSync(EVENTS, preTamperBytes);
+        } catch {
+          /* 恢复失败不影响本段结论 */
+        }
+      }
+      const recomputedStable =
+        result != null && result.ok === true && result?.source?.sources_stable === true && (result?.source?.attempts ?? 1) > 1;
+      ok(
+        threw !== null || recomputedStable,
+        "F 计算期间账本持续被改写 → 宿主入口不返回旧绿（抛错拒绝，或已重算到稳定版；绝不返回被盗版）",
+        threw !== null
+          ? { threw: String((threw as Error)?.message ?? threw).slice(0, 160) }
+          : { ok: result?.ok, sources_stable: result?.source?.sources_stable },
+      );
     } finally {
       (fs as any).statSync = origStat;
     }

@@ -31,6 +31,8 @@ import { updateProgressTool } from "./updateProgress";
 import { SYNC_EVIDENCE_TOOLS } from "./syncEvidence";
 // B2/V09-52（DESIGN.md §6.12）：功能清单**只读**读口 feature_ledger（与 HTTP feature-ledger 同底层、同错误语义）。
 import { featureLedgerTool } from "./featureLedger";
+// V09-63/V09-65（DESIGN.md §6.13/§6.14）：项目工作目录与交付候选统一入口（read/list 只读；其余经唯一写口）。
+import { manageWorkspaceTool, finalizeLocalCommitTool } from "./workspaceTools";
 import { registerToolNameSource } from "../../server/work/eventSurface";
 import type { McpTool } from "./types";
 
@@ -99,6 +101,15 @@ export const TOOLS: readonly McpTool[] = [
   // 唯一义务派生 → feature_item[]（四维分开，绿只取 verification）；与 HTTP GET feature-ledger 同底层、同错误语义。
   // 只读：不写事件/证据/租约、不触发扫描、不自愈、不调模型；工具面 30 → 31。
   featureLedgerTool,
+  // V09-63/V09-65（DESIGN.md §6.13／§6.14）：项目工作目录与交付候选的统一入口 manage_workspace——
+  // op=read/list 只读（同一份事件投影）；register/update/freeze/retire/select_dev/point_trial 经唯一写入服务
+  // 转接（CAS/闭键/角色/路径边界/冻结源重核）。主开发目录由 <project_id>:main 派生、不重复保存；
+  // 项目级指针记独立实体、不改 ProjectRecord.path。工具面 31 → 32。
+  manageWorkspaceTool,
+  // V09-66（DESIGN.md §6.13 第 7 段／§6.14 第 9 段）：本地 Git 自动收尾的唯一入口 finalize_local_commit——
+  // 技术验证与独立审查通过且持有有效任务授权时，由**唯一宿主**对冻结候选做本地提交（提交===受验输入、不空提交、
+  // 不 push）。请求**不得自带** grant/通过布尔/root；授权/目标根/技术/独审状态由宿主读真实账本派生。工具面 32 → 33。
+  finalizeLocalCommitTool,
 ];
 
 export function findTool(name: string): McpTool | undefined {

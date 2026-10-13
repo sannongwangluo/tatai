@@ -412,6 +412,51 @@ function reconcileKnownEntryDiffs(
       normalized.push("④no_ready_task 理由文本（冻结镜像上唯一义务派生层语义升级，两侧文本 sha256 钉值核实后归一）");
     }
   }
+
+  // ⑤ V09-63（本批新增，DESIGN §6.13/§6.14 第 7 段）：`context_manifest.workspace`——**接续工作区上下文**。
+  //    改前侧无此键、改后侧默认带出（`entry.ts` 内 `manifest = { ...contextManifestOf(facts.context), workspace }`）。
+  //    同为「新增可选字段」式归一：先核实改前确无该键、改后**形态与开发根/目标正确**，再**只**删该键供其后
+  //    `firstDiff` 对照；`context_manifest` 其余字段（sources/omitted/stale_reasons/coverage/...）**照旧逐字段比对**，不放宽。
+  const rCm = redEntry?.context_manifest;
+  const gCm = greenEntry?.context_manifest;
+  if (rCm === null || gCm === null || typeof rCm !== "object" || typeof gCm !== "object") {
+    problems.push("context_manifest 缺失或非对象，无法核实 V09-63 新增 workspace 字段");
+  } else if (Object.prototype.hasOwnProperty.call(rCm, "workspace")) {
+    problems.push("context_manifest.workspace 改前已存在（不是本批新增字段，须单独核实两侧差异，不在此归一）");
+  } else if (!Object.prototype.hasOwnProperty.call(gCm, "workspace")) {
+    problems.push("context_manifest.workspace 两侧都不存在（V09-63 新增字段缺失，需核实）");
+  } else {
+    const ws: any = (gCm as any).workspace;
+    const projectId = String(greenEntry?.project?.project_id ?? "");
+    const projectPath = String(greenEntry?.project?.path ?? "");
+    const shapeProblems: string[] = [];
+    if (ws === null || typeof ws !== "object") {
+      shapeProblems.push("workspace 非对象");
+    } else {
+      if (ws.workspace_id !== `${projectId}:main`) {
+        shapeProblems.push(`workspace_id 应为「${projectId}:main」，实为 ${JSON.stringify(ws.workspace_id)}`);
+      }
+      if (ws.source !== "main") shapeProblems.push(`source 应为 main，实为 ${JSON.stringify(ws.source)}`);
+      if (ws.writable !== true) shapeProblems.push(`主开发工作区应 writable=true，实为 ${JSON.stringify(ws.writable)}`);
+      if (ws.status !== "main") shapeProblems.push(`status 应为 main，实为 ${JSON.stringify(ws.status)}`);
+      if (ws.trial !== null) shapeProblems.push(`无试用候选时 trial 应为 null，实为 ${JSON.stringify(ws.trial)}`);
+      if (ws.trial_status !== "none") shapeProblems.push(`无试用候选时 trial_status 应为 none，实为 ${JSON.stringify(ws.trial_status)}`);
+      if (ws.blocked_reason !== null) shapeProblems.push(`主开发工作区未被阻断，blocked_reason 应为 null，实为 ${JSON.stringify(ws.blocked_reason)}`);
+      // 目标/开发 cwd 正确：`root` 必须落到**本项目的实际开发根**（＝投影 `project.path`），不是别的目录
+      if (typeof ws.root !== "string" || ws.root === "") shapeProblems.push("workspace.root 缺失");
+      else if (projectPath === "" || path.resolve(ws.root) !== path.resolve(projectPath)) {
+        shapeProblems.push(`workspace.root ${JSON.stringify(ws.root)} ≠ 项目开发根 ${JSON.stringify(projectPath)}`);
+      }
+    }
+    if (shapeProblems.length > 0) {
+      problems.push(`context_manifest.workspace 形态/开发根不符 V09-63 契约：${shapeProblems.join("；")}`);
+    } else {
+      delete (gCm as any).workspace;
+      normalized.push(
+        `⑤V09-63 context_manifest.workspace（新增接续工作区上下文：workspace_id=${projectId}:main / root=开发根 / source=main / writable / status=main / trial=none / 未阻断，核实后归一）`,
+      );
+    }
+  }
   return { problems, normalized };
 }
 
@@ -630,7 +675,7 @@ try {
             const rec = reconcileKnownEntryDiffs(red.value, green.value, expectedLedger);
             ok(
               rec.problems.length === 0,
-              "H 既定表现差异逐条核实（旧 last_seq:9200 / 新真实账本 sha 独立复算一致＋已验证字节=文件大小 / 新游标完整 sha 与原范围一致 / V09-46 新增可选字段仅按旧字段等价归一 / P3 只读 repair_plan 形态核实后归一）",
+              "H 既定表现差异逐条核实（旧 last_seq:9200 / 新真实账本 sha 独立复算一致＋已验证字节=文件大小 / 新游标完整 sha 与原范围一致 / V09-46 新增可选字段仅按旧字段等价归一 / P3 只读 repair_plan 形态核实后归一 / V09-63 新增 context_manifest.workspace 的形态与开发根核实后归一）",
               rec.problems.length > 0 ? { problems: rec.problems } : undefined,
             );
             ok(
@@ -641,7 +686,7 @@ try {
             const diff = firstDiff(red.value, green.value);
             ok(
               diff === null,
-              "H canonical 结果改前/改后等价（剔除本次时刻类字段；仅归一账本来源内容身份、续读游标两处既定差异、V09-46 新增可选字段的旧字段等价、③b 只读 repair_plan、④ obligations 派生语义升级的 no_ready_task 文本（钉值核实））",
+              "H canonical 结果改前/改后等价（剔除本次时刻类字段；仅归一账本来源内容身份、续读游标两处既定差异、V09-46 新增可选字段的旧字段等价、③b 只读 repair_plan、④ obligations 派生语义升级的 no_ready_task 文本（钉值核实）、⑤ V09-63 新增 context_manifest.workspace）",
               diff === null ? undefined : { firstDiff: diff },
             );
             // 改前 projectWithReleases 不识 projectFacts ⇒ 仍会重算 collectProjectFacts（读盘 1 次）

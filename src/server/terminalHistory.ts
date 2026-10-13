@@ -382,11 +382,20 @@ export class TerminalHistoryRecorder {
   };
   readonly recorded = { count: 0 };
 
+  /**
+   * 会话的**边界根**（V09-63）：`cd` 跟踪只认"目标仍在本根内"。它由建会话时传入的 cwd 定死——
+   * PTY 现在以**当前开发工作区根**起 shell，边界必须随同一个根，否则 dev 工作区里的 `cd` 会被误判越界。
+   * **落盘位置不变**：命令历史仍写中央记录域 `.工作台/logs/terminal-history.jsonl`（见 terminalHistoryPath）。
+   */
+  private readonly boundsRoot: string;
+
   constructor(
     private readonly sessionId: string,
     private readonly projectId: string,
     private cwd: string,
-  ) {}
+  ) {
+    this.boundsRoot = cwd;
+  }
 
   /** 喂 PTY 输出（只用于：① 回显比对/密码提示词判定；② duration_ms 的结束时刻） */
   feedOutput(data: string): void {
@@ -574,8 +583,7 @@ export class TerminalHistoryRecorder {
   }
 
   private projectRoot(): string | null {
-    const project = getProject(this.projectId);
-    return project ? project.path : null;
+    return this.boundsRoot;
   }
 
   /** 静默计时：输出每来一段就续一次；逼近 MAX_PENDING_MS 时按剩余时间收口（长命命令不至于不落盘） */

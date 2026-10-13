@@ -11,6 +11,7 @@
 //   ④ 两个 Gate 不合并（设计审定 / 用户接受分开）。
 
 import { buildSectionIndex, type DocumentSection } from "./documents";
+import { implementationInterpretation } from "../../shared/implementationReadout";
 import { type AcceptanceDimension, type SourceRevisions, type StatusProjection } from "./statusProjection";
 import type { RequirementProjection } from "./requirements";
 import type {
@@ -562,6 +563,8 @@ export interface BuildFeatureItemsInput {
   feature_has_run: Record<string, boolean>;
   /** 功能 → 运行事实引用（最近事件 seq 文本；无运行记录 = null） */
   feature_run_basis: Record<string, string | null>;
+  /** 当前成员逐项结果登记（不从验证通过反推提交）。 */
+  feature_result_registration?: Record<string, NonNullable<ImplementationReadout["result_registration"]>>;
   /** 成员任务 → 定义指纹 */
   task_fingerprints: Record<string, string>;
   /** 章节索引（所选 design_text 的 buildSectionIndex 结果；无设计 = 空数组） */
@@ -788,6 +791,8 @@ export function buildFeatureItems(input: BuildFeatureItemsInput): BuildFeatureIt
       const state: ImplementationState = featureStatus?.projection.execution ?? "not_started";
       implementation = { state, basis: input.feature_run_basis[f.item_id] ?? null };
     }
+    const registration = input.feature_result_registration?.[f.item_id];
+    if (registration !== undefined) implementation.result_registration = registration;
 
     // 验证维度：**直接消费该范围的 canonical 投影**（唯一义务层产物）——不按"各卡最差"另算一套
     let verification: VerificationReadout;
@@ -994,6 +999,9 @@ export function buildFeatureItems(input: BuildFeatureItemsInput): BuildFeatureIt
     });
   }
 
+  for (const item of items) {
+    item.implementation.interpretation = implementationInterpretation(item.implementation, item.verification);
+  }
   return {
     items,
     issues,

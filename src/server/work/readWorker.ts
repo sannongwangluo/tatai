@@ -9,6 +9,13 @@
 //     `read-worker.js`（build-server.ts 增的入口）起——两态同一份源码。
 import { parentPort } from "node:worker_threads";
 import { runReadJobLocal, type ReadJobKind } from "./readJobs";
+import { installWorkspaceReadWiring } from "./hostWiring";
+
+// V09-63 组合根接缝（DESIGN §6.14 第 2/6 段）：worker 是**独立线程**，不共享宿主主线程的模块状态——
+// 主线程 `createWorkHost` 装的那份只读解析器**到不了这里**。若不在此装，worker 上的入口/功能清单/图作业
+// 会用注册表锚点解析图纸与源（"启动了 writer 才读对"），坏指针也**不 fail-closed**（静默读旧主根）。
+// 安装**无 IO**、只注入解析器；worker 纯只读，不装任何写守卫、不写盘。
+installWorkspaceReadWiring();
 
 interface JobRequest {
   id: number;

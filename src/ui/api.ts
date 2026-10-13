@@ -20,6 +20,13 @@ import { apiBase } from "./tauri-env";
 import { sharedReadFetch, type RawFetch } from "./sharedRead";
 // P0/V09-45：构建身份类型是浏览器安全的共享模块（零 node 依赖），前端直接复用同一份判定
 import type { BuildIdentity } from "../shared/buildIdentity";
+// V09-70（§3.18/§6.15）：运行诊断读口与脱敏都是浏览器安全的共享模块——前端只读复用同一份类型与 sanitize，
+// 不另写一套字段/判据/序列化。
+import {
+  sanitizeRuntimeDiagnosticsReport,
+  type RuntimeDiagnosticsReport,
+  type RuntimeDiagnosticsDetail,
+} from "../shared/runtimeDiagnostics";
 
 // ── P2：跨项目视图（DESIGN.md §11.2「多项目并行增强」）：GET /api/summary/projects ──
 // 汇总口径（行的字段 / 排序键 / 分桶 / 缺文件合成）全在服务端，见 src/server/projects-summary.ts（P1）
@@ -117,6 +124,60 @@ export interface HealthPayload {
 export async function getHealth(opts?: FetchOpts): Promise<HealthPayload> {
   const res = await apiFetch("/health", fetchInit(opts));
   return (await res.json()) as HealthPayload;
+}
+
+// ── V09-70（§3.18/§6.15）：本地只读运行诊断读口（不索要 work token）──
+// 只读有界运行遥测（宿主主线程直答），界面诊断页与全局轻量异常提示读**同一份**报告；返回体用共享
+// `sanitizeRuntimeDiagnosticsReport` 逐字段重建（typed allowlist），不直接透传原始 JSON。
+
+/** 旧宿主/未登记路由：读口不存在——页面据此**明报"未接入"**，不假装有数据（§6.15）。 */
+export class RuntimeDiagnosticsUnsupportedError extends Error {
+  constructor(message = "[UNSUPPORTED] 后端未提供运行诊断读口（旧宿主或路由未登记）") {
+    super(message);
+    this.name = "RuntimeDiagnosticsUnsupportedError";
+  }
+}
+
+export interface DiagnosticsParams {
+  /** 缺省（null/undefined）= 全局（无项目级两段） */
+  projectId?: string | null;
+  detail?: RuntimeDiagnosticsDetail;
+  signal?: AbortSignal;
+}
+
+/** 运行诊断只读读口：`GET /api/runtime/diagnostics?project_id=…&detail=…`（DESIGN §6.15）。 */
+export async function getDiagnostics(params: DiagnosticsParams = {}): Promise<RuntimeDiagnosticsReport> {
+  const qs = new URLSearchParams();
+  if (params.projectId !== undefined && params.projectId !== null && params.projectId !== "") {
+    qs.set("project_id", params.projectId);
+  }
+  if (params.detail !== undefined) qs.set("detail", params.detail);
+  const suffix = qs.toString();
+  const res = await apiFetch(
+    `/api/runtime/diagnostics${suffix === "" ? "" : `?${suffix}`}`,
+    fetchInit({ signal: params.signal }),
+  );
+  if (res.status === 404) throw new RuntimeDiagnosticsUnsupportedError();
+  let raw: unknown;
+  try {
+    raw = await res.json();
+  } catch {
+    throw new Error(`[${res.status}] 运行诊断读口返回了不可解析的响应（不是 JSON）`);
+  }
+  const report = sanitizeRuntimeDiagnosticsReport(raw);
+  if (report !== null) return report;
+  // 非报告体（如 `{ ok:false, error:{code,message} }` 或 503 `{ reason }`）：如实报出，不冒充读数。
+  const body = (typeof raw === "object" && raw !== null ? raw : {}) as {
+    reason?: unknown;
+    error?: { code?: unknown; message?: unknown; reason?: unknown };
+  };
+  const reason = typeof body.reason === "string" ? body.reason : typeof body.error?.reason === "string" ? body.error.reason : null;
+  const code = typeof body.error?.code === "string" ? body.error.code : `HTTP_${res.status}`;
+  const message =
+    typeof body.error?.message === "string"
+      ? body.error.message
+      : `运行诊断读口返回不可识别的响应（HTTP ${res.status}${reason === null ? "" : `，reason=${reason}`}）`;
+  throw new Error(`[${code}] ${message}`);
 }
 
 // ── H2：变更流水（DESIGN.md §3.8 简版：顶部小入口「最近变更 · N 条新」，不占主页面）──
@@ -946,6 +1007,12 @@ export async function getDesignVersioned(
 // ── B6/V09-56：功能清单**只读**读口（DESIGN.md §6.12；界面只展示，不涂色、不写状态）──
 import type { FeatureLedger as FeatureLedgerView } from "../shared/coverageTypes";
 export type { FeatureLedgerView };
+import type { FeatureLedgerWorkspace } from "../shared/coverageTypes";
+export type { FeatureLedgerWorkspace };
+// V09-67（DESIGN §6.14 第 2/8 段）：工作区与交付候选的**只读**视图。**type-only** 复用服务端同一份形状
+// （`src/shared/workspaceTypes.ts` 只有类型/常量，零运行时依赖，不进前端包），不在这里另抄一份。
+import type { WorkspaceView, WorkspaceRecord, WorkspacePointer, WorkspaceDevResolution } from "../shared/workspaceTypes";
+export type { WorkspaceView, WorkspaceRecord, WorkspacePointer, WorkspaceDevResolution };
 
 export interface FeatureLedgerReadParams {
   scope?: string;
@@ -954,6 +1021,12 @@ export interface FeatureLedgerReadParams {
   expected_revision?: string;
   cursor?: string;
   limit?: number;
+  /**
+   * V09-67（DESIGN §6.14 第 8 段）：本次读哪个**工作区版本**。服务端白名单参数，未知值 → 400。
+   * 交付总览必须**实际带上解析出的工作区**（试用版＝当前试用候选 id、开发视图＝当前开发根 id），
+   * 不得省略参数而继续读活动主目录。旧宿主不认识该参数时按 §6.6 明确未知，不回退写路由。
+   */
+  workspace?: string;
 }
 
 /**
@@ -982,7 +1055,7 @@ export async function getFeatureLedger(
   opts?: FetchOpts,
 ): Promise<FeatureLedgerView> {
   const q = new URLSearchParams();
-  for (const k of ["scope", "document", "artifact_ref", "expected_revision", "cursor", "limit"] as const) {
+  for (const k of ["scope", "document", "artifact_ref", "expected_revision", "cursor", "limit", "workspace"] as const) {
     const v = params[k];
     if (v !== undefined && v !== null && String(v) !== "") q.set(k, String(v));
   }
@@ -1029,6 +1102,75 @@ export async function getFeatureLedger(
     detail: b.detail ?? null,
     unsupported: false,
   });
+}
+
+/**
+ * V09-67（DESIGN §6.14 第 2/8 段）：工作区/交付候选**只读**读口
+ * `GET /api/projects/:id/workspaces` —— 同一份事件投影 → `WorkspaceView`（含派生 `<id>:main`、
+ * 项目级指针 current_dev/current_trial、当前实际开发根）。**纯读**：不写事件/指针、不自愈。
+ *
+ * 失败口径（与 `getFeatureLedger` 同族）：`unsupported=true` 表示**旧宿主不识别该读口**（404）——
+ * 界面据此明确报「工作区登记未接入」，按旧 current/active 语义读并**如实标出来**，
+ * **绝不**在本地另算一套判据、也不假装读到了固定试用版（§6.6、§6.13 第 8 段）。
+ */
+export class WorkspacesReadError extends Error {
+  readonly status: number | null;
+  readonly code: string;
+  readonly unsupported: boolean;
+  constructor(message: string, info: { status: number | null; code: string; unsupported: boolean }) {
+    super(message);
+    this.name = "WorkspacesReadError";
+    this.status = info.status;
+    this.code = info.code;
+    this.unsupported = info.unsupported;
+  }
+}
+
+export async function getWorkspaces(id: string, opts?: FetchOpts): Promise<WorkspaceView> {
+  let res: Response;
+  try {
+    res = await apiFetch(`/api/projects/${encodeURIComponent(id)}/workspaces`, fetchInit(opts));
+  } catch (e) {
+    throw new WorkspacesReadError(`读取失败：${(e as Error).message}`, {
+      status: null,
+      code: "NETWORK_ERROR",
+      unsupported: false,
+    });
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new WorkspacesReadError(
+      res.status === 404 ? "本功能未接入（旧宿主不识别工作区读口）" : `读取失败：响应无法解析（HTTP ${res.status}）`,
+      { status: res.status, code: res.status === 404 ? "UNSUPPORTED" : "BAD_RESPONSE", unsupported: res.status === 404 },
+    );
+  }
+  const b = body as
+    | ({ ok: true } & WorkspaceView)
+    | { ok: false; status?: number; code?: string; message?: string; error?: { code?: string; message?: string } };
+  if (b.ok === true) {
+    // 只做必要形态检查：三块核心（pointer/workspaces/current_dev）齐才算一次可用读数；缺 → 报错（界面显式未知）。
+    const v = b as unknown as Record<string, unknown>;
+    if (typeof v.project_id !== "string" || typeof v.anchor_root !== "string" || !Array.isArray(v.workspaces)) {
+      throw new WorkspacesReadError("读取失败：工作区读口返回的形态不完整（缺 pointer/workspaces/current_dev）", {
+        status: res.status,
+        code: "BAD_SHAPE",
+        unsupported: false,
+      });
+    }
+    return b as WorkspaceView;
+  }
+  if (b.error?.code === "NOT_FOUND" || (!b.code && res.status === 404)) {
+    throw new WorkspacesReadError("本功能未接入（旧宿主不识别工作区读口）", {
+      status: 404,
+      code: "UNSUPPORTED",
+      unsupported: true,
+    });
+  }
+  const code = b.code ?? b.error?.code ?? "UNKNOWN";
+  const message = b.message ?? b.error?.message ?? `读取失败（HTTP ${res.status}）`;
+  throw new WorkspacesReadError(`[${code}] ${message}`, { status: b.status ?? res.status, code, unsupported: false });
 }
 
 // ── D2：待议记录（DESIGN.md §3.5 提疑权：只能追加，没有任何修改/删除接口或 UI）──

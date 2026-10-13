@@ -7,6 +7,7 @@ import { warnCorruptLinesThrottled } from "./lineStream";
 import { sanitizeErrorMessage } from "./redact";
 import { nowIso } from "./time";
 import { WsError } from "./workstation";
+import { resolveCurrentDevRoot } from "./work/workspaces";
 import { JUNK_DIR_RANDOM_TEMP_RE } from "../arch/config";
 
 // 文件监听器（H1）：对项目根挂 chokidar（DESIGN.md §3.9 无刷新更新的驱动源，§7.2 清单内选型，MIT），
@@ -225,8 +226,16 @@ export interface WatchStats {
 
 /** 单项目的监听句柄：chokidar watcher + 已知文件 size 表（算 size_delta 用）+ 落盘队列 */
 interface WatchEntry {
-  /** 项目根（unwatch 收尾抽干队列时要用，不能只靠调用方再传一次） */
+  /**
+   * **监听根**：V09-63 起是**当前开发工作区根**（源文件所在；事件路径相对它）。
+   * unwatch 收尾抽干队列时要用，不能只靠调用方再传一次。
+   */
   root: string;
+  /**
+   * **中央事实域根**（注册表 `ProjectRecord.path`）：变更流水 `changes.jsonl` 落这里，
+   * 与监听根分开——工作区只记事件/只读投影，不复制第二套可写 `.工作台`（§6.14 第 1 段）。
+   */
+  centralRoot: string;
   /** 预扫描期间为 null（还没挂上 chokidar）；预扫描被 unwatch 打断则一直是 null */
   watcher: FSWatcher | null;
   /** rel（正斜杠相对路径）→ 最近一次已知的文件 size；初始扫描与每次事件后刷新
@@ -258,6 +267,11 @@ const watching = new Map<string, WatchEntry>();
 /** GET /api/watch 的项目级明细（H4：监听模式与计数可见，truncated 不静默） */
 export interface WatchInfo {
   id: string;
+  /**
+   * 实际监听根（V09-63）：当前开发工作区根。读回它即可核对"在看的到底是哪个目录"——
+   * 指针切换后本值随重挂刷新，不会出现"看旧目录却宣称看新目录"。
+   */
+  root: string;
   mode: WatchMode;
   ready: boolean;
   truncated: boolean;
@@ -277,6 +291,7 @@ export interface WatchInfo {
 export function listWatchDetails(): WatchInfo[] {
   return [...watching.entries()].map(([id, e]) => ({
     id,
+    root: e.root,
     mode: e.mode,
     ready: e.ready,
     truncated: e.scan?.truncated ?? false,
@@ -409,7 +424,7 @@ function rememberSize(entry: WatchEntry, projectId: string, rel: string, size: n
  * 注意冲刷途中"已摘出、还没落盘"的那批（drainPending 先 splice 再 await 写盘）不在 written 里，
  * 这几毫秒内读数会短暂差出在途量，不是少记——对账必须等静默（见 WatchStats.changes 注释）。
  */
-function enqueueChange(entry: WatchEntry, projectId: string, root: string, line: ChangeLine): void {
+function enqueueChange(entry: WatchEntry, projectId: string, line: ChangeLine): void {
   entry.stats.changes++;
   if (entry.pending.length >= WATCH_LIMITS.PENDING_MAX) {
     entry.stats.dropped++;
@@ -422,12 +437,12 @@ function enqueueChange(entry: WatchEntry, projectId: string, root: string, line:
   }
   entry.pending.push(line);
   if (entry.pending.length >= WATCH_LIMITS.FLUSH_BATCH) {
-    void flushPending(entry, projectId, root);
+    void flushPending(entry, projectId);
     return;
   }
   if (!entry.flushTimer) {
     entry.flushTimer = setTimeout(() => {
-      void flushPending(entry, projectId, root);
+      void flushPending(entry, projectId);
     }, WATCH_LIMITS.FLUSH_INTERVAL_MS);
   }
 }
@@ -436,22 +451,26 @@ function enqueueChange(entry: WatchEntry, projectId: string, root: string, line:
  * 合批异步追加（H4，单飞）：同一项目同时只跑一条抽干队列的链，写失败计入 errors/dropped，不炸监听本体。
  * unwatch 收尾也调它——返回值就是那条链，等它 resolve 就等于"队列写干净了"。
  */
-function flushPending(entry: WatchEntry, projectId: string, root: string): Promise<void> {
+function flushPending(entry: WatchEntry, projectId: string): Promise<void> {
   if (entry.flushTimer) {
     clearTimeout(entry.flushTimer);
     entry.flushTimer = null;
   }
   if (!entry.flushPromise) {
-    entry.flushPromise = drainPending(entry, projectId, root).finally(() => {
+    entry.flushPromise = drainPending(entry, projectId).finally(() => {
       entry.flushPromise = null;
     });
   }
   return entry.flushPromise;
 }
 
-/** 抽干队列：一批一批 appendFile（每批 ≤ FLUSH_BATCH 行），写完一批才广播这批 */
-async function drainPending(entry: WatchEntry, projectId: string, root: string): Promise<void> {
-  const file = changesJsonlPath(root);
+/**
+ * 抽干队列：一批一批 appendFile（每批 ≤ FLUSH_BATCH 行），写完一批才广播这批。
+ * 落盘位置是**中央事实域** `entry.centralRoot/.工作台/changes.jsonl`（§2.3.5；§6.14 第 1 段：
+ * 工作区只记事件与只读投影，不复制第二套可写 `.工作台`）——与**监听根**（当前开发工作区）不是同一个目录。
+ */
+async function drainPending(entry: WatchEntry, projectId: string): Promise<void> {
+  const file = changesJsonlPath(entry.centralRoot);
   while (entry.pending.length > 0) {
     const batch = entry.pending.splice(0, WATCH_LIMITS.FLUSH_BATCH);
     const text = batch.map((l) => JSON.stringify(l)).join("\n") + "\n";
@@ -479,7 +498,29 @@ async function drainPending(entry: WatchEntry, projectId: string, root: string):
 }
 
 /**
- * 开监听（H1）：对项目根挂 chokidar。幂等——已在监听时直接返回现状（already:true）。
+ * 指针切换时的**真实重挂**（V09-63）：把旧 entry 从表里摘掉、置 closed、关 watcher，并把它的待落盘队列
+ * 抽干到**中央** `changes.jsonl`（旧链自带 pending/flush，与新 entry 不共享任何状态）。同步返回，
+ * 不阻塞 `watchProject`——调用方随即以新根建新 entry。**旧 size 表随旧 entry 丢弃**（相对路径口径变了）。
+ */
+function retargetWatch(entry: WatchEntry, projectId: string): void {
+  watching.delete(projectId);
+  entry.closed = true;
+  entry.resolveReady();
+  if (entry.flushTimer !== null) {
+    clearTimeout(entry.flushTimer);
+    entry.flushTimer = null;
+  }
+  if (entry.watcher !== null) {
+    const watcher = entry.watcher;
+    entry.watcher = null;
+    void watcher.close().catch(() => {});
+  }
+  void flushPending(entry, projectId).catch(() => {});
+}
+
+/**
+ * 开监听（H1）：对**当前开发工作区根**挂 chokidar（V09-63；变更流水仍落中央 `changes.jsonl`）。
+ * 幂等——已在监听且根未变时直接返回现状（already:true）；**根变了就真实重挂**（见 `retargetWatch`）。
  * 返回的 ready 为 Promise：预扫描 + chokidar 初始扫描（chokidar ready）完成后 resolve，
  * 初始扫描期间只登记 size 表、不写流水（存量文件不是"变更"）。
  * H4 起挂载是异步的（先有界预扫描、再决定 full/top 模式），函数本身仍同步返回；
@@ -506,19 +547,34 @@ export function watchProject(
   if (!project) {
     throw new WsError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`);
   }
+  const centralRoot = path.resolve(project.path);
+  // V09-63 源根贯通：**监听根**是当前开发工作区根（源文件所在）；坏指针/目录不在 → 拒绝开监听，
+  // 不静默回退注册表锚点根（§6.14 第 2/10 段）。变更流水仍落 centralRoot（中央事实域）。
+  const dev = resolveCurrentDevRoot(projectId, dataDir);
+  if (dev.root === null) {
+    throw new WsError(
+      "INVALID_INPUT",
+      `当前开发指针不可用（source=${dev.source}）：${dev.blocked_reason ?? "目标工作区不可用"}——拒绝开监听，不静默回退项目根（DESIGN.md §6.14 第 2/10 段）`,
+    );
+  }
+  const root = dev.root;
+  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
+    throw new WsError("INVALID_INPUT", `当前开发工作区目录不在盘上: ${root}（工作区 ${dev.workspace_id}）`);
+  }
   const existing = watching.get(projectId);
   if (existing) {
-    return {
-      watching: true,
-      already: true,
-      root: project.path,
-      ready: Promise.resolve(),
-      mounted: Promise.resolve(),
-    };
-  }
-  const root = project.path;
-  if (!fs.existsSync(root)) {
-    throw new WsError("INVALID_INPUT", `项目目录不存在: ${root}`);
+    // 指针切换：监听根变了 → **真实重挂**到新根（旧 watcher 关闭、size 表清空，不"看旧目录却宣称看新目录"）；
+    // 根没变才按既有幂等口径回 already:true。
+    if (path.resolve(existing.root) === path.resolve(root)) {
+      return {
+        watching: true,
+        already: true,
+        root: existing.root,
+        ready: Promise.resolve(),
+        mounted: Promise.resolve(),
+      };
+    }
+    retargetWatch(existing, projectId);
   }
   // 并发上限（H4）：同时在听的项目数封顶，超了拒绝并明示——不让"打开一堆项目"把服务拖住
   if (watching.size >= WATCH_LIMITS.MAX_WATCHING_PROJECTS) {
@@ -536,6 +592,7 @@ export function watchProject(
   });
   const entry: WatchEntry = {
     root,
+    centralRoot,
     watcher: null,
     sizes: new Map<string, number | null>(),
     ready: false,
@@ -653,7 +710,7 @@ async function startWatching(entry: WatchEntry, projectId: string, root: string)
     }
     // add 的 size_delta 口径：文件当前大小（从无到有，旧值视为 0；拿不到 stat 记 null）
     rememberSize(entry, projectId, rel, size);
-    enqueueChange(entry, projectId, root, {
+    enqueueChange(entry, projectId, {
       ts: nowIso(),
       path: rel,
       action: "add",
@@ -673,7 +730,7 @@ async function startWatching(entry: WatchEntry, projectId: string, root: string)
     // size_delta = 前后 size 差；拿不到旧值（如监听前就缺登记）或新 stat 时记 null
     const delta = old !== null && size !== null ? size - old : null;
     rememberSize(entry, projectId, rel, size);
-    enqueueChange(entry, projectId, root, {
+    enqueueChange(entry, projectId, {
       ts: nowIso(),
       path: rel,
       action: "modify",
@@ -691,7 +748,7 @@ async function startWatching(entry: WatchEntry, projectId: string, root: string)
     const old = entry.sizes.has(rel) ? entry.sizes.get(rel)! : null;
     entry.sizes.delete(rel);
     // remove 的 size_delta 口径：-旧大小（拿不到旧值记 null）
-    enqueueChange(entry, projectId, root, {
+    enqueueChange(entry, projectId, {
       ts: nowIso(),
       path: rel,
       action: "remove",
@@ -722,7 +779,7 @@ export async function unwatchProject(projectId: string): Promise<boolean> {
     entry.watcher = null;
     await watcher.close();
   }
-  await flushPending(entry, projectId, entry.root);
+  await flushPending(entry, projectId);
   return true;
 }
 

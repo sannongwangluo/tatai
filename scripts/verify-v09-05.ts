@@ -56,6 +56,7 @@ import {
   resolveRemoteConfig,
 } from "../src/server/remote-config";
 import { addProject, resolveDataDir } from "../src/server/registry";
+import { workstationDir } from "../src/server/workstation";
 import { importTaskDefinitions, taskDefinitionHash, validateTaskDefinitions } from "../src/server/work/plan";
 import { definitionHashOf, parsePlanTable, validatePlanTasks } from "../src/server/work/planValidate";
 import {
@@ -375,7 +376,7 @@ const m2Src = read(path.join(REPO, "scripts", "verify-m2.ts"));
 // （task_brief），注册表 28 → 29。同一口径补分组名，判据仍为"恰好"，不放宽。
 // 2026-10-06（P2/V09-47 只读预检 preflight_task_result，最终集成）：`verify-m2.ts` 再增 `V0947_TOOLS`
 // （preflight_task_result），注册表 29 → 30。同一口径补分组名，判据仍为"恰好"，不放宽。
-const m2Groups = ["EXPECTED", "M5_TOOLS", "V0610_TOOLS", "C015_TOOLS", "V0702_TOOLS", "V0704_TOOLS", "V0919_TOOLS", "V0923_TOOLS", "V0927_TOOLS", "V0932_TOOLS", "V0939_TOOLS", "V0941_TOOLS", "V0947_TOOLS", "V0952_TOOLS"];
+const m2Groups = ["EXPECTED", "M5_TOOLS", "V0610_TOOLS", "C015_TOOLS", "V0702_TOOLS", "V0704_TOOLS", "V0919_TOOLS", "V0923_TOOLS", "V0927_TOOLS", "V0932_TOOLS", "V0939_TOOLS", "V0941_TOOLS", "V0947_TOOLS", "V0952_TOOLS", "V0963_TOOLS", "V0966_TOOLS"];
 const m2Names = m2Groups.flatMap((g) => extractArray(m2Src, g));
 ok(
   m2Groups.every((g) => extractArray(m2Src, g).length > 0) &&
@@ -460,7 +461,8 @@ ok(
     "design.discuss.md": "塔台自举：待议区在根 DESIGN.md 附录 B，`.工作台/` 里不复制一份",
     "plan.md": "塔台自举：施工图是仓库根 PLAN.md（不是 `.工作台/plan.md`）",
   };
-  const selfWorkbench = path.join(REPO, ".工作台");
+  // 工作树只存源码；真实项目记录仍按注册表定位到唯一中央工作台。
+  const selfWorkbench = workstationDir("tatai", resolveDataDir());
   const realMissing = workbenchTree.filter(
     (e) => SELF_MANAGED_EXCEPTIONS[e.name] === undefined && !fs.existsSync(path.join(selfWorkbench, e.name)),
   );

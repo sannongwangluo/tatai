@@ -612,9 +612,19 @@ async function main(): Promise<void> {
     `④ 远端请求真被拒（间接证据，本脚本不发 HTTP）：该路由在 REMOTE_WRITE_ROUTES（当前 ${REMOTE_WRITE_ROUTES.length} 条）` +
       "，verify:s2 段④ 正是遍历这张表逐条真打并断言 403 REMOTE_READ_ONLY（该断言仍在：源码级指针校验通过）",
   );
+  // 2026-10-09 陈旧前提修正（判据不放宽、反而更严）：这条路由的探测根不再直接取 `project.path`——
+  // V09-63 源根贯通后一律走 `currentDevRootOrFail(项目 id)`（注册表 + 当前开发工作区指针，§6.14 第 2/6 段），
+  // 有显式指针却坏时明确 4xx、**不静默回落注册表主根**。所以这里钉的仍是同一件事（探测根来自注册表侧，
+  // 不接受请求里的任何目录参数），只是把"注册表给的项目路径"换成现在真实的取根函数，并加钉"全模块只有
+  // 一处探测调用、实参不是请求面派生值"。
+  const gitProbeCalls = count(indexCode, "inspectGitStatus(");
   ok(
-    indexCode.includes("await inspectGitStatus(project.path)") && !/inspectGitStatus\(\s*(req|body|query)/.test(indexCode),
-    "④ 路由里探测的是**注册表给的项目路径**（project.path），不接受请求里的任何目录参数",
+    indexCode.includes("const gitRoot = currentDevRootOrFail(gitStatusProjectId);") &&
+      indexCode.includes("await inspectGitStatus(gitRoot)") &&
+      gitProbeCalls === 1 &&
+      !/inspectGitStatus\(\s*(req|body|query)/.test(indexCode),
+    `④ 路由里探测的根来自**注册表 + 当前开发工作区指针**（currentDevRootOrFail，§6.14；全模块仅 ${gitProbeCalls} 处探测调用），` +
+      "不接受请求里的任何目录参数",
   );
 
   info("④ 提醒派生口径（合并同一批 / 新成果不被旧暂缓吞掉 / 提交≠私有事实已备份）");

@@ -28,6 +28,7 @@ export const featureLedgerTool: McpTool = {
       scope: { type: "string", description: "current（缺省）或明确 scope_id" },
       document: { type: "string", description: "current | active（缺省）| <revision>" },
       artifact_ref: { type: "string", description: "已登记产物引用（可选）" },
+      workspace: { type: "string", description: "读哪个工作区版本：dev＝当前开发工作区；<workspace_id>＝指定已登记工作区；缺省＝当前试用候选（无指针时按 :main）。未知值 ⇒ 400" },
       expected_revision: { type: "string", description: "包版本；不符 ⇒ 409 REVISION_CHANGED" },
       cursor: { type: "string", description: "分页游标（绑定 package_revision；版本变 ⇒ 409）" },
       limit: { type: "number", description: "1..200，缺省 50" },
@@ -37,7 +38,7 @@ export const featureLedgerTool: McpTool = {
   },
   handler: (args) => {
     // 严格参数（与 inputSchema.additionalProperties:false 同一口径）：未知键一律拒，不静默忽略。
-    const allowed = ["project_id", "scope", "document", "artifact_ref", "expected_revision", "cursor", "limit"];
+    const allowed = ["project_id", "scope", "document", "artifact_ref", "expected_revision", "cursor", "limit", "workspace"];
     const extra = Object.keys(args).filter((k) => !allowed.includes(k));
     if (extra.length > 0) {
       return {
@@ -56,6 +57,7 @@ export const featureLedgerTool: McpTool = {
       expected_revision: args.expected_revision,
       cursor: args.cursor,
       limit: args.limit,
+      workspace: args.workspace,
     });
     if ("ok" in parsed) {
       return { content: [{ type: "text", text: JSON.stringify(parsed, null, 2) }], isError: true };

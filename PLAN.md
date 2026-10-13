@@ -30,6 +30,15 @@
 
 | 卡号 | 状态 | 交付目标 | 依赖 | 完成证据 |
 | --- | --- | --- | --- | --- |
+| V09-63 | todo | 工作区与交付候选登记、接续契约：目标工作区/实际 cwd/可改范围随入口与工作包带出 | 无 | 本卡正反例、真实解析与 HTTP/MCP 读回、源清单与非作者复核 |
+| V09-64 | todo | 候选冻结、证据按候选版本解析与交付版本读数（回收后可从提交还原，不失效） | V09-63 | 本卡正反例、真实解析与读回、源清单与非作者复核 |
+| V09-65 | todo | 写口拒错目标与冻结候选写入拒绝（语义校验，不冒充 OS 沙箱） | V09-63 | 本卡正反例、既有合法路径回归、源清单与非作者复核 |
+| V09-66 | todo | 本地 Git 自动收尾：提交内容等于所受验输入且不空提交、诚实失败、不 push | V09-65 | 本卡正反例、真实仓库隔离夹具读回、源清单与非作者复核 |
+| V09-67 | todo | 交付总览版本一致、运行核对与本批受影响证据续验收口 | V09-63、V09-64、V09-65、V09-66 | 本卡正反例、真实安装与同版读回、续验证据与非作者复核 |
+| V09-68 | todo | 实现读数修正：缺登记和部分提交不误报未实现或未开始 | 无 | 同源聚合反例、真实界面、非作者复核和安装身份 |
+| V09-69 | todo | 运行健康只读读口与统一状态模型（宿主直答本地读口＋Agent tokened 读口同一 builder；`doctor` 扩展 `runtime` 与 `runtime_only` 轻量模式、不新增工具名；503 按 reason 区分） | 无 | 本卡正反例、四态与超时/503 按 reason 语义、同源读数与零写入字节级判据、源清单与非作者复核 |
+| V09-70 | todo | 专用运行诊断页、主工作面全局轻量异常提示、任一主视图可见时 5 秒监看、有界只读重连与脱敏导出 | 无（读口契约冻结后并行；不等待其它卡完成） | 真实浏览器观察、监看/退避/去重/恢复核验反例、脱敏导出核对、类型与构建通过 |
+| V09-71 | todo | 集成、受控安装与真实大项目 Agent+UI 旅程验收（含既有 V09-37 性能返工收敛） | V09-37、V09-69、V09-70 | 集成读数与安装身份一致、真实大项目 Agent+UI 旅程记录、机械期望逐条点名更新留档、非作者复核 |
 | V09-40 | todo | 已认可草图落地：统一小塔台标志、日夜主题、主界面层次与真实图说明 | 无 | docs/ui-redesign-20261004.md；类型/定向行为/界面/图标/正式安装验证 |
 | V09-41 | todo | Agent 简短接续入口，保留真实动作与阻断 | 无 | docs/efficiency-20261004.md；行为与上下文体积对照 |
 | V09-42 | todo | 阶段材料与同步检查按明确章节绑定 | 无 | docs/efficiency-20261004.md；内容变更与失败反例 |
@@ -3449,6 +3458,8 @@ U3 + S3 ──► L1 LICENSE 逐条核对 ──► L4 仓库打磨 + release ta
 | cap-ui-experience | 人话主界面、日夜主题与图标一致 | V06-08、V08-04、V09-40、V06-12、V09-62 | chk-v06-08-01、chk-v08-04-06、chk-v09-40-01、chk-v06-12-01、chk-v06-12-02、chk-v06-12-03、chk-v09-62-08 | int-cap-ui-experience-01 |  |
 | cap-reverse-draft | 从已有代码补设计草稿 | V09-62 | chk-v09-62-06 | int-reverse-draft-01 | 未验 |
 | cap-delivery-overview | 交付总览与人工试用交接 | V09-62 | chk-v09-62-02、chk-v09-62-03 | int-delivery-overview-01 | 未验 |
+| cap-project-workspace-isolation | 同项目多目录与交付候选版本隔离（开发／固定试用／临候选各自按其版本读取） | V09-63、V09-64、V09-65、V09-66、V09-67 | chk-v09-63-01、chk-v09-63-02、chk-v09-63-03、chk-v09-63-04、chk-v09-64-01、chk-v09-64-02、chk-v09-64-03、chk-v09-64-04、chk-v09-65-01、chk-v09-65-02、chk-v09-65-03、chk-v09-65-04、chk-v09-66-01、chk-v09-66-02、chk-v09-66-03、chk-v09-66-04、chk-v09-66-05、chk-v09-67-01、chk-v09-67-02、chk-v09-67-03、chk-v09-67-04、chk-v09-67-05 | int-cap-project-workspace-isolation-01 | 未验（本批尚无运行记录） |
+| cap-runtime-diagnostics | 运行诊断与运行健康读数（专用诊断页、轻量异常提示、Agent 同源读口） | V09-69、V09-70、V09-71 | chk-v09-69-01、chk-v09-69-02、chk-v09-69-03、chk-v09-69-04、chk-v09-69-05、chk-v09-69-06、chk-v09-70-01、chk-v09-70-02、chk-v09-70-03、chk-v09-70-04、chk-v09-70-05、chk-v09-71-01、chk-v09-71-02、chk-v09-71-03、chk-v09-71-04、chk-v09-71-05 | int-cap-runtime-diagnostics-01 | 未验（本批尚无运行记录） |
 
 
 > **本轮 V09-61 功能成员/必需检查语义补齐（2026-10-08）**：按 DESIGN §2.5.2 审定矩阵，把 9 个 `cap-*` 功能行的**真实直接承接卡**补为成员（**保留原有成员**；7 个 `cap-loop-*` 不改身份/语义），并为**新增成员卡**逐条纳入该功能的实际技术义务检查（正常/反例/独审），只补稳定 ID、**不重写正文**。「承接卡」与「必需检查」进**施工定义区**（改它们换施工定义哈希、相关卡重新受检，**不产生执行事实**、不改状态列）。逐条选择理由与边界见 `.工作台/project-completion-20261008/feature-scope-reconcile/REPORT.md`：纯真人体验/接受项不进技术必需列；`V09-09` 的十条检查曾因旧解析判据误吞而零 checkbox（V09-61 plan-parser-repair 已修共同机制恢复解析）；本行据恢复结果补授稳定键 `chk-v09-09-01`…`chk-v09-09-10` 并纳入本功能必需列（非作者复测见 `plan-finalize/`）；`V06-13` 末项为技术+人工历史混合、不整条当技术通过。
@@ -3485,6 +3496,8 @@ U3 + S3 ──► L1 LICENSE 逐条核对 ──► L4 仓库打磨 + release ta
 | plan:cap:06 | int-blueprint-06-01 | MCP 接口设计（读写入口）：只读/接续/写入口语义与工具面计数同源；旧客户端 unsupported 不回退写路由 | 必需 |
 | plan:cap:11 | int-blueprint-11-01 | 建设顺序与里程碑（10 声明模块集成、构建与运行身份）：§11.1 十模块有落点、模块身份一致、构建产物可核 | 必需 |
 | plan:cap:12 | int-blueprint-12-01 | 遗留风险与未决项（现行风险约束闭合）：静态边来源分档、交付阻断判词、风险项有去向不静默 | 必需 |
+| cap-project-workspace-isolation | int-cap-project-workspace-isolation-01 | 同项目多目录与候选版本隔离：登记/接续按目标工作区、写口拒错目标且冻结源码写被拒而中央证据可登记、证据按候选版本隔离且不回落开发目录、交付默认读固定试用版、自动收尾提交树与所受验输入及工作区三者一致；UI/HTTP/MCP 同判据，缺字段不假绿 | 必需 |
+| cap-runtime-diagnostics | int-cap-runtime-diagnostics-01 | 运行诊断 HTTP(本地)/MCP(`doctor.runtime`)/UI 三入口同源同判据（同一 builder）；超时与 503（按 `reason` 区分）不被误判成服务已死/不可达；运行读数零写入、账本字节不增长；旧宿主 `unsupported` 不假绿 | 必需 |
 
 > **蓝图范围集成验收矩阵（2026-10-08，V09-61 整合）**：下表 7 个 `plan:cap:*` 蓝图范围各接一条稳定集成检查 `int-blueprint-XX-01`（对象 ID 就是能力稳定 ID，消费者＝`sixGraphs.ts#declaredIntegration`），
 > 每条的**可执行验收矩阵**用**真实存在**的组合命令（不空集判绿、不只比对 ID）：
@@ -3638,3 +3651,283 @@ U3 + S3 ──► L1 LICENSE 逐条核对 ──► L4 仓库打磨 + release ta
 | req-U-06 | `DESIGN.md` 附录 A U-06 行；正文 §3.7、§3.15；账本 seq 630（来源待证） | 当前有效 | 终端对本人无用（移出主导航）、增加 Git 提交提醒（只读观察）、主动完善交互细节 | 明确 | V06-08、V06-12 |
 | req-U-08 | `DESIGN.md` 附录 A U-08 行；正文 §5.5、§4.1；账本 seq 632（来源待证） | 当前有效 | 高端省重复劳动、五环审计与独立抽查；**GLM 常驻图监工保持移除（排除项，不恢复）** | 明确 | V06-09、V09-01 |
 | req-tatai-ui-20261004 | `docs/ui-redesign-20261004.md#用户授权`；`DESIGN.md` §2.5.2 `cap-ui-experience`；账本 seq 3136 | 当前有效 | 人话主界面（大白话理解进展/模块用途/设计依据）、已认可草图的小塔台标志与日夜主题统一；**不重建 Agent 调度、不新增第七张图、不把演示数据写入正式项目** | 明确 | V09-40 |
+
+---
+
+## 项目工作目录与交付候选批次（2026-10-09 用户授权；**施工定义，实现验收中**）
+
+> **性质**：本段把 `DESIGN.md` §6.13 的用户定版规则与其落地契约 §6.14 展开为**有界施工卡**。规则正文以 §6.13 为准，§6.14 只做施工细化。**本段只定义施工与验收，不表示已实现、不标绿；本批现处于实现验收中**：卡状态以第一张当前任务表与账本为准，模块/能力状态仍按证据派生，**实际落地以实际运行宿主的工具面（`tools/list`）与账本证据为准**；不改既有检查定义、不改既有功能行、不为新功能放宽任何判据。
+>
+> **2026-10-09 首轮复审返工**：本节 5 卡 / 22 检查的组织与「复用唯一账本」方向经复审保留；检查文本按复审 9 项裁定**补足边界**（默认试用视图、被验输入与配套版本同源、完整候选分片不塞进 512、冻结后仍可登记验证证据、提交等于受验输入、新工具接入自动接续、试用提升、恢复两条路径、本项目引导时序），**不删任何必需义务、不新增第二套权威规划**。
+
+**稳定需求 ID**：`req-project-workspace-version-isolation`（唯一写口 `manage_requirement` 登记；首次 seq 5077，本地 Git 收尾修订 seq 5079／revision 2）。本段把既有「待覆盖实现链」逐条落到 V09-63…V09-67；不改写需求、不新建第二套追溯台账。
+
+**实现链 → 卡对应**：① 身份与目录记录（含项目级指针与真实 op） → V09-63；② 候选建立/冻结与被验输入同源 → V09-64；③ 接续与写口（拒绝语义＋冻结后仍可登记验证证据） → V09-63（接续）+ V09-65（拒绝语义）；④ 边界与保留、恢复两条路径 → V09-64 + V09-65 + V09-67；⑤ 本地 Git 收尾与版本历史（提交＝受验输入） → V09-66（提交）+ V09-67（版本一致与交付）；⑥ 试用提升（promotion） → V09-67。
+
+**本批机械影响（如实预告，不改任何判据）**：① 第一张当前任务表新增 5 行（卡行数 90→95）位于追加块锚点**之前**，故 `scripts/verify-v09-03.ts` 的「剥离追加块后逐字节恒等」钉值须按**原算法**重钉，`scripts/verify-v06-02.ts` 的精确卡行数期望 90→95（含其两处负例）须同步——两者都是机械期望维护，**不放宽成 `>=`**。② 若新增 MCP 工具（本批计划 2 个：`manage_workspace`、`finalize_local_commit`），`README.md`、`docs/capabilities.md`、`scripts/verify-u2.ts`（`MCP_TOOL_NAMES`）与 `scripts/verify-m2.ts`（分组点名）须逐条同步，判据仍是**恰好**；`docs/agent-integration.md` 保持不含计数。③ 新增路由须登记进 `src/server/remote-routes.ts`（漏登记即红），写路由须为 `kind:"write"`（本批新增 `GET /api/projects/:id/workspaces`＝read、`POST /api/work/git/finalize`＝write）。④ **新增事件类型必须同时登记**：`src/server/work/types.ts` 的 `REGISTERED_EVENT_TYPES` 与 `src/server/work/eventSurface.ts` 的 `EVENT_SURFACE`（每型须给 `mcp:<工具名>` 或 `internal:<模块>` 出口），否则 `scripts/check-event-surface.ts`／doctor 报红；新模块词表（`WORKSPACE_EVENT_TYPES`）与登记表的一致性由既有断言核。⑤ **版本**：本轮按**本地 0.5.0 候选**准备，四处版本串（`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`）由集成者在最终冻结前统一改并由 `scripts/verify-version-consistency.ts` 核；**不隐含新一轮 GitHub 发布**。
+
+### V09-63 工作区与交付候选登记、接续契约（2026-10-09）
+
+**设计依据**：DESIGN §6.13、§6.14 第 1、2、7 段、§6.7、§2.6、§2.9、§8.1；`req-project-workspace-version-isolation`。
+
+**来源与授权**：用户 2026-10-09 授权「规则已定并登记，现在去实现，并让塔台项目本身在交付总览全绿」；2026-10-09 首轮复审裁定（工作区指派先放运行期登记/认领，**不改旧 `taskDefinitionHash`**；允许 `manage_workspace` 与 `finalize_local_commit` 两个工具）。
+
+**责任角色**：executor
+
+**依赖**：无。
+
+**目标**：按 §6.14 第 2 段建立工作区/交付候选记录与接续契约：稳定工作区身份、用途、规范绝对路径、来源与状态；**主要开发目录由 `<project_id>:main` 派生而不重复登记**，`ProjectRecord.path` 仍是项目与唯一账本的定位锚点（**不被新增开发工作区改写**）；**项目级指针**（当前开发工作区／当前试用候选）另记并带 CAS；接续者从入口与工作包即可拿到目标工作区、实际 cwd、可改范围、应读版本、候选状态与**机器可执行的下一步及其实际参数**。**不新建第二张台账**：记录以事件写入本项目账本，候选不复制可写 `.工作台/`。
+
+**文件责任**：`src/server/work/workspaceBuildBinding.ts`、`scripts/lib/packageVerdict.ts`、`scripts/lib/buildIdentity.ts`、`scripts/lib/buildOutputManifest.ts`、`scripts/package-bind.ts`、`scripts/verify-workspace-package.ts`、`src/mcp/index.ts`、新增 `src/server/work/workspaces.ts`、`src/shared/workspaceTypes.ts`、`src/server/work/hostWiring.ts`、`src/mcp/tools/workspaceTools.ts`、`scripts/verify-v09-63.ts`、`scripts/verify-v09-63b.ts`；改 `src/server/work/types.ts`、`src/server/work/eventSurface.ts`、`src/server/work/entry.ts`、`src/server/work/readWorker.ts`、`src/server/work/taskBrief.ts`、`src/server/work/claims.ts`、`src/server/work/service.ts`、`src/server/work/workPackage.ts`、`src/server/workHost.ts`、`src/mcp/tools/index.ts`、`src/mcp/tools/projectEntry.ts`、`src/server/index.ts`、`src/server/remote-routes.ts`、`AGENTS.md`。**共享入口注册由本卡基础实现者统一接线；其它 worker 不并发改这些文件。**不修改既有检查定义或其它纳管项目。
+
+**交付**：工作区登记/读取/指针/接续契约的实际代码、正反例与真实 HTTP/MCP 读回；源清单与命令/退出码；非作者复核记录。旧项目无工作区记录时按 `:main` 派生口径继续可用。
+
+- [ ] **chk-v09-63-01 工作区登记与指针**：可按需登记 `dev`／`trial`／`candidate` 工作区（稳定 ID、用途、规范绝对路径、来源 `source_kind`/提交或内容指纹、状态、负责人、关联任务）；**主要开发目录由 `<project_id>:main` 派生、不重复保存**；`register`／`update`／`retire`／`select_dev`／`point_trial` 五类写 op 经唯一写口并带 `expected_revision`；**项目级指针**（当前开发工作区、当前试用候选）记于独立实体且**不改 `ProjectRecord.path`**；候选**不复制第二套可写 `.工作台/`**；未知键/非法路径拒绝且**零字节**。
+- [ ] **chk-v09-63-02 接续契约**：`project_entry`／`task_brief`（含其 `omitted` 口径）与工作包给出**目标工作区、实际 cwd、可改范围、应读设计/施工版本、候选状态**与**机器可执行的下一步及其实际参数**（如 `claim_task` 的 `expected_revision`）；认领/续领记录携带目标 `workspace_id` 并由入口读回；缺字段如实标**未知**，不猜、不用其它字段顶替。
+- [ ] **chk-v09-63-03 只读读口与旧客户端**：HTTP 与 MCP 只读读口和入口**同判据**；旧宿主/旧客户端缺新字段时明确 `unsupported`／未知，**不回退写路由、不另算一套判据**；新只读路由 `GET /api/projects/:id/workspaces` 按维护清单登记（`kind:"read"`），写面保持在唯一写口之内。
+- [ ] **chk-v09-63-04 并发与幂等**：并发登记/更新/指针切换按既有版本校验拒 `VERSION_CONFLICT`；相同输入重复登记不产生第二个候选（幂等）；非法输入**零字节**写入、账本原字节不增长。
+
+### V09-64 候选冻结、证据按候选版本解析与交付版本读数（2026-10-09）
+
+**设计依据**：DESIGN §6.13 第 3、5、6 段、§6.14 第 3、4、5、8 段、§2.9、§6.10、附录 E.3；`req-project-workspace-version-isolation`。
+
+**来源与授权**：同上批；2026-10-09 复审裁定「候选冻结须绑定完整实际输入与配套 DESIGN/PLAN/基线」「完整候选与逐检查清单分开」。
+
+**责任角色**：executor
+
+**依赖**：V09-63。
+
+**目标**：把「被验候选」接入既有 `source_manifest` 现读复核链路并把冻结绑定到**同一候选的文档/源码/证据**：冻结固定真实完整输入（含未提交内容是否纳入的声明），候选绑定证据按**确定性来源解析顺序**复核，开发目录后续变化**不机械失效**已冻结候选；**完整候选身份不塞进 512 限额**——用全树内容指纹 + 分片候选索引，逐检查清单仍**有限完整**；交付读数按**明确版本**读取、**默认读当前试用候选**。**不新造判据、不建第二张完成表**：复核仍走 `source_manifest` 与既有投影。
+
+**文件责任**：`scripts/verify-workspace-documents.ts`、新增 `src/server/work/candidateSource.ts`、`src/shared/candidateIndexTypes.ts`、`scripts/verify-v09-64.ts`；改 `src/server/work/evidence.ts`、`src/server/work/statusProjection.ts`、`src/server/work/submitChecks.ts`、`src/server/work/runtimeEntryRevision.ts`、`src/server/work/documents.ts`、`src/server/work/featureLedger.ts`、`src/server/work/deliveryReadout.ts`、`src/server/work/reportingHost.ts`、`src/mcp/tools/recordWorkEvidence.ts`、`src/mcp/tools/featureLedger.ts`、`src/shared/coverageTypes.ts`。**既有 `checkEffectiveness` 与 `checksWithSourceManifests` 判据只做「来源根可注入」的最小改动**，不改其结论语义；`source_manifest` 版本号与指纹算法不变。共享读口与类型由集成者统一接线。
+
+**交付**：候选冻结与来源解析的实际实现、正反例（含目录回收后仍可复核、被篡改不悄悄转读 Git、不可取回时诚实报缺）、`feature_ledger`／交付读数按版本读取的读回原文与源清单。
+
+- [ ] **chk-v09-64-01 候选冻结与被验输入同源**：冻结前固定**完整实际输入**——未提交改动须保全并**声明是否纳入**，**不用 HEAD 冒充实际内容**；记录**全树内容指纹**与**分片候选索引**（每片 ≤512 文件、片数 ≤64，上限可判定，超限如实拒）；同时绑定**配套版本**（所绑 `DESIGN.md`／`PLAN.md` 内容哈希、`baseline_id`、`ledger_last_seq`、清单游标）；来源不明、遗漏拟纳入内容或以 HEAD 顶替时**拒绝冻结**；构建输出与私有运行数据与固定源输入分开。
+- [ ] **chk-v09-64-02 来源解析顺序与恢复两条路径**：候选绑定证据复核按顺序解析字节来源——① 目录仍在且内容指纹相符 → 就地复核；② 目录**已按规则回收/不在**且来源提交可达（Git）或快照库在（非 Git）→ 只读物化/取证到**可再生缓存**后复核（**不 checkout、不写任何工作树**）；③ 均不可得 → 报 `unknown`／失效并点名原因；**目录存在但指纹不符即 `CANDIDATE_TAMPERED`（失效），不得静默转读 Git 掩盖篡改**；非 Git 用可核验内容快照、不 `git init`；**任何情况不回退读开发目录兜底**；恢复须保住 `.gitattributes`、文件模式/路径与私有工作台的设计/施工材料。
+- [ ] **chk-v09-64-03 证据按候选隔离**：候选绑定证据绑定**被验候选真实完整内容 ＋ 同一候选的配套设计/施工定义与基线**；开发目录后续变化**不机械失效**已冻结候选；**该版真实新缺陷仍可追记**（账本继续追加）；候选被旁路篡改或证据损坏报**失效/未知**；临时候选目录按规则回收后**能从提交/既有保管处还原的候选不判失效**；不扩大为每次全项目重验。
+- [ ] **chk-v09-64-04 交付版本读数与默认试用视图**：`feature_ledger` 与交付总览按**明确版本**读取并如实标出所读 `workspace_id`、来源提交/内容指纹与基线；**已登记固定试用版后默认读该版**，**开发视图明确读当前开发工作区**，界面**实际带上解析出的工作区参数**而不省略；默认开发工作区行为与既有读数**逐字段向后兼容**；旧宿主缺字段显示**未知**，不拿其它绿状态代替；物化缓存**可再生**、可清理且不参与指纹。
+
+### V09-65 写口拒错目标与冻结候选写入拒绝（2026-10-09）
+
+**设计依据**：DESIGN §6.13 第 4 段、§6.14 第 6 段、§6.6；`req-project-workspace-version-isolation`。
+
+**来源与授权**：同上批；2026-10-09 复审裁定「拒绝的是改写冻结源码/错目标/错版本，**不是**拒绝中央账本登记验证证据」。
+
+**责任角色**：executor
+
+**依赖**：V09-63。
+
+**目标**：让塔台托管的写口在**目标工作区或版本不符**时拒绝对应写入，并拒绝**直接修改冻结候选源码**；**同时对 frozen 候选放行经唯一写口追加自检/独审/包身份/Git 关联/复测证据**（证据只引用候选版本内容指纹）。拒绝是语义校验，**不冒充 OS 沙箱**（既有 `assertIsolatedWorkspace` 保留为既有防线，不回退、不替代）。
+
+**文件责任**：新增 `src/server/work/workspaceGuard.ts`、`scripts/verify-v09-65.ts`、`scripts/verify-workspace-source-routing.ts`；改 `src/server/work/claims.ts`、`src/server/work/submitChecks.ts`、`src/server/work/context.ts`、`src/server/work/projectIndex.ts`、`src/server/work/executionReceipts.ts`、`src/server/workstation.ts`、`src/server/work/graphRefresh.ts`、`src/server/work/sync.ts`、`src/server/work/syncGraph.ts`、`src/server/work/syncDiscovery.ts`、`src/server/workHost.ts`、`src/server/attachAgentsMd.ts`、`src/server/chatTools.ts`、`src/server/chatTurn.ts`、`src/server/pty.ts`、`src/server/scanner.ts`、`src/server/terminalHistory.ts`、`src/server/watcher.ts`。**共享挂点由基础实现者统一接线**，按协调者分工避免并发覆盖。不修改既有检查定义、不改既有合法路径的判定、**不得把既有「冻结后再验证」的合法路径误改成拒绝**；只读的 src/server/gitStatus.ts 的只读契约一字不动（**不列入本卡可改路径**）。
+
+**交付**：四类拒绝的真实反例（非法/缺失/跨项目/冻结源码写）与既有合法路径回归，**并含「对 frozen 候选登记中央验证证据成功」的正例**；稳定错误码与读回原文；非作者复核记录。
+
+- [ ] **chk-v09-65-01 认领与续领校验**：目标工作区未知、不属本项目、或与任务声明的目标工作区不符时**拒绝认领**并给稳定错误码；认领记录的 `workspace_id` 与任务/工作区授权一致；既有隔离口径（等于/凌驾项目根或落在项目根内非 `.工作台/runs/`）继续拒绝；租约到期仍只表示「所有权需核实」，不当作进程已停。
+- [ ] **chk-v09-65-02 拒绝冻结源码写、放行中央证据**：提交与证据存证的目标工作区/候选须与认领一致；**对候选源码目录的写入**（含冻结源码改写、错目标、错版本）拒绝，**零字节写入**且账本原字节不增长、拒绝原因结构化可读；**对 frozen 候选经唯一写口追加自检/独立审查/包身份/Git 关联/复测证据必须成功**（引用候选版本内容指纹），不得把「冻结」误设计成「拒绝一切中央账本写入」。
+- [ ] **chk-v09-65-03 边界与不冒充沙箱**：校验只拒**塔台托管写口**的对应写入，**不冒充 OS 沙箱**；文档/读回明确 cwd 与允许路径的执行侧边界仍在外部协调器与任务声明；不因此把无关范围纳入重验。
+- [ ] **chk-v09-65-04 反例与既有回归**：非法、缺失、跨项目、**冻结源码写**四类反例**真实拒绝**，且**冻结候选登记中央证据为正例（成功）**；旧项目（无工作区记录）与既有合法认领/提交路径继续可用；既有 V06-10／V09-10／V09-59 相关断言复跑不回归。
+
+### V09-66 本地 Git 自动收尾（2026-10-09 用户纠正）
+
+**设计依据**：DESIGN §6.13 第 7 段、§6.14 第 7、9 段、§3.15、§6.10；`req-project-workspace-version-isolation`。
+
+**来源与授权**：用户 2026-10-09 明确补充「技术验证与独立审查通过后由已获授权 Agent 自动做本地提交」；2026-10-09 复审裁定「提交须真实等于受验输入，须核待提交树/暂存区、hook 只改 index、CRLF/attributes/filter 差异与幂等恢复」；允许 `finalize_local_commit` 工具，**executor 须核真实任务/工作区授权，coordinator 可对已获授权且完成技术验收的本批收尾**。
+
+**责任角色**：executor
+
+**依赖**：V09-65。
+
+**目标**：提供**真实可用**的本地提交写口工具（不是建议或壳代码）：执行时自行重核通过状态与任务授权，只提交本次获授权且实际验过的内容，**显式排除无关暂存内容**，提交后核 `HEAD`/commit tree/工作区与受验输入三者关系；相同内容复用、不产生空提交；`hook` 改文件或只改 index、并发漂移、提交失败**如实返回失败**；**不 `push`**、不改远端配置、不代签验收。只读 Git 提醒界面（§3.15）维持只读，不执行提交。
+
+**文件责任**：新增 `src/server/work/gitFinalize.ts`、`src/server/work/gitFinalizeHost.ts`、`scripts/verify-v09-66.ts`、`scripts/verify-v09-66b.ts`；改 `src/server/workHost.ts`（写路由挂点）、`src/server/index.ts`（路由）、`src/server/remote-routes.ts`、`src/server/work/types.ts`、`src/server/work/eventSurface.ts`、`src/server/work/service.ts`、`src/server/work/workPackage.ts`、`src/shared/coverageTypes.ts`、`src/mcp/tools/workspaceTools.ts`、`src/mcp/tools/index.ts`（工具注册，**由集成者统一改**）。只读的 src/server/gitStatus.ts 的只读契约（写子命令黑名单与只读白名单）**一字不动，不列入本卡可改路径**；不得在只读提醒路径上引入写能力。
+
+**交付**：工具端到端真实运行记录（在隔离夹具仓库上真跑 `git`）、诚实失败反例（未通过/无授权/无关已暂存内容/`hook` 改文件/`hook` 只改 index/空提交）、CRLF/attributes 差异的处理与恢复读数、`commit tree`＝受验输入＝工作区的实测读数与源清单；非作者复核记录。
+
+- [ ] **chk-v09-66-01 触发与授权**：仅在**技术验证与独立审查通过**且持有有效任务/工作区授权时可提交；工具在**执行时自行重核**（不信任调用方声明）通过状态、授权与提交内容范围；**资格判据是「存在有效授权记录」，不因任务转入完成态而失效**（否则收尾窗口永远不可调用）；未通过或无授权时拒绝并说明原因。
+- [ ] **chk-v09-66-02 提交内容范围与暂存区**：提交必须覆盖已验候选相对预期基准 HEAD 的全部获准实际修改；有未授权或未验证依赖修改时拒绝，不能仅取路径交集而遗漏；提交**前**枚举完整暂存区，**显式拒绝**任何「已暂存且与 HEAD 不同、但不属本授权集合」的条目（`REFUSED_UNRELATED_STAGED`）；用 `git add -- <授权路径>` **精确暂存**（**不用 `-A`**）；已有相同内容的提交**复用**；**不产生空提交**（内容与 HEAD 相同即如实返回「无需提交」而非造提交）。
+- [ ] **chk-v09-66-03 提交后核实与诚实失败**：提交后校验 parent 为预期基准、HEAD 为新提交、完整提交树等于预期基准树加已验改动；diff(基准,提交) 恰好等于获准的实际改动路径（多出未授权路径即失败）；逐路径比对提交前暂存 oid 与 `commit:<path>` blob oid（不一致＝**`hook` 只改 index**）；**重读工作区字节**与受验指纹比对（不一致即失败）；**CRLF/attributes/filter** 使入库 blob 与工作区字节不同时，如实分别记录工作区内容指纹与入库 blob 指纹、随材料保存可还原差异（含 `.gitattributes`）、**不悄悄改 Git 配置也不因此永远失败**，需要时用**显式有记录的恢复操作**把源文件恢复为受验字节并复测；`hook` 失败、并发漂移或非零退出**如实返回失败、不记为完成**；**不执行 `push`**、不改远端配置、不代签用户 Gate。
+- [ ] **chk-v09-66-04 关联、幂等与回执恢复**：塔台记录**关联**该 commit、完整输入指纹、交付包/运行身份与证据引用，**不新建追溯台账、不复制原证据**；提交消息带确定性 `finalize_id`，**重复触发幂等**（同输入不产生第二个提交）；**`git` 已成功但回执写失败/响应丢失时，重试以 `finalize_id` 限量检索并重核 parent/可达性/完整树/工作区/候选身份，相符才复用、不重复 commit**；本地提交**不更新另一目录或安装程序**。
+- [ ] **chk-v09-66-05 只读提醒不被越权与自动接续接线**：§3.15 只读 Git 提醒界面**不执行提交**；写能力只经唯一写口与既有角色规则暴露；**工作包对已通过技术验证与独立审查且有授权的任务给出 `finalize_local_commit` 的机器可执行下一步及实际参数**（不是孤立工具）；非 Git 项目用可核验快照、**不假称已保存、不擅自 `git init`**。
+
+### V09-67 交付总览版本一致、运行核对与本批证据续验收口（2026-10-09）
+
+**设计依据**：DESIGN §3.16、§3.17、§6.13 第 5、6 段、§6.14 第 8、11 段、§5.6、§5.8；`req-project-workspace-version-isolation`。
+
+**来源与授权**：用户 2026-10-09 授权「让塔台项目本身在交付总览全绿」；本地发布收尾根因见 `.工作台/diagnose-delivery-regression-20261009/ROOT-DIAGNOSIS.md`；2026-10-09 复审裁定「读数默认固定试用版、试用提升协议、恢复两条路径、本项目引导时序」。
+
+**责任角色**：executor
+
+**依赖**：V09-63、V09-64、V09-65、V09-66。
+
+**目标**：交付总览与 `feature_ledger` 按**明确版本**呈现本项目（含新增能力），**默认读已登记固定试用版**、开发视图读开发区；试用目录只接收已验版本且结果对应同一交付总览版本；提供可执行的**试用提升（promotion）**协议与**恢复两条路径**；同时完成本批**发布收尾**：按变化逐项核对旧证据对新源码的适用性，仍适用的复用真实结果，必要的补做验证与独立审查并经唯一写口登记，再读回主项目全部正式功能与交付核对。**不以自动豁免版本文件、批量刷新哈希或删失败项来恢复绿色**；人的接受保持未签。
+
+**文件责任**：`scripts/verify-fivegraph-dataflow.ts`、`scripts/verify-v09-05.ts`、`src/arch/dataflow.ts`、`scripts/verify-fivegraph-readout.ts`、`scripts/verify-feature-scope.ts`、`scripts/verify-unified-entry.ts`、`scripts/verify-v06-12.ts`、`scripts/verify-v06-09.ts`、`scripts/verify-s3.ts`、`scripts/verify-v09-07.ts`、`scripts/verify-workspace-host-e2e.ts`、改 `src/ui/components/DeliveryOverview.tsx`、`src/ui/components/DeliveryOverview.css`、`src/ui/api.ts`、`src/server/work/featureLedger.ts`、`src/server/work/deliveryReadout.ts`、`src/server/index.ts`、`scripts/verify-delivery-overview-ui.ts`、`README.md`、`docs/capabilities.md`、`DESIGN.md`、`PLAN.md`、`PROGRESS.md`、`scripts/verify-v09-03.ts`、`scripts/verify-v06-02.ts`、`scripts/verify-plan-state-boundary.ts`、`scripts/verify-unified-host.ts`、`scripts/verify-m2.ts`、`scripts/verify-u2.ts`、`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`；新增 `scripts/verify-v09-67-ui.py`、`scripts/verify-workspace-integration.ts`。**共享类型与读口由集成者统一接线**；不修改既有功能行、不改既有检查定义、不代签用户 Gate、不改其它纳管项目。工具计数按**实际注册表**逐条点名同步（判据仍是「恰好」），verify-v09-03.ts 按**原剥离追加块算法**重钉（不放宽断言），版本四源按 scripts/verify-version-consistency.ts 核。
+
+**交付**：交付总览与读口同版本同结论的实际读回、真实浏览器操作、试用提升与恢复两条路径的正反例、实际安装与桌面/HTTP/MCP 身份一致的读数；受影响证据续验的逐项结论（复用/补做/失效）与写口回执；未通过项如实保留。
+
+- [ ] **chk-v09-67-01 交付页版本一致与默认试用视图**：交付总览与 `feature_ledger` **同版本、同结论**；**已登记固定试用版后默认读该版**，开发视图读当前开发工作区，界面**实际带上工作区参数**；新增能力按其**候选版本**读数并标出所读版本；缺字段显示**未知**；部分/历史读取不冒充现行全项目可试用；**不假绿**。
+- [ ] **chk-v09-67-02 试用提升（promotion）与目录同步**：提供可执行的试用提升协议——外部协调者同步**同一份已验源码/产物**到试用位置后由宿主**实测**目录指纹与配套材料/包身份、逐项相符才变更**当前试用候选指针**，失败**保留旧指针**并给补救动作；试用目录只接收**已验版本**、结果对应**同一交付总览版本**；本地 commit **不更新**另一目录或安装程序；开发环境与实际试用实例/数据隔离。
+- [ ] **chk-v09-67-03 运行交付核对**：源冻结后构建并**实际安装**拟交付版本，桌面/HTTP/新 MCP 身份一致；交付总览逐项与同版正式事实核对；版本/来源变化后**正确撤回**就绪结论；人的接受保持**未签**。
+- [ ] **chk-v09-67-04 本批受影响证据续验与恢复两条路径**：按变化逐项核对旧证据对新源码的**适用性**；仍适用的复用**真实**结果，必要的补做验证与独立审查经唯一写口登记并读回；**不自动豁免**版本/依赖文件、**不批量刷新哈希**冒充通过、不删失败项；确实不适用的如实标失效并保留历史；**恢复两条路径**（Git 提交可达 / 非 Git 可核验快照）各有正反例，**源与证据不可得时如实未知**。
+- [ ] **chk-v09-67-05 非作者复核与问题收口**：非作者独立复核本批实现、反例与正式运行包读回；发现问题有正式去向、阻断项修复复测；不以作者自报或卡提交代替复核通过；**不代签用户 Gate**。
+
+## 本批需求映射（2026-10-09 项目工作目录与交付候选）
+
+| 需求 ID | 来源 | 分类 | 适用范围/生效时点 | 确认度 | 承接卡 |
+| --- | --- | --- | --- | --- | --- |
+| req-project-workspace-version-isolation | `DESIGN.md` §6.13、§6.14；账本 seq 5077 登记、seq 5079 修订（revision 2） | 当前有效 | 同项目多目录关联与接续契约、候选冻结与证据按候选版本隔离、写口拒错目标、自动本地 Git 收尾、交付按明确版本一致 | 明确 | V09-63、V09-64、V09-65、V09-66、V09-67 |
+
+## 本批功能映射落点（2026-10-09 项目工作目录与交付候选）
+
+> **落点说明**：`coverageModel.parsePlanFeatureMap` 只吸收**文档中第一张**表头同时含「功能 ID」「承接卡」的表并即返回（`coverageModel.ts:461`），因此 `cap-project-workspace-isolation` 的功能行**追加进既有「功能→任务/检查/集成映射（2026-10-07 新判据）」主表**（本段不再另立第二张功能表，避免写进去是死声明）。**结果状态是派生列**（不进定义哈希）：本批该行只声明功能↔卡↔检查的**身份与义务**，不产生执行事实；`未验` 只是「本批尚无运行记录」，**不等于**「无实现」，也**不**代表已通过。集成检查行同样追加进既有「集成检查要求」表（`parseIntegrationRequirements` 同取第一处该标题）。
+
+**验收场景（原 13 条，现映射到上列检查；尚未按验收口径执行——实现自测/作者自报不等于验收）**：① 同项目多目录关联及两个 Agent 接力时任务始终指向正确工作区与材料版本（含入口/工作包给出机器可执行下一步及实际参数）→ `chk-v09-63-02`；② 来源不明、遗漏拟纳入未提交内容或以 HEAD 冒充实际内容时拒绝冻结；冻结同时绑定配套 DESIGN/PLAN/基线且全树指纹+分片索引超出限额如实拒 → `chk-v09-64-01`；③ 受控写口拒绝**冻结源码写**，合法修改派生新候选并保留来源，旁路篡改只报原候选失效；**冻结候选仍可登记中央验证证据** → `chk-v09-65-02`、`chk-v09-64-03`；④ 候选被旁路篡改或证据损坏显示失效/未知、**不回退开发目录也不静默转读 Git**（临时目录按规则回收、可从提交/既有保管处还原的不判失效）→ `chk-v09-64-02`、`chk-v09-64-03`；⑤ 下一版开发变化不影响固定试用版，真实新缺陷仍可追记该版；**交付读数默认读已登记固定试用版、开发视图读开发区** → `chk-v09-64-03`、`chk-v09-64-04`、`chk-v09-67-01`、`chk-v09-67-02`；⑥ 工作区/版本不符时拒绝对应写入 → `chk-v09-65-01`、`chk-v09-65-02`；⑦ 旧客户端缺少能力时明确边界、人工核对，不伪调用工具 → `chk-v09-63-03`；⑧ 最终交付包与实际受验包一致，开发与试用数据分离、受引用候选版本与证据可保留与追溯；**试用提升须经宿主实测指纹与配套材料** → `chk-v09-67-02`、`chk-v09-67-03`；⑨ 技术验证与独立审查通过后自动本地提交、提交内容与验证输入一致、已有相同内容提交被复用且不产生空提交；**提交前排除无关已暂存内容** → `chk-v09-66-01`、`chk-v09-66-02`；⑩ hook 改文件或提交失败时如实返回、不记为完成，本地收尾不隐含 push/发布授权、不把 commit 当验证或用户接受；**hook 只改 index 或 CRLF/attributes 使入库 blob 与工作区字节不同时如实分流处理** → `chk-v09-66-03`；⑪ 提交后的实际内容与验证输入不一致时按失败处理；**`git` 已成功但回执写失败时按 `finalize_id` 幂等恢复、不重复 commit** → `chk-v09-66-03`、`chk-v09-66-04`；⑫ 清理临时候选目录后仍能按提交还原完整所验源码与证据并可继续派生（非 Git 用可核验快照）→ `chk-v09-64-02`、`chk-v09-67-04`；⑬ 提交不可达或无法取回时如实报未知/失效、禁止读开发目录兜底，非 Git 项目用可核验快照、不假称已保存、不擅自 `git init` → `chk-v09-64-02`、`chk-v09-66-05`。
+
+### V09-68 实现读数与执行登记的关联修正（2026-10-10）
+
+**设计依据**：DESIGN §3.16、§3.17、§4.2、§6.12、§6.13、§6.14；用户 2026-10-10 要求用内置子代理修复功能方块将缺登记误示为缺实现的问题。
+
+**责任角色**：executor
+
+**依赖**：无。
+
+**目标**：修复既有功能清单解释，不新增产品功能或验收豁免。保留执行原始状态、技术验证、独审和用户接受；按真实成员结果登记与当前验证依据解释实现列。没有登记不推定未实现，部分成员已提交不显示整项未开始。
+
+**文件责任**：`src/shared/implementationReadout.ts`、`src/shared/coverageTypes.ts`、`src/server/work/coverageModel.ts`、`src/server/work/featureLedger.ts`、`src/ui/components/DeliveryOverview.tsx`、`src/ui/components/FeatureLedgerView.tsx`、`src/ui/components/deliveryOverviewDisplay.ts`、`scripts/verify-feature-ledger.ts`、`scripts/verify-feature-cross-interface.ts`、`scripts/verify-feature-ledger-ui.py`、`scripts/verify-delivery-overview-ui.ts`、`docs/loop-closure-20261007.md`、`PROGRESS.md`、`PLAN.md`。本卡具体化本次有界修复与本地收尾的授权，不扩大旧卡范围；保留冻结旧候选，不修改其源码。不 push，不代签用户 Gate。
+
+**交付**：共享的人话解释与真实登记摘要、相关正反例和版本/分页一致、非作者复核、同源构建与本机实际安装；按 §6.13／§6.14 自动本地提交。既有未受影响功能和有效证据按差额复用，记录适用性，不机械扩成全项目审计。
+
+- [ ] **chk-v09-68-01 真实登记与同源解释**：真实隔离账本的无执行已验证、部分提交、全部提交、未验证与失效证据均准确；HTTP/MCP、方块及设计页共享解释；不伪造提交、不修改 canonical 义务或 Gate，旧游标不得跨解释版本。
+- [ ] **chk-v09-68-02 界面与受影响回归**：真实浏览器验证方块和详情的人话解释、部分提交、缺登记和失效/刷新失败；设计页实际渲染不矛盾；类型与构建通过。未改变交互的适用旧证据可以复用并说明。
+- [ ] **chk-v09-68-03 非作者复核**：非作者复核需求、设计、实现、接口与验证/交付，实际复测关键反例；来源固定、覆盖明确，无本次未闭合阻断缺陷。
+- [ ] **chk-v09-68-04 同源安装与版本读回**：冻结源构建的包与安装后的桌面、HTTP/新 MCP 身份一致；真实示例项目功能方块使用新解释，原始执行与验证事实仍一致；桌面快捷方式可用。旧冻结候选与用户数据保留，用户接受仍待本人。
+
+## 运行诊断与接续提速批次（2026-10-13 用户授权；已纳入正式施工）
+
+> **性质**：本段按用户 2026-10-13 授权诊断维护（`D:/tatai/.工作台/diagnose-agent-entry-20261013/`，含 `ROOT-DIAGNOSIS.md`）与主协调者审定修正，把设计落点（DESIGN §3.7／§3.18／§6.8 追加段／§6.15／§11.3／§11.6／§11.8／§12.1／§12.2／附录 E.22）细化为施工卡。**保留既有 96 卡与全部勾选位、卡定义一字不动**；本批**只新增 V09-69／V09-70／V09-71 三张卡**（第一张当前任务表卡行 96 → 99）。**性能修复直接承接既有已重开（attempt 2）的 V09-37 返工范围，不另立重复性能卡**。
+
+**批次名（拟，唯一写口 `manage_change` 登记后生效）**：`change-runtime-diagnostics-20261013`。
+
+**稳定需求 ID（root 经唯一写口 `manage_requirement` 登记后方为有效）**：`req-runtime-diagnostics-20261013`、`req-agent-entry-latency-20261013`。**登记由 root 做**；本段先按现行可解析格式登记承接关系，登记完成前执行导入会因**悬空需求引用**被拒（fail-closed，如实拒绝，不绕过）。
+
+**目标**：① 真实大项目**无变化重读**不再触发重算/超时（**请求内**快照共享、证据/源核验去重、图计算复用，**保留请求外必要前后内容核验**）；② 新增**专用运行诊断页**与主界面**全局轻量异常提示（任一主视图可见时监看）**；③ Agent 读**同一份**诊断报告；④ **脱敏导出**；⑤ **有界只读重连**。**交付绿（feature_ledger.delivery）与运行健康分开；不统一抬超时；不建自愈平台；不自动重启/改账本/放松门禁。**
+
+> **2026-10-13 设计复审修正（本段三卡随之修正，既有 96 卡仍一字不动）**：按复审返工，改**本批三卡**（非既有 96 卡）：① V09-69／本节 503 一律表述改为**按 `reason` 区分**（`QUEUE_SATURATED`≠不可达、`SOURCE_UNAVAILABLE` 按可达性判），并明确 `doctor` **既有显式 `heal:true` 自愈不变**、只新增 `runtime` 读取与 `runtime_only` 不自动启动；② V09-70／本节监看改为**任一主视图可见时每 5 秒**（因主工作面全局异常提示），重连**成功即停本轮重试并恢复正常监看**（非稳态零请求）。
+
+**依赖与写域（前后端独立、共享文件单独占用，禁止并发覆盖）**
+
+| 拟卡号 | 交付目标 | 写域 | 依赖 |
+| --- | --- | --- | --- |
+| V09-69 | 运行健康只读读口与统一状态模型（双读口同一 builder；MCP `doctor` 扩展 `runtime`／`runtime_only`，不新增工具名；503 按 `reason`） | 后端（`src/server` + `src/mcp`） | 无 |
+| V09-70 | 专用运行诊断页、主工作面全局轻量异常提示、任一主视图可见时 5 秒监看、有界只读重连与脱敏导出 | 前端（`src/ui`） | 无（读口契约冻结后与 V09-69 并行） |
+| V09-71 | 集成、受控安装与真实大项目 Agent+UI 旅程验收（含 V09-37 性能返工收敛） | 集成（文档/版本/安装/回归） | V09-37、V09-69、V09-70 |
+
+> **V09-70 无卡号依赖**：前端在**读口契约冻结后即可并行开工**（固定契约即 §6.15 的路径/参数/字段/错误码），**不等待 V09-69 完成交付**；故依赖列只写「无（读口契约冻结后并行；不等待其它卡完成）」，不产生 V09-69 卡号依赖。**共享后端入口**（`src/server/index.ts`、`service.ts`、`remote-routes.ts`）由 V09-69 单独占用，V09-70 **不改后端**。
+
+**与既有 V09-37 的关系（性能）**：本轮性能修复**直接承接既有已重开（attempt 2）的 V09-37 返工范围**（后台派生与有界公平调度：请求内快照共享、证据/源核验去重、图计算复用），**不另立重复性能卡**；`ROOT-DIAGNOSIS` 记录的 **V09-31／V09-38 源变失效**须按真实源变化**收敛恢复失效验证链**（当前源码复验 + 非作者证据）后再认领 V09-37，**不为解锁刷新哈希、不绕过门禁**；V09-71 依赖 V09-37（本批性能收敛）与 V09-69／V09-70。
+
+---
+
+### V09-69 运行健康只读读口与统一状态模型（2026-10-13）
+
+**接口接线责任补充**：`src/shared/runtimeDiagnostics.ts` 为前后端唯一类型契约；`src/server/work/readWorkerPool.ts` 负责有界作业遥测；必要构建输入登记由 `scripts/lib/buildIdentity.ts` 同步。本卡独占上述文件，性能卡不并发写读池。无新增依赖。
+
+**设计依据**：DESIGN §3.18、§6.15、§6.8 追加段、§6.10、§6.11、§6.6、§3.7；`req-runtime-diagnostics-20261013`。
+
+**来源与授权**：用户 2026-10-13 授权诊断维护（`D:/tatai/.工作台/diagnose-agent-entry-20261013/`）；主协调者审定修正。
+
+**责任角色**：executor
+
+**依赖**：无。
+
+**目标**：在宿主主线程新增**只读**运行诊断读口与**统一状态模型**（`healthy/degraded/unavailable/unknown`；**超时≠服务已死、503 按 `reason` 区分（`QUEUE_SATURATED`≠不可达、`SOURCE_UNAVAILABLE` 按可达性判）**；运行观测短时新鲜度 30 秒；`last_success`/`staleness` 明确），**只读有界运行遥测与 worker 队列、不重推导、不进 CPU 重派生队列**；并让 MCP `doctor` 读到**同一份**报告（`runtime` 段 + `runtime_only` 轻量模式，**不新增工具名**、**`runtime`/`runtime_only` 不触发自愈或自动拉起写服务**，**既有显式 `heal:true` 自愈不变**）。**交付绿与运行健康分开。**
+
+**文件责任**：新增 `src/server/work/runtimeDiagnostics.ts`（装配统一状态模型 + typed allowlist 脱敏边界）；改 `src/server/work/service.ts`（新增主机直答只读读口）、`src/server/index.ts`（逐条列名转发两条路由）、`src/server/remote-routes.ts`（`kind:"read"` 登记）、`src/mcp/tools/doctor.ts`（新增 `runtime` 段 + `runtime_only` 参数）；新增 `scripts/verify-v09-69.ts`、`scripts/verify-v09-69-mcp.ts`。**共享入口（`service.ts`／`index.ts`／`remote-routes.ts`）由本卡单独占用**，V09-70／V09-71 不得并发改。**不新增 MCP 工具名**（工具计数零波及）。
+
+**输入/输出契约**：见 DESIGN §6.15（`schema_version=1`；双读口同一 builder：本地 `GET /api/runtime/diagnostics` 不索要 work token，tokened `GET /api/work/diagnostics` 供 Agent；503 带 `reason`（`SOURCE_UNAVAILABLE`|`QUEUE_SATURATED`）；无原始请求正文/路径/query/token（含前缀与幂等键）/stack/聊天；导出仅 typed allowlist）。
+
+**交付**：只读读口四态正反例（各自报因）、**超时带 `last_success`**、**503 按 `reason`（`QUEUE_SATURATED` 不报 `unavailable`、`SOURCE_UNAVAILABLE` 按可达性判）**、HTTP 与 MCP 同源读数、**零写入字节级判据**、源清单与命令/退出码、非作者复核记录。
+
+- [ ] **chk-v09-69-01 统一状态模型与超时/503 语义**：`healthy/degraded/unavailable/unknown` 由**单一判据**派生；**超时且有 `last_success` ⇒ `degraded`（带 `timed_out:true`）、从未成功 ⇒ `unknown`，只有明确的描述符缺失/进程退出/连接被拒才 `unavailable`**；**503 必带 `reason`——`QUEUE_SATURATED`（读池/扫描池队列饱和）不得报 `unavailable`；`SOURCE_UNAVAILABLE` 按可达性判（明确不可达 ⇒ `unavailable`、仅超时记 degraded/unknown），不把 503 一律当饱和**。反例：模拟超时**不得**得到 `unavailable`；模拟 `503 QUEUE_SATURATED`**不得**得到 `unavailable`。
+- [ ] **chk-v09-69-02 时间与新鲜度**：每维度给 `observed_at`／`last_success_at`／`last_success_age_ms`／`stale_after_ms`／`age_state`／`degraded_since`；运行观测 `stale_after_ms`＝**短时阈值 30 秒**，**不套** 24h；`stale` 只作「该重新看一眼」，**不自动判失效、不撤入口、不改写交付结论**。
+- [ ] **chk-v09-69-03 只读有界且不进重队列**：诊断只读有界内存运行遥测与 worker 队列，**不调用**图／功能清单（ledger）／基线／完整 `doctor` 等重推导；构造重派生在途（读池 busy/queued）时诊断读口**仍按时返回**，不被重计算堵住；**不统一抬超时**。
+- [ ] **chk-v09-69-04 双读口同一 builder 与 `doctor` 扩展**：本地 `/api/runtime/diagnostics`（不索要 work token）与 tokened `/api/work/diagnostics` **同源同判据**（同一 builder）；`doctor` 新增 `runtime` 段与 `runtime_only` 轻量模式，**不新增工具名**、**`runtime`/`runtime_only` 不触发自愈或自动拉起服务**（**既有显式 `heal:true` 自愈不变**）；宿主/客户端不支持 ⇒ `runtime:{state:"unknown",unsupported:["runtime_diagnostics"]}`，**不回退写路由、不另算判据**；既有 `doctor` 五段与 `/api/work/health` 向后兼容。
+- [ ] **chk-v09-69-05 字段、脱敏与零写入**：`schema_version=1` 与字段集（`generated_at`／进程身份／`release_id`／`status`／`reasons`／`last_success`／**有界** recent incidents／`queue`／`timing`），统计**分 queue 与执行**、**没测不编**；typed allowlist，**不含**请求/响应正文、路径、query、token（含前缀与幂等键）、stack、聊天、密钥；不写事件/证据/租约、不自愈、不触发扫描、不拉起写服务；**账本原字节不增长**。
+- [ ] **chk-v09-69-06 非作者复核**：非作者复核四态判据、超时/503（按 `reason`）边界、双读口同源与保密边界，实际复测反例。
+
+### V09-70 专用运行诊断页、主工作面全局轻量异常提示、任一主视图可见时 5 秒监看、有界只读重连与脱敏导出（2026-10-13）
+
+**接口接线责任补充**：`src/ui/useRuntimeDiagnostics.ts`、`src/ui/runtimeDiagnosticsMonitor.ts` 承载单一监看状态与有界重连，页面和全局提示共用；共享类型只读引用后端卡的 `src/shared/runtimeDiagnostics.ts`。
+
+**设计依据**：DESIGN §3.18、§3.11、§6.15、§3.7；`req-runtime-diagnostics-20261013`。
+
+**来源与授权**：同上。
+
+**责任角色**：executor
+
+**依赖**：无（**读口契约冻结后与 V09-69 并行**；不等待 V09-69 完成）。
+
+**目标**：在维护诊断范围新增**运行诊断页**（沿现有辅助入口）；主工作面给**全局轻量异常提示**（`healthy` 安静、异常一行可见，任一主视图可见都显示）；**任一主视图可见时每 5 秒轻量监看**（全部主视图隐藏即暂停、至多一笔在途）与**有界只读重连**（退避 400ms×2 封顶 6s、最多 6 次即停；**成功即停本轮失败重试、恢复 5 秒监看**；焦点/`online`/手动再试、恢复后确认新报告与宿主身份）；**导出脱敏报告**。
+
+**文件责任**：新增 `src/ui/components/RuntimeDiagnosticsView.tsx`、`src/ui/components/RuntimeHealthHint.tsx`、`scripts/verify-v09-70.ts`、`scripts/verify-v09-70-ui.py`（真浏览器）；改 `src/ui/projectScope.ts`（`ViewKey` 加 `"diagnostics"`）、`src/ui/App.tsx`（`AUX_NAV` 追加项 + `FULL_HEIGHT_VIEWS`）、`src/ui/api.ts`（`getDiagnostics()`）；复用 `src/ui/useProjectRefresh.ts#useBoundedReloader`、`src/ui/components/BuildIdentityPanel.tsx` 模式、`src/ui/sharedRead.ts`。**前端独立写域，不改后端。**
+
+**输入/输出契约**：读 V09-69 的 `GET /api/runtime/diagnostics`（固定契约后并行）；导出走 DESIGN §6.15 typed allowlist 的 `runtime-diagnostics-report v1`。
+
+**交付**：真实浏览器逐页观察（默认态、异常可见、详情不吃掉主区、窄窗可读、切项目不串）、监看/重连正反例（任一主视图可见时 5 秒、全隐藏暂停、至多 1 在途、重连成功回正常监看、退避/去重/恢复核验/次数用尽停止）、脱敏导出核对、类型与构建通过；**人的可用性观察不由 agent 代签**。
+
+- [ ] **chk-v09-70-01 默认态与异常可见**：`healthy` 默认安静（不占常驻行，或至多一行）；`degraded/unavailable/unknown` 默认态**可见**（状态+原因+观测时间+查看入口）；**提示是主工作面全局的**（任一主视图可见都显示）；收起详情**不删数据**、不吃掉画布（§3.11）。
+- [ ] **chk-v09-70-02 可见态监看与切项目不串**：**任一主视图可见时**每 5 秒轻量读取、**全部主视图隐藏即暂停**、任一瞬间**至多一笔在途**（同 URL 同代际去重、旧回包作废、卸载 abort）；**暂停/停止如实标注**（不把「已暂停／已停止」说成仍在主动监看）；切项目/切版本**取消或丢弃旧请求**，快速切换**不显示他项目读数**。
+- [ ] **chk-v09-70-03 有界只读重连**：只对「没连上」重试（业务错误不重试）；退避 **400ms×2 封顶 6s**、**最多 6 次即停**；**成功即停本轮失败重试、恢复可见态 5 秒监看（非稳态零请求）**；焦点/`online`/手动再试可再触发；恢复后**重读并比对** `generated_at`/宿主进程身份/构建身份偏斜（**不拿旧成功冒充当前**）；**不自动重启/拉起写服务/改代码/改账本/放松门禁**。
+- [ ] **chk-v09-70-04 冷启动、客户端观测与脱敏导出**：冷启动 `unknown` 有**加载宽限**、不立即报故障，持续未知明确提示；**前端自身网络失败只作 client observation**、**不伪装成后端报告**；导出报告**不含**请求/响应正文、token（含前缀与幂等键）、聊天、密钥，附 `redaction.note`；导出**只读**、不触发重算、不写账本。
+- [ ] **chk-v09-70-05 真实浏览器与旧端**：真浏览器默认入口可达、异常提示与详情可用；后端未提供读口时页面**明报未接入**，不假装有数据；类型/构建通过。
+
+### V09-71 集成、受控安装与真实大项目 Agent+UI 旅程验收（集成发布卡，2026-10-13）
+
+**设计依据**：DESIGN §3.18、§6.15、§6.8 追加段、§11.8、§6.10、§11.6、附录 E.22；`req-runtime-diagnostics-20261013`、`req-agent-entry-latency-20261013`。
+
+**来源与授权**：本批三卡与既有 V09-37 性能返工收敛后，由协调者集成与受控安装。
+
+**责任角色**：coordinator（集成）+ executor（实测）
+
+**依赖**：V09-37、V09-69、V09-70。
+
+**目标**：集成三卡与 V09-37 性能收敛、同步文档/版本、**受控安装**拟交付版本并**同版本读回**；在**真实大项目**上走通 **Agent（MCP）＋ UI 双旅程**（Agent 读 `doctor.runtime` 与接续入口在预算内返回、**诊断不被重队列堵住**；UI 诊断页、异常提示、可见态监看、有界重连、脱敏导出可用）；**零写入**核对；非作者复核；**人的接受保持未签**。
+
+**文件责任**：`DESIGN.md`、`PLAN.md`、`PROGRESS.md`、`README.md`、`docs/capabilities.md`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`package.json`（版本四源）、`scripts/verify-version-consistency.ts`、`scripts/verify-v06-02.ts`、`scripts/verify-v09-03.ts`（机械期望逐条点名同步）；新增 `scripts/verify-v09-71-e2e.ts`、`scripts/verify-v09-71-ui.py`。**不代签用户 Gate、不改既有检查定义、不 push。**
+
+**交付**：集成读数与安装身份一致、真实大项目 Agent+UI 旅程记录（**拿不到真实 usage 即标「未测」**）、打包物-源码绑定、机械期望逐条点名更新留档（五要素，不放宽）、非作者复核。
+
+- [ ] **chk-v09-71-01 集成与同源**：HTTP（本地）/MCP（`doctor.runtime` 与 `runtime_only`）/UI 三入口读数**同源同判据**（同一 builder）；切项目不串；旧宿主 `unsupported`/未知。
+- [ ] **chk-v09-71-02 受控安装与版本一致**：源冻结后构建并**实际安装**拟交付版本，桌面/HTTP 新 MCP 身份一致；诊断页与 `doctor.runtime` 与同版事实一致；版本四源一致。
+- [ ] **chk-v09-71-03 真实大项目 Agent+UI 旅程**：真实大项目（如示例项目）接续——**Agent** 读 `doctor.runtime` + `project_entry`／`task_brief` 在预算内返回（V09-37 收敛后无变化重读不超时）、**诊断不被重队列堵住**；**UI** 打开诊断页、异常提示、可见态监看、有界重连、脱敏导出**可用**；旅程成对记录 usage（拿不到真实 usage 即标「未测」）；运行读数**零写入**、账本字节不增长。
+- [ ] **chk-v09-71-04 机械影响与文档同步**：新增路由逐条点名更新 `src/server/remote-routes.ts`；**因不新增工具名，`verify:u2`／`verify:m2`／README／`docs/capabilities.md` 的「恰好」计数不变**（若实际有变则逐条点名同步）；`verify-v06-02` 卡行数按原算法重钉（**96 → 99**，判据未放宽）；`verify-v09-03` 剥离块钉值按**原算法**重钉（不放宽）；版本四源由 `scripts/verify-version-consistency.ts` 核。
+- [ ] **chk-v09-71-05 非作者复核与用户 Gate**：非作者独立复核本批实现、反例与正式运行包读回；阻断项修复复测；**不代签用户 Gate**，人的接受保持**未签**。
+
+---
+
+## 本批需求映射（2026-10-13 运行诊断与接续提速）
+
+> **登记状态（本段起草时点）**：`req-runtime-diagnostics-20261013`、`req-agent-entry-latency-20261013` 为**拟定稳定 ID**，**登记由 root 经唯一写口 `manage_requirement` 做**（本段只按现行可解析格式登记承接关系）。登记完成前执行导入会因**悬空需求引用**被拒（fail-closed）；分类列按现行映射表列名口径填写。
+
+| 需求 ID | 来源 | 分类 | 适用范围 | 确认度 | 承接卡 |
+| --- | --- | --- | --- | --- | --- |
+| req-runtime-diagnostics-20261013 | 用户 2026-10-13 授权诊断维护（专用诊断页/轻量提示/Agent 同源/脱敏导出/有界重连/运行健康模型）＋DESIGN §3.18／§6.15；批次 change-runtime-diagnostics-20261013 | 当前有效 | 运行诊断与运行健康读数 | 明确 | V09-69、V09-70、V09-71 |
+| req-agent-entry-latency-20261013 | 用户 2026-10-13 授权诊断维护（真实大项目无变化重读不触发重算/超时）＋DESIGN §6.8 追加段／附录 E.22；`ROOT-DIAGNOSIS` 缺陷 f-97057ed3ca5b883e | 当前有效 | 真实大项目无变化读取提速 | 明确 | V09-37、V09-71 |
+
+## 本批功能映射落点（2026-10-13 运行诊断）
+
+> **落点说明**：`coverageModel.parsePlanFeatureMap` 只吸收**文档中第一张**表头同时含「功能 ID」「承接卡」的表并即返回（`coverageModel.ts:461`），故 `cap-runtime-diagnostics` 的功能行**追加进既有「功能→任务/检查/集成映射（2026-10-07 新判据）」主表**（本段不另立第二张功能表，避免写进去是死声明）。集成检查行同样**追加进既有「集成检查要求」表**（`parseIntegrationRequirements` 同取第一处该标题）。**结果状态是派生列**（不进定义哈希）：本批行只声明功能↔卡↔检查的**身份与义务**，不产生执行事实；`未验` 只是「本批尚无运行记录」，**不等于**「无实现」，也不代表已通过。
+
+**验收场景 → 检查映射（尚未按验收口径执行；作者自测/自报不等于验收）**：① 正常运行 `healthy` → `chk-v09-69-01`、`chk-v09-70-01`；② 慢/超时与重派生在途 → `chk-v09-69-01`、`chk-v09-69-03`、`chk-v09-71-03`；③ **503 按 `reason`**：`QUEUE_SATURATED` 不得报不可达、`SOURCE_UNAVAILABLE` 按可达性判 → `chk-v09-69-01`；④ 断连/恢复与退避 → `chk-v09-70-03`；⑤ 运行观测过期（30s）→ `chk-v09-69-02`；⑥ 冷启动 `unknown` 与前端网络失败（client observation）→ `chk-v09-70-04`；⑦ 切项目不串 → `chk-v09-70-02`、`chk-v09-71-01`；⑧ 真实大项目 Agent+UI 旅程 → `chk-v09-71-03`；⑨ 安装版本一致 → `chk-v09-71-02`；⑩ 零写入与保密（无正文/路径/token/密钥）→ `chk-v09-69-05`、`chk-v09-70-04`、`chk-v09-71-03`。
+
+## 本批机械影响（2026-10-13，如实预告；施工时实测更新、逐条留档、判据不放宽）
+
+1. **第一张当前任务表卡行 96 → 99**（V09-68 行之后纯插入 V09-69…V09-71 三行；既有卡行/勾选位零改动）⇒ `scripts/verify-v06-02.ts` 的「行数恰好」断言按**原算法**重钉为 99（**不放宽成 `>=`**）。
+2. **PLAN 文末追加段**（本批入口段 + 三张卡定义 + 需求映射 + 功能映射落点 + 本说明）⇒ `scripts/verify-v09-03.ts` 的「剥离追加块后与钉值逐字节恒等」钉值按**原算法**重钉（不放宽）。
+3. **新增两条只读路由**（本地 `/api/runtime/diagnostics`、tokened `/api/work/diagnostics`）⇒ 逐条登记 `src/server/remote-routes.ts` 并在 `src/server/index.ts` 列名转发；漏登记即红。
+4. **不新增 MCP 工具名**（`doctor` 只增输出段与 `runtime_only` 参数）⇒ `scripts/verify-u2.ts`／`scripts/verify-m2.ts`／`README.md`／`docs/capabilities.md` 的「恰好」工具计数**不变**；若后续改为新增工具则逐条点名同步（口径不变）。
+5. **`doctor` 新增 `runtime` 输出段**若影响既有断言（如 `verify:v07-04` 等）⇒ 逐条点名同步，不改既有段语义。
+6. **版本四源**由 `scripts/verify-version-consistency.ts` 核；**本批不额外重写版本号或 README 产品宣称**。
+7. **PROGRESS.md 交付时顶部追加**（只追加）：时间/执行者/卡号/改动文件/实际验证/踩坑。

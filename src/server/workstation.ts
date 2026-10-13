@@ -6,7 +6,10 @@ import { getProject } from "./registry";
 import { nowIso } from "./time";
 // V06-02：`.工作台/` 目录名与两份图纸的**唯一当前源**解析（含登记路径与越界拒绝）都收在 work/documents.ts，
 // 本层只接上入口——设计书的读写路径口径仍在这里（readDesign/appendDesign/appendDiscuss 都走 designPath）。
-import { WORKBENCH_DIRNAME, resolveDocumentSource } from "./work/documents";
+import { WORKBENCH_DIRNAME, assertDocumentWriteAllowed, resolveDocumentSource } from "./work/documents";
+// V09-63 源根贯通：托管文档写口的**目标根**要按"当前开发工作区"解析（§6.14 第 2/6 段）。委派给已存在的
+// 规范解析器，不新造路径事实：坏指针/目录不在 → 明确拒绝，不静默回退项目根。
+import { resolveCurrentDevRoot } from "./work/workspaces";
 // V06-03：v1 写口的"新格式拒写"闸门与兼容投影读口。判据/文案都收在 work/tasks.ts（leaf 模块），
 // 本层只调用——这样 workstation ↔ work/tasks 不成环，也不会把 v2 逻辑塞进这个数据层。
 import { readCompatTasksProjection, readTaskStates, v1TaskWriteGate, v1StatusOf, TASK_STATUS_LABELS, type TaskExecutionStatus } from "./work/tasks";
@@ -713,6 +716,34 @@ export function designPath(projectId: string, dataDir?: string): string {
   return resolveDocumentSource(projectId, "design", dataDir).abs_path;
 }
 
+/** 塔台自身例外（与 designPath/documents 同一口径）：塔台设计源固定在 repo 根，不受工作区指针影响 */
+function isSelfManaged(projectId: string, dataDir?: string): boolean {
+  const project = getProject(projectId, dataDir);
+  return project != null && (project.self_managed === true || project.id === "tatai");
+}
+
+/**
+ * 守卫：托管写口的**目标根**必须可用的当前开发根（DESIGN §6.14 第 2/6/10 段）。
+ * **有显式指针却坏**（不存在/已回收）或**目录不在盘上** → 拒绝写入，绝不静默回退项目根。
+ * 塔台自身的图纸源固定在锚点根（documents 的既有例外），不按指针改写，故跳过本判据。
+ */
+function assertDevRootWritable(projectId: string, dataDir?: string): void {
+  if (isSelfManaged(projectId, dataDir)) return;
+  const dev = resolveCurrentDevRoot(projectId, dataDir);
+  if (dev.root === null) {
+    throw new WsError(
+      "INVALID_INPUT",
+      `当前开发指针不可用（source=${dev.source}）：${dev.blocked_reason ?? "目标工作区不可用"}——拒绝写入，不静默回退项目根（DESIGN.md §6.14 第 2/10 段）`,
+    );
+  }
+  if (!fs.existsSync(dev.root) || !fs.statSync(dev.root).isDirectory()) {
+    throw new WsError(
+      "INVALID_INPUT",
+      `当前开发工作区目录不在盘上：${dev.root}（工作区 ${dev.workspace_id}）——拒绝写入，不回退项目根`,
+    );
+  }
+}
+
 /** 读设计书全文；文件不存在返回 { exists: false }，不报错崩溃 */
 export function readDesign(projectId: string, dataDir?: string): DesignDoc {
   const file = designPath(projectId, dataDir);
@@ -765,6 +796,8 @@ export function appendDesign(
     throw new WsError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`);
   }
   const file = designPath(projectId, dataDir);
+  assertDevRootWritable(projectId, dataDir);
+  assertDocumentWriteAllowed({ projectId, dataDir, targetRoot: path.dirname(file) });
   const countLines = (t: string) => (t === "" ? 0 : t.replace(/\n+$/, "").split("\n").length);
 
   // ── 塔台自身：插入到 DESIGN.md 附录 B 标题之前（2026-09-19 主人拍板解锁）──
@@ -878,8 +911,14 @@ function isTataiProject(projectId: string, dataDir?: string): boolean {
   return project.self_managed === true || project.id === "tatai";
 }
 
+/**
+ * 待议记录路径：与设计源**同根**（DESIGN §6.14 第 6 段"开发来源解析必须贯穿…讨论追加"）。
+ * 图纸源由 `resolveDocumentSource` 解析当前开发根；待议与它同放在该源的 `.工作台/` 下——
+ * 没登记开发指针时 `source_root` 就是注册表锚点根，行为与旧实现逐字节一致。
+ */
 function discussPath(projectId: string, dataDir?: string): string {
-  return path.join(workstationDir(projectId, dataDir), DISCUSS_FILE);
+  const sourceRoot = resolveDocumentSource(projectId, "design", dataDir).source_root;
+  return path.join(sourceRoot, WORKBENCH_DIR, DISCUSS_FILE);
 }
 
 /** 新建 design.discuss.md 时的标题头（templates/.工作台.example 同口径） */
@@ -949,6 +988,7 @@ export function appendDiscuss(
   if (isTataiProject(projectId, dataDir)) {
     // ── 塔台自身例外：追加到 repo 根 DESIGN.md 附录 B 区 ──
     const file = designPath(projectId, dataDir);
+    assertDocumentWriteAllowed({ projectId, dataDir, targetRoot: path.dirname(file) });
     const oldText = readTextForAppend(file, "DESIGN.md");
     const { start, end } = appendixBRange(oldText);
     const section = oldText.slice(start, end);
@@ -981,8 +1021,10 @@ export function appendDiscuss(
     return { source: file, line, entry };
   }
 
-  // ── 被纳管项目：追加到 <项目根>/.工作台/design.discuss.md ──
+  // ── 被纳管项目：追加到 <当前开发根>/.工作台/design.discuss.md ──
+  assertDevRootWritable(projectId, dataDir);
   const file = discussPath(projectId, dataDir);
+  assertDocumentWriteAllowed({ projectId, dataDir, targetRoot: path.dirname(file) });
   const existed = fs.existsSync(file);
   const oldText = existed
     ? readTextForAppend(file, "design.discuss.md")

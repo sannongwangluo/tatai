@@ -145,6 +145,13 @@ async function main(): Promise<void> {
   // → feature_item[]；注册表 30 → 31。同一个口径（**逐个点名登记**、数量判据仍是"恰好"）。
   // 语义/反例由 verify:feature-ledger 守；本脚本只做身份/集合断言。
   const V0952_TOOLS = ["feature_ledger"];
+  // 2026-10-09（V09-63/V09-65 项目工作目录与交付候选，DESIGN §6.13/§6.14）：工作区/候选统一入口
+  // manage_workspace；注册表 31 → 32。同一个口径（**逐个点名登记**、数量判据仍是"恰好"）。
+  // 语义/反例由 verify:v09-63 / verify:v09-65 守；本脚本只做身份/集合断言。
+  const V0963_TOOLS = ["manage_workspace"];
+  // 2026-10-09（V09-66 本地 Git 自动收尾，DESIGN §6.13 第 7 段/§6.14 第 9 段）：唯一宿主收尾入口
+  // finalize_local_commit；注册表 32 → 33。同一个口径（逐个点名登记、数量判据仍是"恰好"）。
+  const V0966_TOOLS = ["finalize_local_commit"];
   ok(
     EXPECTED.every((n) => names.includes(n)) &&
       M5_TOOLS.every((n) => names.includes(n)) &&
@@ -160,6 +167,8 @@ async function main(): Promise<void> {
       V0941_TOOLS.every((n) => names.includes(n)) &&
       V0947_TOOLS.every((n) => names.includes(n)) &&
       V0952_TOOLS.every((n) => names.includes(n)) &&
+      V0963_TOOLS.every((n) => names.includes(n)) &&
+      V0966_TOOLS.every((n) => names.includes(n)) &&
       names.length ===
         EXPECTED.length +
           M5_TOOLS.length +
@@ -174,8 +183,10 @@ async function main(): Promise<void> {
           V0939_TOOLS.length +
           V0941_TOOLS.length +
           V0947_TOOLS.length +
-          V0952_TOOLS.length,
-    `listTools 恰含一期 8 个 + 扩充 2 个 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 + V07-04 doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口 + V09-32/33/35 两件 + V09-39 project_index + V09-41 task_brief + V09-47 preflight_task_result + V09-52 feature_ledger（实际 ${names.length} 个）`,
+          V0952_TOOLS.length +
+          V0963_TOOLS.length +
+          V0966_TOOLS.length,
+    `listTools 恰含一期 8 个 + 扩充 2 个 + V06-10 三件套 + C-015 三件套 + V07-02 出口件 + V07-04 doctor + V09-19 六图读口 + V09-23 同步域三接口 + V09-27/V09-28 三接口 + V09-32/33/35 两件 + V09-39 project_index + V09-41 task_brief + V09-47 preflight_task_result + V09-52 feature_ledger + V09-63 manage_workspace + V09-66 finalize_local_commit（实际 ${names.length} 个）`,
   );
   ok(!names.includes("write_design"), "权限证伪②：listTools 不存在 write_design");
   ok(

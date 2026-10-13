@@ -45,15 +45,26 @@ export function handleSyncStatusRoute(req: IncomingMessage, res: ServerResponse,
   // 与 work 面 `/api/work/sync/status` 返回**同一份** report 与后台发现错误（MCP 跨进程读到宿主健康）。
   // 复审 A：worker 线程有独立模块内存，宿主汇不共享——主线程读出真实错误随参数带入，回包后再读一次做
   // **有界**健康对账；作业期间健康持续变化 → 503 HEALTH_UNSTABLE，绝不把新错误拼到旧 passed 报告上。
+  // V09-37 BLOCK-2：把 HTTP 连接的**提前断开**接成 AbortSignal——客户端预算用尽/主动断开即取消**本请求**的
+  // 只读作业（`runReadJob` 的 `signal`：在途 terminate 该作业 worker，仅该请求、不动并行其它请求）。
+  // **成功应答后的正常 close 不算取消**（`res.writableEnded` 已置位）；`.finally` 摘监听（不泄漏）。
+  const ac = new AbortController();
+  const onClose = (): void => {
+    if (!res.writableEnded && !ac.signal.aborted) ac.abort(new Error("客户端提前断开同步只读读口"));
+  };
+  res.on("close", onClose);
   void runWithHostHealth(
     () => readProjectDiscoveryIssues(projectId, dataDir),
-    (issues) => runReadJob("sync_status", { projectId, dataDir, discoveryIssues: issues }),
+    (issues) => runReadJob("sync_status", { projectId, dataDir, discoveryIssues: issues }, { signal: ac.signal }),
+    { signal: ac.signal },
   )
     .then((reconciled) => {
-      if (res.headersSent) return;
+      if (res.headersSent || ac.signal.aborted) return;
       json(200, { ok: true, sync: reconciled.value, discovery_issues: reconciled.issues });
     })
     .catch((e: unknown) => {
+      // 客户端已断开：没有接收方，不写响应（也不把取消误报成一次错误）
+      if (ac.signal.aborted) return;
       if (res.headersSent) {
         res.end();
         return;
@@ -64,6 +75,7 @@ export function handleSyncStatusRoute(req: IncomingMessage, res: ServerResponse,
         ? { code: "HEALTH_UNSTABLE", message: e.message, detail: { issues: e.issues }, httpStatus: 503 }
         : describeReadJobError(e);
       json(d.httpStatus, { ok: false, error: { code: d.code, message: d.message, detail: d.detail } });
-    });
+    })
+    .finally(() => res.removeListener("close", onClose));
   return true;
 }

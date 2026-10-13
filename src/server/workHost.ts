@@ -25,6 +25,8 @@ import {
 import { WorkError } from "./work/types";
 import { handleBaselineRequest } from "./work/baselineHost";
 import { handleProjectIndexRequest } from "./work/projectIndexHost";
+import { handleFinalizeRequest } from "./work/gitFinalizeHost";
+import { installWorkspaceHostWiring } from "./work/hostWiring";
 import { descriptorBelongsTo, removeDescriptorIfOwned } from "./work/serviceOwnership";
 
 export interface WorkHost {
@@ -76,6 +78,9 @@ export function createWorkHost(
     }
   };
   const service = new WorkService({ dataDir, faults: opts.faults, assertWriteOwnership });
+  // V09-64 集成：把「证据/文档按目标工作区同一版本解析」的宿主接线接上（解析器只注入、不改判据）；
+  // 桌面服务与独立 daemon 都经这里启动，故两种宿主同源（不注册 ⇒ 证据/文档退回锚点旧口径）。
+  installWorkspaceHostWiring();
   let descriptor: WorkServiceDescriptor | null = null;
 
   return {
@@ -101,6 +106,10 @@ export function createWorkHost(
       // 桌面宿主与独立 daemon 同一份 handle、同一写者；读（read/impact/coverage）不走本模块（本地纯读取）。
       // POST upsert/remove 已被上面的写方法所有权闸覆盖（非写宿主 503 零字节）。
       if (await handleProjectIndexRequest(req, res, { dataDir, token, pathname, assertWriteOwnership })) return true;
+      // V09-66（DESIGN §6.13 第 7 段/§6.14 第 9 段）：本地 Git 自动收尾的唯一宿主写面
+      // `/api/work/git/finalize`——桌面宿主与独立 daemon 同一 handle、同一写者；POST 已被上面的
+      // 写方法所有权闸覆盖（非写宿主 503 零字节）。
+      if (await handleFinalizeRequest(req, res, { dataDir, token, pathname, assertWriteOwnership })) return true;
       return handleWorkRequest(req, res, { service, token, pathname });
     },
     publish(port, host) {

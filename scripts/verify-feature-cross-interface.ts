@@ -416,6 +416,9 @@ async function main(): Promise<void> {
   // ═══ ① 默认多 feature（无 scope 过滤）逐 item 自身 scope + 跨接口对账 ═══
   section("① 默认多 feature：逐 item 自身 scope，四读口同对象同结论");
   const s1 = await readAll();
+  const httpImplementation = (s1.httpLedger.items as Array<any>).find((i) => i.item_id === "cap-b")?.implementation;
+  const mcpImplementation = (s1.mcpLedger.items as Array<any>).find((i) => i.item_id === "cap-b")?.implementation;
+  ok(JSON.stringify(httpImplementation) === JSON.stringify(mcpImplementation) && httpImplementation?.interpretation?.label === "已有验证依据", "① HTTP/MCP 实现登记与解释同源：已验但未提交不冒充执行完成", { httpImplementation, mcpImplementation });
   const a1 = agree("①", "cap-a", s1);
   agree("①", "cap-b", s1);
   agree("①", "cap-c", s1);

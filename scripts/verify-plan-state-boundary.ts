@@ -328,11 +328,33 @@ ok(noteEdited !== planBefore, "R4 变异守卫：施工备注正文替换确实�
   ok(checkInState === 0, `R7 没有任何已解析检查项落在 state 段（越界 ${checkInState}）`);
 }
 
-// R8：逐卡明细（真实解析增量）——V09-09 从 0 → 10；总数 394 → 404 → 413（2026-10-09 追加 V09-62 后）。
+// R8：逐卡明细（真实解析增量）——**保留原 90 卡 / 413 检查回归**，另显式核本轮**仅新增** 5 卡 / 22 检查增量。
+// 2026-10-09 追加 V09-63…67（工作区/交付候选批次）后真实 PLAN 为 95 卡 / 435 检查；旧 90 卡的定义与检查一字未改，
+// 故把旧卡集单独回归（原断言口径不放宽、不删除），增量逐项点名。
 {
-  const total = real.definitions.reduce((a, d) => a + (d.acceptance?.checks.length ?? 0), 0);
-  ok(real.definitions.length === 90, `真实 PLAN 解析出 90 张卡（实得 ${real.definitions.length}）`);
-  ok(total === 413, `真实 PLAN 解析出的检查项总数 = 413（修前 404；实得 ${total}）`);
+  const NEW_CARDS = ["V09-63", "V09-64", "V09-65", "V09-66", "V09-67"];
+  const oldDefs = real.definitions.filter((d) => !NEW_CARDS.includes(d.task_id));
+  const newDefs = real.definitions.filter((d) => NEW_CARDS.includes(d.task_id));
+  const checksOfDefs = (defs: typeof real.definitions): number =>
+    defs.reduce((a, d) => a + (d.acceptance?.checks.length ?? 0), 0);
+  const oldTotal = checksOfDefs(oldDefs);
+  const newTotal = checksOfDefs(newDefs);
+  const total = checksOfDefs(real.definitions);
+  // —— 原回归（保留，口径不变）：旧卡区仍 90 卡 / 413 检查 ——
+  ok(oldDefs.length === 90, `真实 PLAN 旧卡区仍 90 张卡（实得 ${oldDefs.length}）`);
+  ok(oldTotal === 413, `真实 PLAN 旧卡区检查项总数仍 = 413（修前 404；实得 ${oldTotal}）`);
+  // —— 本轮增量（仅新增，不改旧定义）：+5 卡 / +22 检查 ——
+  ok(newDefs.length === 5, `本轮新增 5 张卡 V09-63…67（实得 ${newDefs.length}）`);
+  ok(newTotal === 22, `本轮新增卡检查项 = 22（实得 ${newTotal}）`);
+  // —— 总量等于两段之和，且真实为 95 / 435 ——
+  ok(
+    real.definitions.length === oldDefs.length + newDefs.length && total === oldTotal + newTotal,
+    `总量 = 旧 90 卡 + 新增 5 卡 = 95 卡 / 413 + 22 = 435 检查（实得 ${real.definitions.length} 卡 / ${total} 检查）`,
+  );
+  ok(
+    real.definitions.length === 95 && total === 435,
+    `真实 PLAN 解析出 95 张卡 / 435 检查项（实得 ${real.definitions.length} / ${total}）`,
+  );
 }
 
 // ── 只读证明 ──

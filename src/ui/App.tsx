@@ -40,6 +40,8 @@ import { PlanView } from "./components/PlanView";
 import { ProjectList } from "./components/ProjectList";
 import { ProjectOverview } from "./components/ProjectOverview";
 import { RemoveProjectDialog } from "./components/RemoveProjectDialog";
+import { RuntimeDiagnosticsView } from "./components/RuntimeDiagnosticsView";
+import { RuntimeHealthHint } from "./components/RuntimeHealthHint";
 import { SyncEvidenceStatus } from "./components/SyncEvidenceStatus";
 import { TerminalView } from "./components/TerminalView";
 import { VersionReminder } from "./components/VersionReminder";
@@ -82,14 +84,16 @@ const MAIN_NAV: readonly [ViewKey, string][] = [
   ["live", "实况与验收"],
 ];
 
-/** 辅助入口（§3.1「最近变化 / 版本提醒 / 设置与诊断」）：终端在这里，标注"维护诊断" */
+/** 辅助入口（§3.1「最近变化 / 版本提醒 / 设置与诊断」）：终端在这里，标注"维护诊断"；
+ *  V09-70 起与终端**并列**新增「运行诊断」（§3.18，同组、不抢主导航）。 */
 const AUX_NAV: readonly [ViewKey, string][] = [
   ["overview", "项目信息"],
   ["terminal", "终端（维护诊断）"],
+  ["diagnostics", "运行诊断（维护诊断）"],
 ];
 
 /** 上下文背景页（`overview` / `terminal` 两个辅助入口）里主区怎么铺 */
-const FULL_HEIGHT_VIEWS: readonly ViewKey[] = ["chat", "terminal", "arch", "live", "delivery"];
+const FULL_HEIGHT_VIEWS: readonly ViewKey[] = ["chat", "terminal", "arch", "live", "delivery", "diagnostics"];
 
 export default function App() {
   const { theme, toggleTheme } = useTheme();
@@ -341,6 +345,8 @@ export default function App() {
             </div>
             {watchError && <p className="tt-watch-error" title={watchError} data-watch-error="1">项目变化暂未连接：{watchError}</p>}
             <SyncEvidenceStatus project={selected} />
+            {/* V09-70（§3.18）：主工作面**全局**轻量异常提示——任一主视图可见都显示；healthy 安静。 */}
+            <RuntimeHealthHint projectId={selected.id} onOpen={() => patch({ view: "diagnostics" })} />
 
             <div
               ref={viewHostRef}
@@ -365,6 +371,8 @@ export default function App() {
                 <PlanView project={selected} />
               ) : view === "terminal" ? (
                 <TerminalView project={selected} />
+              ) : view === "diagnostics" ? (
+                <RuntimeDiagnosticsView project={selected} />
               ) : view === "arch" ? (
                 <ArchView project={selected} />
               ) : view === "live" ? (

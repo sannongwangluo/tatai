@@ -6,6 +6,7 @@ import { getProject } from "./registry";
 import { JUNK_DIR_RANDOM_TEMP_RE } from "../arch/config";
 import { sanitizeErrorMessage } from "./redact";
 import { WsError } from "./workstation";
+import { resolveCurrentDevRoot } from "./work/workspaces";
 
 const execFileAsync = promisify(execFile);
 
@@ -761,14 +762,33 @@ export async function scanDirectoryAsync(
   }
 }
 
-/** 按注册表项目 id 扫描（HTTP 路由入口；路径只走注册表，与 watcher/workstation 同一红线）。
+/**
+ * 扫描根（V09-63 源根贯通）：扫描的是**当前开发工作区**的源码（§6.14 第 2/6 段）。
+ * 路径只从注册表 + 工作区指针解析，不接受调用方传路径（与 watcher/workstation 同一红线）；
+ * 坏指针/目录不在 → 明确拒绝，不静默回退注册表锚点根。
+ */
+function scanSourceRoot(projectId: string, dataDir?: string): string {
+  const dev = resolveCurrentDevRoot(projectId, dataDir);
+  if (dev.root === null) {
+    throw new WsError(
+      "INVALID_INPUT",
+      `当前开发指针不可用（source=${dev.source}）：${dev.blocked_reason ?? "目标工作区不可用"}——拒绝扫描，不静默回退项目根（DESIGN.md §6.14 第 2/10 段）`,
+    );
+  }
+  if (!fs.existsSync(dev.root) || !fs.statSync(dev.root).isDirectory()) {
+    throw new WsError("INVALID_INPUT", `当前开发工作区目录不在盘上：${dev.root}（工作区 ${dev.workspace_id}）——拒绝扫描`);
+  }
+  return dev.root;
+}
+
+/** 按注册表项目 id 扫描（HTTP 路由入口；路径只走注册表 + 工作区指针，与 watcher/workstation 同一红线）。
  *  批3 T17：遍历异步分批让出后本函数也返回 Promise（调用点要 await）。 */
 export async function scanProject(projectId: string, dataDir?: string, hooks?: ScanHooks): Promise<ProjectScan> {
   const project = getProject(projectId, dataDir);
   if (!project) {
     throw new WsError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`);
   }
-  return scanDirectory(project.path, project.id, hooks);
+  return scanDirectory(scanSourceRoot(projectId, dataDir), project.id, hooks);
 }
 
 /** 按项目 id 扫描的异步版（Q131：HTTP 路由与起草链路用这条；阻塞口径见文件头） */
@@ -781,5 +801,5 @@ export async function scanProjectAsync(
   if (!project) {
     throw new WsError("PROJECT_NOT_FOUND", `项目不存在: ${projectId}`);
   }
-  return scanDirectoryAsync(project.path, project.id, hooks);
+  return scanDirectoryAsync(scanSourceRoot(projectId, dataDir), project.id, hooks);
 }

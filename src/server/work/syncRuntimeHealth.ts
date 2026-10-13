@@ -118,11 +118,13 @@ function sameIssues(a: readonly string[], b: readonly string[]): boolean {
 export async function runWithHostHealth<T>(
   readIssues: () => string[],
   run: (issues: string[]) => Promise<T>,
-  opts: { maxAttempts?: number } = {},
+  opts: { maxAttempts?: number; signal?: AbortSignal } = {},
 ): Promise<{ value: T; issues: string[] }> {
   const max = opts.maxAttempts ?? 3;
   let last: string[] = [];
   for (let attempt = 1; attempt <= max; attempt++) {
+    // V09-37 BLOCK-2：调用方（HTTP 只读读口）在客户端提前断开时 abort——**后续健康重试不再发起**新只读作业。
+    if (opts.signal?.aborted === true) throw new Error("只读健康对账已取消（客户端提前断开）");
     const dispatchIssues = readIssues();
     const value = await run(dispatchIssues);
     const after = readIssues();

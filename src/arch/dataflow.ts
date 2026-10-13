@@ -1687,7 +1687,7 @@ const TATAI_INDEX: ProjectIndex = {
       relation: "read_write",
       label: "写：终端会话经 recorder 追加命令历史到 logs/",
       claims: [
-        cc("src/server/pty.ts", "history: new TerminalHistoryRecorder(sid, projectId, project.path),", "写点：每个终端会话挂一个 recorder，落 <项目根>/.工作台/logs/terminal-history.jsonl"),
+        cc("src/server/pty.ts", "history: new TerminalHistoryRecorder(sid, projectId, sessionCwd),", "写点：每个终端会话挂一个 recorder，落 <项目根>/.工作台/logs/terminal-history.jsonl"),
         cc("src/server/terminalHistory.ts", "export function appendTerminalHistoryLine(projectId: string, line: TerminalHistoryLine): void {", "写点：命令历史只追加落 logs/（超限归档）"),
       ],
       static_clues: [],

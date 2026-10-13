@@ -123,8 +123,15 @@ const MCP_TOOL_NAMES = [
   // 不自愈、不调模型。同一点名口径（V09-27/V09-28/V09-39 先例）：逐个点名登记、数量判据仍是"恰好"；
   // 语义/反例由 verify:feature-ledger 守，本脚本只做身份/集合断言。
   "feature_ledger",
+  // 2026-10-09 V09-63/V09-65（DESIGN §6.13/§6.14）：项目工作目录与交付候选统一入口 manage_workspace——
+  // read/list 只读；register/update/freeze/retire/select_dev/point_trial 经唯一写入服务转接。
+  // 同一点名口径：逐个点名登记、数量判据仍是"恰好"；语义/反例由 verify:v09-63 / verify:v09-65 守。
+  "manage_workspace",
+  // 2026-10-09 V09-66（DESIGN §6.13 第 7 段/§6.14 第 9 段）：本地 Git 自动收尾唯一入口 finalize_local_commit——
+  // 技术验证+独立审查通过且持有有效任务授权时，由唯一宿主对冻结候选做本地提交（请求不自带 grant/布尔/root）。
+  "finalize_local_commit",
 ] as const;
-const MCP_TOOL_COUNT = MCP_TOOL_NAMES.length; // 31
+const MCP_TOOL_COUNT = MCP_TOOL_NAMES.length; // 33
 
 const ok = (cond: boolean, label: string) => {
   console.log(`[verify] ${cond ? "PASS" : "FAIL"} ${label}`);

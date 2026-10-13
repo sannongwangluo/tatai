@@ -35,6 +35,7 @@ import {
   renderSourceManifestText,
   type SourceManifest,
 } from "./sourceEvidence";
+import { memoizedForDerivation } from "./derivationScope";
 
 // ── 证据版本绑定（§4.2 / §5.6：设计/接口/代码版本变化触发复核） ──
 
@@ -99,6 +100,13 @@ export interface EvidenceBlob {
    * 登记时由服务端现读核实；读侧按它现读复核，源码一变就判失效（不认识清单的旧读侧忽略它）。
    */
   source_manifest: SourceManifest | null;
+  /**
+   * 本条证据**作用于哪个工作区**（V09-64；§6.14 第 6 段）：source_manifest 的现读根就是该工作区的
+   * 当前开发根，不是 `.工作台` 目录硬推的项目主根。旧证据无此字段 = 未知（不重建第二套判据）。
+   */
+  workspace_id: string | null;
+  /** 实际用于现读 source_manifest 的**规范绝对根**（宿主解析，非调用方直接传；见 `setEvidenceWorkspaceResolver`） */
+  workspace_root: string | null;
 }
 
 export const evidenceDir = (workDir: string): string => path.join(workDir, EVIDENCE_DIRNAME);
@@ -137,6 +145,54 @@ export interface EvidenceInput {
    * 拒绝越界/软链/私密目录/超限；返回的清单随证据不可变保存，读侧据此现读复核。
    */
   source_manifest?: unknown;
+  /**
+   * 本条证据作用的目标工作区 id（V09-64；§6.14 第 6 段）。给了它，`source_manifest` 就按**该工作区**
+   * 当前开发根现读，而不是从 `.工作台` 目录硬推的项目主根。**只传 id**（调用者不得直接传绝对根）；
+   * 宿主用 `setEvidenceWorkspaceResolver` 注册的解析器把它解析成真实根。
+   */
+  workspace_id?: string | null;
+  /**
+   * 已由**宿主**解析出的目标工作区规范绝对根（内部字段：只允许宿主/宿主同源调用设置，**不**从
+   * MCP/HTTP 调用方直接透传）。给了它就优先于 `workspace_id` 的解析结果。
+   */
+  workspace_root?: string | null;
+}
+
+/**
+ * 目标工作区根解析器（V09-64；§6.14 第 6 段）：宿主/同源调用把 `workspace_id` 解析成**规范绝对根**。
+ * 由宿主注入（如基于 `resolveCurrentDevRoot` / 工作区投影）——`evidence.ts` **不静态 import** `workspaces.ts`，
+ * 避免 `workstation → documents → workspaces → workstation` 循环。返回 null = 未知/已回收工作区（**不回落主根**）。
+ */
+export type EvidenceWorkspaceResolver = (workDir: string, workspaceId: string) => string | null;
+let evidenceWorkspaceResolver: EvidenceWorkspaceResolver | null = null;
+export function setEvidenceWorkspaceResolver(fn: EvidenceWorkspaceResolver | null): void {
+  evidenceWorkspaceResolver = fn;
+}
+
+function evidenceWorkspaceIdOf(input: EvidenceInput): string | null {
+  return typeof input.workspace_id === "string" && input.workspace_id.trim() !== "" ? input.workspace_id.trim() : null;
+}
+
+/**
+ * 现读 source_manifest 的根：宿主解析出的工作区根 > 调用方给的 workspace_id（经解析器）> 旧口径
+ * （从 `.工作台/work` 硬推的项目主根）。**调用方不能直接传绝对根**（`workspace_root` 只作宿主内部字段）。
+ */
+function resolveManifestRoot(workDir: string, input: EvidenceInput): string {
+  const explicit = typeof input.workspace_root === "string" && input.workspace_root.trim() !== "" ? path.resolve(input.workspace_root) : null;
+  if (explicit !== null) return explicit;
+  const wsId = evidenceWorkspaceIdOf(input);
+  if (wsId === null) return projectRootOfWorkDir(workDir);
+  if (evidenceWorkspaceResolver === null) {
+    evidenceBad(
+      `给了 workspace_id=${wsId} 但没有注册工作区根解析器：不能从 .工作台 目录硬推主根冒充该工作区（宿主未接线）`,
+      { workspace_id: wsId },
+    );
+  }
+  const root = evidenceWorkspaceResolver(workDir, wsId);
+  if (root === null || root === undefined || root.trim() === "") {
+    evidenceBad(`workspace_id=${wsId} 解析不到目标工作区（未知/已回收）：拒绝存证，**不回落项目主根**`, { workspace_id: wsId });
+  }
+  return path.resolve(root);
 }
 
 /**
@@ -157,6 +213,13 @@ export function putEvidence(workDir: string, input: EvidenceInput): EvidenceBlob
       field: "binding",
     });
   }
+  const scopeWorkspaceId = evidenceWorkspaceIdOf(input);
+  const explicitRootGiven = typeof input.workspace_root === "string" && input.workspace_root.trim() !== "";
+  const scopeRequested =
+    scopeWorkspaceId !== null || explicitRootGiven || (input.source_manifest !== undefined && input.source_manifest !== null);
+  const manifestRoot = scopeRequested ? resolveManifestRoot(workDir, input) : null;
+  // 只有**声明了工作区**（id 或宿主解析出的根）才把根记为证据的作用域；纯清单（旧口径）不记，避免冒充工作区
+  const recordedWorkspaceRoot = scopeWorkspaceId !== null || explicitRootGiven ? manifestRoot : null;
   // 源文件清单：登记时由**服务端现读**核实（不信任调用方自报的哈希；越界/软链/私密目录/超限一律拒）
   let manifest: SourceManifest | null = null;
   if (input.source_manifest !== undefined && input.source_manifest !== null) {
@@ -167,7 +230,7 @@ export function putEvidence(workDir: string, input: EvidenceInput): EvidenceBlob
         { field: "kind" },
       );
     }
-    manifest = buildSourceManifest(projectRootOfWorkDir(workDir), input.source_manifest);
+    manifest = buildSourceManifest(manifestRoot ?? projectRootOfWorkDir(workDir), input.source_manifest);
   } else if (input.kind === "source_manifest") {
     evidenceBad("source_manifest 类的证据必须给 source_manifest（有限文件集合 + 内容哈希），否则读侧无从复核", {
       field: "source_manifest",
@@ -203,6 +266,8 @@ export function putEvidence(workDir: string, input: EvidenceInput): EvidenceBlob
     created_at: input.occurred_at ?? nowIso(),
     duplicate: false,
     source_manifest: manifest,
+    workspace_id: scopeWorkspaceId,
+    workspace_root: recordedWorkspaceRoot,
   };
   fs.mkdirSync(evidenceDir(workDir), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
@@ -220,8 +285,56 @@ export function putEvidence(workDir: string, input: EvidenceInput): EvidenceBlob
   return record;
 }
 
-/** 读一份证据正文（读时复核哈希：与文件名不符 = 现场被改过，必须暴露） */
+/**
+ * 读一份证据正文（读时复核哈希：与文件名不符 = 现场被改过，必须暴露）。
+ *
+ * V09-37 性能返工：同一次同步派生内按 (workDir, sha256) 记忆化。热调用链
+ * `statusProjection.evidenceManifestRootVerdict → readEvidence` 会**每条检查**读一遍同一份内容寻址证据正文、
+ * 读回后再全量核一次 `sha256Hex(content)`（现场实测同一份正文被读+核哈希 971 次/sync、2135 次/entry）。
+ * 记忆只省**同一次派生、同一瞬间**的重复现读 + 核哈希：
+ *   · 键含 `path.resolve(workDir)` 与 `sha256`——跨 workDir / 跨项目各有各的键，不串味；
+ *   · 内容寻址正文**不可变、写一次**（`putEvidence` 已存在即不改写），同一次派生内重读字节必同；
+ *   · 没有活跃作用域时 `memoizedForDerivation` 直接现算——写侧/单测路径行为逐字不变；
+ *   · 作用域 `finally` 一到即丢、**跨请求不缓存**：下一个请求照旧现读并重核哈希。
+ *
+ * 边界（复审约束，如实说明，不靠"无 `await`"糊过去）：派生是**同步**的，只保证本线程不交错，**不**保证外部
+ * 进程不改文件。若外部进程在**同一次派生内**篡改/删除该证据正文（含**只改 metadata、不改 content**），记忆返回
+ * 的是本次派生的首个现读结论、本次派生不再重读；**下一个请求必然重读**：内容对不上内容地址即现读核哈希抛错，
+ * 删除即 `fs.existsSync` 判缺。这不是新引入的信任面——正文"内容不变"本就只由 `sha256(content)` 背书，记忆键即该
+ * 内容地址；metadata 的同类窗口在单次现读里也同样不可再检出（`readEvidence` 只对 `content` 核哈希）。
+ * 返回**深独立副本**（同 `readManifestCarrier`／`verifySourceManifest` 口径）：记忆里存的是同一次派生内共享的
+ * 解析结果，直接交出去会让某一处调用方的就地深改泄露给同次派生的其他检查。
+ */
 export function readEvidence(workDir: string, sha256: string): EvidenceBlob {
+  const blob = memoizedForDerivation(
+    "evidence:read",
+    `${path.resolve(workDir)}\u0000${sha256}`,
+    () => computeEvidenceBlob(workDir, sha256),
+  );
+  return cloneEvidenceBlob(blob);
+}
+
+/** 深独立副本：记忆只用来省重复现读 + 核哈希，不共享任何可变结构（`binding` / `source_manifest.files`）。 */
+function cloneEvidenceBlob(b: EvidenceBlob): EvidenceBlob {
+  const binding = b.binding as EvidenceBinding | null | undefined;
+  return {
+    ...b,
+    // binding 缺省（坏文件）时保留原值，不因拷贝把它变出个字段来
+    ...(binding === null || binding === undefined
+      ? {}
+      : { binding: { revision_kind: binding.revision_kind, revision: binding.revision } }),
+    source_manifest:
+      b.source_manifest === null
+        ? null
+        : {
+            version: b.source_manifest.version,
+            fingerprint: b.source_manifest.fingerprint,
+            files: b.source_manifest.files.map((f) => ({ path: f.path, sha256: f.sha256, bytes: f.bytes })),
+          },
+  };
+}
+
+function computeEvidenceBlob(workDir: string, sha256: string): EvidenceBlob {
   const file = evidenceBlobPath(workDir, sha256);
   if (!fs.existsSync(file)) {
     evidenceBad(`证据不存在：${sha256}（恢复位置 ${evidenceRecoveryRel(sha256)}）——` +
@@ -258,6 +371,77 @@ export function readEvidence(workDir: string, sha256: string): EvidenceBlob {
     duplicate: false,
     // 旧证据没有这一字段 → parse 回 null（不认识清单的旧读侧忽略它，行为不变）
     source_manifest: parseSourceManifest(raw.source_manifest),
+    workspace_id: typeof raw.workspace_id === "string" ? raw.workspace_id : null,
+    workspace_root: typeof raw.workspace_root === "string" ? raw.workspace_root : null,
+  };
+}
+
+/**
+ * 现读复核该证据的 source_manifest 时该用哪个根（V09-64；§6.14 第 6 段）：优先证据**记录时**实际用的
+ * 工作区根（`workspace_root`），否则回退调用方给的根。这样"证据在哪个工作区核的"和"复核在哪个工作区读"
+ * 用**同一个根**——不会因为复核侧硬推主根而把同一份证据误判成漂移。旧证据无字段 → 回退。
+ */
+export function evidenceManifestRoot(workDir: string, sha256: string, fallback: string): string {
+  return evidenceManifestRootVerdict(workDir, sha256, fallback).root;
+}
+
+/**
+ * 作用域根解析器（V09-64 集成；§6.14 第 3/5 段）：宿主注入，把一条证据的**作用域**（workspace_id +
+ * 记录时的绝对根）解析成**当前同一版本**可读的根——目录在 → 原根；目录回收但可还原 → 可再生缓存的
+ * 解析根；篡改/取不回 → `root=null` 并给原因（**不回落开发目录兜底**）。未注册 ⇒ 只认记录根在场时。
+ * 这样证据"在哪个版本核的"与复核"在哪个根读"用同一版本，且**不同版本不可借绿**。
+ */
+export type EvidenceScopeRootResolver = (
+  workDir: string,
+  scope: { workspace_id: string | null; workspace_root: string | null },
+) => { root: string | null; reason: string | null };
+
+let evidenceScopeRootResolver: EvidenceScopeRootResolver | null = null;
+export function setEvidenceScopeRootResolver(fn: EvidenceScopeRootResolver | null): void {
+  evidenceScopeRootResolver = fn;
+}
+
+export interface EvidenceManifestRootVerdict {
+  /** 现读复核该证据 source_manifest 该用的根 */
+  root: string;
+  /** 非 null ⇒ 作用域来源当前不可用（未知/已回收/篡改/宿主未接线），调用方须按"未知待复核"处理，不复核成绿 */
+  unavailable_reason: string | null;
+  /** 该证据是否声明了工作区作用域（旧无 scope 证据 = false，沿既有适用判据） */
+  scoped: boolean;
+}
+
+/**
+ * 现读复核该证据的 source_manifest 时该用哪个根（V09-64；§6.14 第 3/5 段）。
+ * 优先证据**记录时**实际用的工作区根，但经宿主解析器按**同一版本**复核（目录回收走可再生缓存）；
+ * 作用域解析不到 ⇒ 明确不可用（不回落开发目录兜底），调用方据此判"未知待复核"。
+ * 旧证据无 scope ⇒ 沿用调用方给的当前被验版本根（既有适用判据，不自动豁免）。
+ */
+export function evidenceManifestRootVerdict(workDir: string, sha256: string, fallback: string): EvidenceManifestRootVerdict {
+  let blob: EvidenceBlob | null = null;
+  try {
+    blob = readEvidence(workDir, sha256);
+  } catch {
+    blob = null;
+  }
+  if (blob === null) return { root: fallback, unavailable_reason: null, scoped: false };
+  const recordedRoot = typeof blob.workspace_root === "string" && blob.workspace_root.trim() !== "" ? blob.workspace_root : null;
+  const scoped = blob.workspace_id !== null || recordedRoot !== null;
+  if (!scoped) return { root: fallback, unavailable_reason: null, scoped: false };
+  if (evidenceScopeRootResolver !== null) {
+    const res = evidenceScopeRootResolver(workDir, { workspace_id: blob.workspace_id, workspace_root: recordedRoot });
+    if (res.root !== null && res.root.trim() !== "") return { root: path.resolve(res.root), unavailable_reason: null, scoped: true };
+    return {
+      root: path.join(workDir, "__candidate_source_unavailable__", sha256),
+      unavailable_reason: res.reason ?? "证据作用域的来源当前不可用（未知/已回收/篡改）",
+      scoped: true,
+    };
+  }
+  // 未注入解析器：保守——记录根仍在盘上就就地复核（present），否则按不可用，不回落开发目录
+  if (recordedRoot !== null && fs.existsSync(recordedRoot)) return { root: path.resolve(recordedRoot), unavailable_reason: null, scoped: true };
+  return {
+    root: path.join(workDir, "__candidate_source_unavailable__", sha256),
+    unavailable_reason: "宿主未注册作用域根解析器且记录的工作区根不在盘（不回落开发目录兜底）",
+    scoped: true,
   };
 }
 

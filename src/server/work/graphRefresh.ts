@@ -65,6 +65,7 @@ import { autoRebuildBlueprint } from "../../arch/blueprintAuto";
 import { blueprintDir, draftBlueprintOf, writeJsonAtomic, type BlueprintDraftResult } from "../../arch/blueprint";
 import { getProject } from "../registry";
 import { resolveDocumentSource } from "./documents";
+import { resolveCurrentDevRoot } from "./workspaces";
 import { sanitizeErrorMessage } from "../redact";
 import { nowIso } from "../time";
 import { onProjectChange, type ChangeLine } from "../watcher";
@@ -842,14 +843,25 @@ export function graphRefreshDispatch(projectId: string, line: ChangeLine): void 
  * V09-12：开链时把上次遗留的 `updating` 标成 `stale`（进程重启/上次监听被关——**不把旧图当新图**）。
  */
 export function startGraphRefresh(projectId: string, deps: GraphRefreshDeps = {}): boolean {
-  if (states.has(projectId)) return false;
   const project = getProject(projectId, deps.dataDir);
   if (!project) return false; // 项目不存在：不开链（调用方是 watch 落地路径，项目已在的；这里兜底）
+  // V09-63 源根贯通：结构/接口/依赖判定读的是**当前开发工作区**源码（§6.14 第 2/6 段）。
+  // 坏指针/目录不在 → 不开链（调用方就是监听落地路径，watcher 侧已同样拒绝），不静默回退项目根。
+  const dev = resolveCurrentDevRoot(projectId, deps.dataDir);
+  if (dev.root === null || !fs.existsSync(dev.root) || !fs.statSync(dev.root).isDirectory()) {
+    return false;
+  }
+  const existing = states.get(projectId);
+  if (existing !== undefined) {
+    // 幂等：根没变就不重开。**指针切换导致根变了** → 先摘旧链再用新根开（否则会一直按旧根判结构变化）。
+    if (path.resolve(existing.root) === path.resolve(dev.root)) return false;
+    stopGraphRefresh(projectId);
+  }
   markInterrupted(projectId, "上次派生被中断（进程重启或监听被关）", deps.dataDir);
   const persisted = readGraphUpdate(projectId, deps.dataDir);
   const st: RefreshState = {
     deps: { now: deps.now ?? nowIso, ...deps },
-    root: project.path,
+    root: dev.root,
     docPaths: docPathsOf(projectId, deps.dataDir),
     quietMs: deps.quietMs ?? GRAPH_REFRESH_QUIET_MS,
     minIntervalMs: deps.minIntervalMs ?? GRAPH_REFRESH_MIN_INTERVAL_MS,
@@ -934,6 +946,14 @@ export function stopAllGraphRefresh(): void {
 /** 读某项目当前的更新状态（只读；HTTP 读口用；没有记录返回 null） */
 export function graphUpdateOf(projectId: string, dataDir?: string): GraphUpdateRecord | null {
   return readGraphUpdate(projectId, dataDir);
+}
+
+/**
+ * 只读：该项目发现链当前**实际使用的源码根**（当前开发工作区根）；没开链返回 null。
+ * 给验证/诊断核对"派生根与监听根是同一个目录"，不参与任何判据、不写盘。
+ */
+export function graphRefreshRootOf(projectId: string): string | null {
+  return states.get(projectId)?.root ?? null;
 }
 
 /** 供验证脚本断言"阶段总数"（口径只有一处：graphUpdate.PHASES_TOTAL） */

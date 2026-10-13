@@ -23,7 +23,7 @@
 // "能不能打开"是另一条轴（`runtimeEntries.ts#runtimeEntryStateOf`），本文件**不**碰它。
 //
 // **不新增存储、不重写账本、不写任何字节**：只读现读复核。
-import { evidenceBlobPath } from "./evidence";
+import { evidenceBlobPath, evidenceManifestRoot } from "./evidence";
 import { withDerivationScope } from "./derivationScope";
 import {
   projectRootOfWorkDir,
@@ -184,7 +184,7 @@ export function resolveRuntimeEntryRevision(
   //（它们结论相同，取谁都不改变结论）；结论本身与 `evidence_refs` 的数组顺序无关。
   const projectRoot = projectRootOfWorkDir(workDir);
   const verdicts = candidates
-    .map((c) => evaluateCandidate(projectRoot, c.evidence_id, c.carrier, revision, kind))
+    .map((c) => evaluateCandidate(evidenceManifestRoot(workDir, c.evidence_id, projectRoot), c.evidence_id, c.carrier, revision, kind))
     .sort((a, b) => a.evidence_id.localeCompare(b.evidence_id) || a.fingerprint.localeCompare(b.fingerprint));
 
   const fingerprints = [...new Set(verdicts.map((v) => v.fingerprint))];

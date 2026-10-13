@@ -31,7 +31,7 @@ import { getProject, resolveDataDir } from "../registry";
 import { nowIso } from "../time";
 import { projectWorkDir } from "../workstation";
 import { loadDocuments } from "./documents";
-import { evidenceBlobPath, readEvidence } from "./evidence";
+import { evidenceBlobPath, evidenceManifestRoot, readEvidence } from "./evidence";
 import { importTaskDefinitions, taskDefinitionHash, type TaskDefinition } from "./plan";
 import { readManifestCarrier, verifySourceManifest } from "./sourceEvidence";
 import { dependencyRelease, projectFromFacts, type EventsSnapshot } from "./statusProjection";
@@ -570,7 +570,7 @@ export function evaluateSubmitResultChecks(
               ...noDiff,
             };
           } else {
-            const verdict = verifySourceManifest(projectRoot, carrier.manifest);
+            const verdict = verifySourceManifest(evidenceManifestRoot(workDir, value, projectRoot), carrier.manifest);
             outcomeForRef = {
               ref: value,
               status: verdict.status === "valid" ? "checked_valid" : verdict.status === "invalidated" ? "stale" : "unreadable",

@@ -9,6 +9,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { FeatureLedgerView } from "../src/ui/components/FeatureLedgerView";
+import { implementationChip } from "../src/ui/components/deliveryOverviewDisplay";
+import { implementationInterpretation } from "../src/shared/implementationReadout";
 
 import { WorkService } from "../src/server/work/service";
 import { collectProjectFacts, eventsSnapshotOf } from "../src/server/work/statusProjection";
@@ -16,9 +21,10 @@ import { addProject } from "../src/server/registry";
 import { buildSectionIndex, activateBaseline, readBaselineLog, sha256Hex } from "../src/server/work/documents";
 import { importTaskDefinitions } from "../src/server/work/plan";
 import { submitDefinitionImports } from "../src/server/work/tasks";
+import { claimTask, submitTaskResult } from "../src/server/work/claims";
 import { registerRequirement } from "../src/server/work/requirements";
 import { putEvidence } from "../src/server/work/evidence";
-import type { FeatureItem } from "../src/shared/coverageTypes";
+import type { FeatureItem, FeatureLedger } from "../src/shared/coverageTypes";
 import { TOOLS } from "../src/mcp/tools/index";
 import { featureLedgerTool } from "../src/mcp/tools/featureLedger";
 import {
@@ -62,6 +68,12 @@ const ok = (cond: boolean, label: string, detail?: unknown): void => {
 const section = (t: string): void => console.log(`\n[verify] ═══ ${t}`);
 const sha256 = (b: string | Buffer): string => crypto.createHash("sha256").update(b).digest("hex");
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const renderLedger = (ledger: FeatureLedger) => renderToStaticMarkup(createElement(FeatureLedgerView, {
+  selector: "current", ledger, error: null, loading: false,
+  onRetry() {}, onLoadMore() {}, loadMoreBusy: false, loadMoreError: null, pagingNotice: null,
+  onLocateSection() {}, activeSectionLine: null, onSupplement() {}, supplementBusy: false,
+  supplementError: null, supplementNote: null, supplementDraft: "", onSupplementDraftChange() {}, bodyDesignRevision: null,
+}));
 
 const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "tatai-b2-fl-"));
 const dataDir = path.join(tmpBase, "home");
@@ -724,6 +736,17 @@ recordCheck(GREEN, "cap-g", "int-g-01", "pass", "g-int");
     ok(false, "⑥ 功能范围项缺失（cap-g）", r);
   } else {
     ok(cap.verification.display_status === "verified", "⑥d 必需检查 + 集成检查都有有效通过证据 ⇒ 功能 verified（同一份 projectStatuses 判据）", cap.verification);
+    ok(cap.implementation.state === "no_run_record", "⑥d-1 验证通过不伪造执行结果提交", cap.implementation);
+    ok(cap.implementation.interpretation?.label === "已有验证依据", "⑥d-2 已验证但无执行登记：实现读数不再暗示未实现", cap.implementation);
+    const html = r.ok ? renderLedger(r.ledger) : "";
+    ok(html.includes("已有验证依据") && !html.includes("暂无实现记录"), "⑥d-3 真实设计页组件消费同一解释，不把有效验证忽略掉");
+    const stale = implementationChip(cap.implementation, cap.verification, true);
+    ok(stale.label === "已有验证依据（上次）" && stale.tone !== "ok", "⑥d-4 刷新失败的已有验证依据显式上次，不能冒充当前通过", stale);
+    const partialEvidence = { ...cap.verification, display_status: "pending_verification" as const, passed_count: 1, missing: ["int-g-01 待验证"] };
+    ok(implementationInterpretation(cap.implementation, partialEvidence).label === "有部分验证依据", "⑥d-5 部分检查通过不冒充全部实现");
+    const oldEvidence = { ...cap.verification, evidence_state: "invalidated" as const };
+    ok(implementationInterpretation(cap.implementation, oldEvidence).label === "验证依据待复核", "⑥d-6 源版本失效不沿用已有有效验证结论");
+    ok(implementationInterpretation({ state: "not_started", basis: null }, { ...partialEvidence, passed_count: 0, evidence_entry: [] }).label === "未开始", "⑥d-7 确无运行和验证证据的未开始状态仍如实保留");
     ok(
       cap.verification.required_count === 2,
       "⑥e required_count 只数**本范围**声明的检查（1 必需 + 1 集成），不数整卡",
@@ -2339,6 +2362,49 @@ section("㉒ scope 源变化边界：同卡两功能两组检查 ⇒ 改 B 独�
   ok(r3.ok && r3.ledger.package_revision !== pkg0, "㉒e 改 A 自己声明覆盖的源 ⇒ 包版本变（相关源命中）", {
     pkg: r3.ok ? r3.ledger.package_revision : r3,
   });
+}
+
+// 实现登记的混合成员反例：正式提交与定义导入/尚未提交必须分开。
+section("㉓ 实现登记：部分提交不显示未开始，不借验证补造提交");
+{
+  const pid = "fl-implementation-records";
+  const root = path.join(tmpBase, pid);
+  const plan = gPlan
+    .replace("| V-1 | todo | 功能 G |  | 证据齐 |", "| V-1 | todo | 功能 G |  | 证据齐 |\n| V-2 | todo | 功能 G 后半 |  | 证据齐 |")
+    .replace("| cap-g | 功能 G | V-1 |", "| cap-g | 功能 G | V-1、V-2 |");
+  write(path.join(root, ".工作台", "plan.md"), plan);
+  write(path.join(root, ".工作台", "design.md"), gDesign);
+  addProject({ id: pid, name: "实现登记夹具", path: root, kind: "backend" }, dataDir);
+  registerRequirementFor(pid, "req-g");
+  submitDefinitionImports(service, { project_id: pid, change_id: "chg-b2", actor_id: "fixture", role: "coordinator", definitions: importTaskDefinitions(plan, { plan_revision: sha256(plan) }).definitions });
+  activateBaseline(pid, { approved_by: "user", approval_basis: "夹具", approval_kind: "user_confirmed" }, dataDir);
+  const read = () => {
+    const r = readFeatureLedger(pid, dataDir, { document: "current" }, { project_exists: () => true, code_revision: CODE_REV });
+    if (!r.ok) throw new Error(JSON.stringify(r));
+    return r.ledger.items.find((i) => i.item_id === "cap-g")!;
+  };
+  const submit = async (tid: string) => {
+    const claim = await claimTask({ project_id: pid, task_id: tid, role: "executor", owner_id: "fixture", change_id: "chg-b2" }, submitter as never, dataDir);
+    if (!claim.ok) throw new Error(JSON.stringify(claim));
+    const evidence = putEvidence(path.join(root, ".工作台", "work"), { kind: "submission", content: `夹具结果 ${tid}`, summary: "执行登记反例", created_by: "fixture", role: "executor", binding: { revision_kind: "code", revision: CODE_REV } });
+    const result = await submitTaskResult({ project_id: pid, task_id: tid, role: "executor", owner_id: "fixture", change_id: "chg-b2", claim_token: claim.claim.claim_token, expected_revision: claim.claim.entity_revision, deliverables: ["夹具结果"], evidence_refs: [evidence.evidence_id], verification: [], untested: ["夹具不声明技术验证"], known_issues: [] }, { submitter: submitter as never }, dataDir);
+    if (!result.ok) throw new Error(JSON.stringify(result));
+  };
+  const initial = read();
+  ok(initial.implementation.result_registration?.state === "none" && initial.implementation.state === "no_run_record", "㉓a 仅定义导入：暂无执行记录，不能冒充未实现", initial.implementation);
+  await submit("V-1");
+  const partial = read();
+  const registration = partial.implementation.result_registration;
+  ok(registration?.state === "partial" && registration.submitted_task_ids.join() === "V-1" && registration.pending_task_ids.join() === "V-2", "㉓b 混合成员：逐项点名已提交与未提交", partial.implementation);
+  ok(partial.implementation.interpretation?.label === "部分结果已登记", "㉓c 部分提交不能显示整个功能未开始", partial.implementation);
+  const partialLedger = readFeatureLedger(pid, dataDir, { document: "current" }, { project_exists: () => true, code_revision: CODE_REV });
+  const partialHtml = partialLedger.ok ? renderLedger(partialLedger.ledger) : "";
+  ok(partialHtml.includes("部分结果已登记") && !partialHtml.includes("还没有执行"), "㉓c-1 设计页验证列也不把缺证说成没有执行");
+  ok(partial.verification.display_status !== "verified" && partial.user_acceptance.state === "pending", "㉓d 部分提交不改变验证或用户接受");
+  await submit("V-2");
+  const complete = read();
+  ok(complete.implementation.result_registration?.state === "complete" && complete.implementation.state === "result_submitted", "㉓e 全部成员提交才是完整登记", complete.implementation);
+  ok(complete.implementation.interpretation?.label === "已提交实现" && complete.verification.display_status !== "verified", "㉓f 完整登记但缺验证不冒称已实现", complete.implementation);
 }
 
 // ═══════════════════ 收尾 ═══════════════════

@@ -30,7 +30,7 @@ import { submitDefinitionImports, readTaskStates } from "../src/server/work/task
 import { activateBaseline, BASELINES_FILE } from "../src/server/work/documents";
 import { buildRegisterContractCommand, scanSyncProject, readSyncStatus } from "../src/server/work/sync";
 import { projectWorkDir } from "../src/server/workstation";
-import { REPO_ROOT, ensureSelfRegistered, realHome } from "./lib/fixtures";
+import { REPO_ROOT } from "./lib/fixtures";
 
 let pass = 0;
 const fails: string[] = [];
@@ -47,8 +47,6 @@ const section = (t: string): void => console.log(`\n[verify] ── ${t}`);
 const sha256 = (t: string | Buffer): string => crypto.createHash("sha256").update(t).digest("hex");
 
 const REPO = REPO_ROOT;
-const REAL_HOME = realHome();
-ensureSelfRegistered(REAL_HOME);
 
 /** 本批次新增的实体／关系／链（逐条点名断言，缺一条就红） */
 const NEW_NODES = [
@@ -126,12 +124,19 @@ async function main(): Promise<void> {
   const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "tatai-fivegraph-df-"));
   const FX_HOME = path.join(TMP, "home");
   mkdirp(FX_HOME);
+  // 受验项目根＝本仓库（**所验代码**）：把 `tatai` 登记进隔离数据目录并指向 REPO。
+  // 不读真实 registry——那里 `tatai` 可能仍指向另一棵树（如旧 main），扫描出的 `path:line`
+  // 就是**别的树**的行号，与下面 `recheck`（读 REPO）对不上：会把「夹具根 ≠ 所验代码」
+  // 误报成出处不合格/被剔除。这里把夹具根统一到 REPO_ROOT，让扫描与复算读同一份源码。
+  const SRC_HOME = path.join(TMP, "src-home");
+  mkdirp(SRC_HOME);
+  addProject({ id: "tatai", name: "塔台", path: REPO, kind: "fullstack", self_managed: true }, SRC_HOME);
   const prevHome = process.env.TATAI_HOME;
 
   try {
     // ═════════════ ① 声明层完整性（真实项目 tatai） ═════════════
     section("① 声明层完整性：新增实体/关系/链逐条在场 + 每条出处独立复算");
-    const model = analyzeDataFlow("tatai", { dataDir: REAL_HOME });
+    const model = analyzeDataFlow("tatai", { dataDir: SRC_HOME });
     info(`实体 ${model.nodes.length} · 关系 ${model.edges.length} · 链 ${model.chains.length} · 覆盖行 ${model.coverage.declared_total} · 剔除 ${model.scan.claims_dropped}`);
     const idsOf = (x: readonly { id: string }[]): Set<string> => new Set(x.map((o) => o.id));
     const nodeIds = idsOf(model.nodes);

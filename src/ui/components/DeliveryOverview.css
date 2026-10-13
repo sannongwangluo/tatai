@@ -97,3 +97,34 @@
 @media (max-width: 560px) {
   .tt-dlv-grid { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* ── V09-67「读哪个版本」（DESIGN §6.14 第 8 段）：工作区选择 + 来源显示 ──
+ *
+ * 放在**既有 header 行内**（同一行、可换行）：首屏几何是既有回归断言（顶部区 ≤ 首屏一半），
+ * 所以选择器只占一个紧凑行内控件，完整来源/目录/指纹收进「完整读数与版本依据」折叠区与
+ * 「展开路径」的一行（默认不占高度）。选择器只**选版本**，不写状态、不带颜色结论——
+ * 交付颜色与计数仍完全由服务端派生。 */
+.tt-dlv.tt-dlv .tt-dlv-scope {
+  display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+  min-width: 0; font-size: 12px; color: var(--tt-muted);
+}
+.tt-dlv-scope-label { color: var(--tt-subtle); white-space: nowrap; }
+.tt-dlv-scope-seg { display: inline-flex; border: 1px solid var(--tt-border); border-radius: 999px; overflow: hidden; }
+.tt-dlv-scope-btn {
+  font-size: 11px; line-height: 1.5; padding: 1px 8px; margin: 0;
+  border: 0; border-radius: 0; background: transparent; color: var(--tt-muted); white-space: nowrap;
+}
+.tt-dlv-scope-seg .tt-dlv-scope-btn + .tt-dlv-scope-btn { border-left: 1px solid var(--tt-border); }
+.tt-dlv-scope-btn:hover { background: var(--tt-surface-muted); color: var(--tt-text); }
+.tt-dlv-scope-btn:focus-visible { outline: 2px solid var(--tt-focus); outline-offset: 1px; }
+.tt-dlv-scope-seg .tt-dlv-scope-btn[aria-pressed="true"] { background: var(--tt-accent-soft); color: var(--tt-accent); font-weight: 600; }
+/* 说明只在**一行**内呈现：超出裁掉（完整路径用「展开路径」看），避免把 header 挤成两行 */
+.tt-dlv-scope-note { min-width: 0; max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tt-dlv-scope-root { font-family: ui-monospace, monospace; font-size: 11px; color: var(--tt-text); }
+.tt-dlv-scope-root-full { font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; word-break: break-all; }
+.tt-dlv-scope-actions { display: inline-flex; gap: 4px; }
+.tt-dlv-scope-actions .tt-dlv-scope-btn { border: 1px solid var(--tt-border); border-radius: 6px; }
+.tt-dlv-scope-copied { color: var(--tt-subtle); white-space: nowrap; }
+@media (max-width: 720px) {
+  .tt-dlv-scope-note { max-width: 100%; }
+}

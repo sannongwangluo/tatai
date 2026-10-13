@@ -396,15 +396,25 @@ export function computeSyncStatusView(args: SyncStatusReadArgs): SyncStatusRepor
   const MAX_ATTEMPTS = 3;
   let lastReason = "";
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    let snapshot: EventsSnapshot | null = null;
-    try {
-      snapshot = eventsSnapshotOf(args.projectId, args.dataDir);
-    } catch {
-      snapshot = null; // 读不出：readSyncStatus 按既有 fail-closed 给 invalid，无内容身份可核
-    }
-    const report = readSyncStatus(args.projectId, args.dataDir, {
-      ...(snapshot === null ? {} : { events: snapshot.events }),
-      ...(args.discoveryIssues === undefined ? {} : { discoveryIssues: args.discoveryIssues }),
+    // V09-37 性能返工：整条同步判据链此前跑在**派生作用域之外**——于是所有 `memoizedForDerivation` 接线
+    // （`workspaces:projection`／`loadDocument`／`activeBaseline`／`graphInputsOf`／`verifySourceManifest`／
+    // `readManifestCarrier`／`gitIgnoredPaths`／`readEvidence`）都退化成"每次现算"：一次只读请求里同一份账本
+    // 被反复整读（现场实测 10 次）。这里把「现读快照 + readSyncStatus」整体收进一层派生作用域，同一次派生里
+    // 同一瞬间的重复现读坍缩为一次；作用域 `finally` 一到整批丢弃、**跨请求不缓存**——下一个请求照旧现读现算。
+    // **红线**：`ledgerIdentityOf` 的**回包前复核**留在作用域**外**现读（见下），保住"计算期间账本被追加/改写"
+    // 的判据不被记忆吞掉；`readLedger` 本身也不进 memo。复用只省重复读盘，判据/返回字段一字不改。
+    const { snapshot, report } = withDerivationScope(() => {
+      let snap: EventsSnapshot | null = null;
+      try {
+        snap = eventsSnapshotOf(args.projectId, args.dataDir);
+      } catch {
+        snap = null; // 读不出：readSyncStatus 按既有 fail-closed 给 invalid，无内容身份可核
+      }
+      const rep = readSyncStatus(args.projectId, args.dataDir, {
+        ...(snap === null ? {} : { events: snap.events }),
+        ...(args.discoveryIssues === undefined ? {} : { discoveryIssues: args.discoveryIssues }),
+      });
+      return { snapshot: snap, report: rep };
     });
     // 账本读不出时 `readSyncStatus` 已按既有 fail-closed 给出 invalid（含原因），无内容身份可核——如实返回。
     if (snapshot === null || snapshot.content === undefined) return report;

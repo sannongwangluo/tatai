@@ -178,6 +178,7 @@ import {
 // GET /design 的 `document` query（current|active|<revision>）据此返回正文＋章节索引＋基线历史元数据；
 // 缺省 current 时逐字复用 readDesign（旧 shape 不变），本 helper 只追加、不新增写口/不建 cache。
 import { parseDesignSelector, readDesignView } from "./work/designReadView";
+import { runtimeDiagnosticsRouteResult } from "./work/runtimeDiagnostics";
 import { isWorkError, WorkError, type WorkErrorCode } from "./work/types";
 // V06-08：施工图定义 + 运行状态（定义与状态分开给，界面不合并成"完成度"）与待议处置记录。
 // C-015 接线：本服务唯一的图纸导入点走受检导入（references.ts），与正式提交路径同一份引用判据
@@ -243,6 +244,13 @@ import { deriveObligations } from "./work/obligations";
 // feature_item[]（四维分开，绿只取 verification）。与同族 status-projection 的区别：本路由**读 query**
 // （scope/document/artifact_ref/expected_revision/cursor/limit，只改选择与分页，不改判据）；登记见 remote-routes.ts。
 import { parseFeatureLedgerParams, type FeatureLedgerResult } from "./work/featureLedger";
+// V09-63（DESIGN.md §6.13/§6.14）：工作区/交付候选**只读**读口——同一份事件投影 → WorkspaceView
+// （含派生 :main 与项目级指针）。登记见 remote-routes.ts（workspace-list-read）。
+import { readWorkspacesForProject, resolveCurrentDevRoot } from "./work/workspaces";
+// V09-63 源根贯通（DESIGN.md §6.14 第 2/6/10 段）：`context.ts` 的坏指针/解析失败是**结构化**错误
+// （`ContextError`，非 `WsError`/`WorkError`）；读口路由经 `wsFail` 时必须映射成稳定 4xx，
+// 不能落到通用 `else` 变成 500 INTERNAL（"坏指针"是调用方可修的入参/状态错，不是服务内部错）。
+import { isContextError } from "./work/context";
 // V06-07：聊天动作与可追溯回执（§3.5–§3.6）。修订动作**不在本文件里长**——本文件只做接线：
 // 意图 → 动作 → SSE 回执 + 三条只读/审定路由；动作的语义、落盘与红线全在 work/chatActions.ts。
 import {
@@ -561,6 +569,25 @@ function wsErrorStatus(code: string): number {
 }
 
 /**
+ * 解析**当前开发工作区根**（DESIGN.md §6.14 第 2/6/10 段）：读源码/开终端/扫描/Git 探测这一类
+ * "实际根"口径一律走它，不再拿注册表锚点 `project.path` 冒充当前源。
+ *   · 无工作区记录 → 按 `:main` 派生口径回落注册表锚点（旧项目逐字段兼容）；
+ *   · **有显式指针却坏**（不存在/已回收/目录不在盘）→ 抛结构化 4xx（`INVALID_INPUT`），
+ *     **不静默改读锚点主根**——"读了错版本"比"读不到"更糟。
+ */
+function currentDevRootOrFail(projectId: string, dataDir: string = DATA_DIR): string {
+  const dev = resolveCurrentDevRoot(projectId, dataDir);
+  if (dev.root === null || dev.root === "") {
+    throw new WsError(
+      "INVALID_INPUT",
+      `当前开发指针不可用（source=${dev.source}）：${dev.blocked_reason ?? "目标工作区不可用"}` +
+        "——拒绝读该项目的源码/工作树，不静默回退注册表主根（DESIGN.md §6.14 第 2/10 段）",
+    );
+  }
+  return path.resolve(dev.root);
+}
+
+/**
  * v2 事实错误码 → HTTP 状态码（PLAN.md V06-02 的图纸/基线路由用；与 `docs/work-v2-contract.md`
  * 的错误表同一口径：409 是"你手里的版本旧了"，503 是"写入服务不在"，其余按入参错/内部错分）。
  */
@@ -851,6 +878,13 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     replyWorkRoutes();
     return;
   }
+  // V09-69（DESIGN §3.18/§6.15）：tokened 只读**运行诊断**读口 `GET /api/work/diagnostics`——
+  // Agent（MCP `doctor.runtime`）读它；桌面宿主同样逐条列名转发（未登记会落本文件兜底 404）。
+  // 判据同上面几条：**方法 + 精确路径**；登记进 `remote-routes.ts`（kind:"read"）。
+  if (req.method === "GET" && reqPath === "/api/work/diagnostics") {
+    replyWorkRoutes();
+    return;
+  }
   // P2/V09-47（DESIGN §6.11）：唯一宿主的**只读预检**路由 `POST /api/work/preflight`（结果提交前预检）。
   // 桌面宿主同样逐条列名转发（未登记的精确路径会落本文件兜底 404），判据同上：**方法 + 精确路径**。
   // 它是**只读**路由（token 走 body、不进 URL；不写事件/证据/租约、不自愈），但用 POST 承载表单式大对象；
@@ -893,6 +927,32 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     replyWorkRoutes();
     return;
   }
+  // V09-66（DESIGN §6.13 第 7 段/§6.14 第 9 段）：本地 Git 自动收尾的唯一宿主写面
+  // `POST /api/work/git/finalize`（桌面宿主逐条列名转发；独立 daemon 全路径进 workHost）。
+  // 判据同上：**方法 + 精确路径**；登记进 remote-routes.ts（kind:"write"）。请求体不得自带
+  // grant/通过布尔/root——授权与目标根由宿主读真实账本派生。
+  if (req.method === "POST" && reqPath === "/api/work/git/finalize") {
+    replyWorkRoutes();
+    return;
+  }
+
+  // V09-69（DESIGN §3.18／§6.15）：本地**运行诊断**读口 `GET /api/runtime/diagnostics`——
+  // 沿现有同源本地读口安全注册（**不索要 work token**，因而是本机回环信任域内的维护读口，不暴露令牌）。
+  // 与 tokened `/api/work/diagnostics` **同一 builder**（`workHost.service.runtimeDiagnostics`），
+  // 响应语义（400 INVALID_INPUT / 503 SOURCE_UNAVAILABLE / 403 REMOTE_LOCAL_ONLY）由共享
+  // `runtimeDiagnosticsRouteResult` 统一给出。纯只读：不写事件/证据/租约、不自愈、不触发扫描、不拉起写服务。
+  if (req.method === "GET" && reqPath === "/api/runtime/diagnostics") {
+    const outcome = runtimeDiagnosticsRouteResult({
+      rawUrl: req.url ?? reqPath,
+      remoteLocalOnlyDenied: guard.remote,
+      projectExists: (id) => getProject(id) !== undefined,
+      build: (q) => workHost.service.runtimeDiagnostics({ projectId: q.projectId, detail: q.detail }),
+    });
+    res.statusCode = outcome.status;
+    res.setHeader("content-type", "application/json; charset=utf-8");
+    res.end(JSON.stringify(outcome.body, null, 2));
+    return;
+  }
 
   // G1：工作台数据读写层 HTTP 最小集。错误统一走结构化 { ok:false, error:{code,message} }：
   // 项目不存在 404，其余参数/状态校验失败 400，不抛裸栈。
@@ -920,6 +980,18 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
             ...e.toJSON(),
             ...(guard.remote ? { message: sanitizeErrorMessage(e.message) } : {}),
           },
+        }),
+      );
+    } else if (isContextError(e)) {
+      // V09-63 源根贯通（§6.14 第 2/6/10 段）：PTY/扫描/监听/上下文包一类的**坏指针/解析失败**是
+      // `context.ts` 的结构化读口错误（`ContextError`，非 `WsError`/`WorkError`）——映射成稳定 4xx/404
+      // （`INVALID_INPUT`→400、`PROJECT_NOT_FOUND`→404），**不落到通用 `else` 变成 500 INTERNAL**
+      // （那是"服务内部错"，会把调用方可修的入参/状态错报成静默 500）。文案可能含本机绝对路径，远程照旧脱敏。
+      res.statusCode = wsErrorStatus(e.code);
+      res.end(
+        JSON.stringify({
+          ok: false,
+          error: { ...e.toJSON(), ...(guard.remote ? { message: sanitizeErrorMessage(e.message) } : {}) },
         }),
       );
     } else if (e instanceof RegistryStateError) {
@@ -1450,10 +1522,13 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         source: "independent_audit",
       }));
       const changedFiles = latest?.changed_files ?? [];
+      // V09-63 源根贯通（§6.14 第 6 段）：审计抽查取的是**被验改动所在的实际源**＝当前开发工作区根
+      // （有显式指针却坏 → 明确 4xx，不偷偷读锚点 main）。相对路径与越界判据仍按同一个根。
+      const sourceRoot = currentDevRootOrFail(id);
       const sources = changedFiles.map((rel) => {
-        // 只读项目根内的相对路径；越界/不存在一律记 null（不给摘要冒充原文）
-        const abs = path.resolve(project.path, rel);
-        const inside = abs.startsWith(path.resolve(project.path) + path.sep);
+        // 只读当前开发根内的相对路径；越界/不存在一律记 null（不给摘要冒充原文）
+        const abs = path.resolve(sourceRoot, rel);
+        const inside = abs.startsWith(sourceRoot + path.sep);
         let sha: string | null = null;
         try {
           if (inside && fs.existsSync(abs) && fs.statSync(abs).isFile()) {
@@ -1536,6 +1611,25 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     return;
   }
 
+  // ── V09-63（DESIGN.md §6.13/§6.14）：工作区/交付候选**只读**读口（登记 remote-routes.ts 的 workspace-list-read）──
+  //   GET /api/projects/:id/workspaces
+  // 同一份事件投影 → WorkspaceView（含派生 `<project_id>:main` 与项目级指针）。**只读**：不写事件/指针、
+  // 不自愈、不启动写宿主、不调模型。旧项目无工作区记录时按 `:main` 派生口径继续可用（逐字段兼容）。
+  // 远程来源经 withoutLocalPaths 去掉本机绝对路径（既有红线）。
+  const workspacesMatch = req.url?.match(/^\/api\/projects\/([^/]+)\/workspaces(?:\?(.*))?$/);
+  if (req.method === "GET" && workspacesMatch) {
+    try {
+      const id = decodePathSegment(workspacesMatch[1]);
+      if (getProject(id) === undefined) throw new WsError("PROJECT_NOT_FOUND", `项目不存在: ${id}`);
+      const view = readWorkspacesForProject(id, DATA_DIR);
+      res.setHeader("content-type", "application/json; charset=utf-8");
+      res.end(JSON.stringify(withoutLocalPaths({ ok: true, ...view }, guard.remote)));
+    } catch (e) {
+      wsFail(e);
+    }
+    return;
+  }
+
   // ── B2/V09-52：功能清单**只读**读口（DESIGN.md §6.12；登记 remote-routes.ts 的 feature-ledger-read）──
   //   GET /api/projects/:id/feature-ledger
   // 同一 revision 事实快照 → 唯一义务派生（deriveObligations）→ feature_item[]（四维分开，绿只取 verification）。
@@ -1546,7 +1640,7 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
     const id = decodePathSegment(featureLedgerMatch[1]);
     const query = new URLSearchParams(featureLedgerMatch[2] ?? "");
     const raw: Record<string, unknown> = {};
-    for (const k of ["scope", "document", "artifact_ref", "expected_revision", "cursor", "limit"]) {
+    for (const k of ["scope", "document", "artifact_ref", "expected_revision", "cursor", "limit", "workspace"]) {
       const v = query.get(k);
       if (v !== null) raw[k] = v;
     }
@@ -1572,7 +1666,9 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
         if (res.headersSent) return;
         const r = result as FeatureLedgerResult;
         res.statusCode = r.ok ? 200 : r.status;
-        res.end(JSON.stringify(r.ok ? { ok: true, ledger: r.ledger } : r));
+        // 远程只读来源经 withoutLocalPaths 裁掉本机绝对路径（含工作区 root / delivery.version.root）——
+        // 与 /workspaces 同一条既有红线（F6）。
+        res.end(JSON.stringify(withoutLocalPaths(r.ok ? { ok: true, ledger: r.ledger } : r, guard.remote)));
       })
       .catch((e: unknown) => {
         if (res.headersSent) {
@@ -1603,8 +1699,11 @@ function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): voi
       try {
         const project = getProject(gitStatusProjectId);
         if (!project) throw new WsError("PROJECT_NOT_FOUND", `项目不存在: ${gitStatusProjectId}`);
-        // 路径只走注册表（§2.3.1）：不接受 query/body 里给的任何目录
-        const status = await inspectGitStatus(project.path);
+        // 路径只走注册表 + 工作区指针（§2.3.1、§6.14 第 6 段）：不接受 query/body 里给的任何目录；
+        // 探测/提醒的实际根＝**当前开发工作区根**（有显式指针却坏 → 明确 4xx，不偷偷读锚点 main）。
+        // 提醒的 `checks`/`required_checks_by_task` 仍来自中央事实，但内容版本按**同一根**现算。
+        const gitRoot = currentDevRootOrFail(gitStatusProjectId);
+        const status = await inspectGitStatus(gitRoot);
         const facts = collectProjectFacts(gitStatusProjectId, DATA_DIR);
         const manifest = evidenceManifest(facts.work_dir);
         const reminder = buildVersionReminder(
